@@ -34,7 +34,8 @@ log buffer size) and `variants/<env>/platformio.ini`.
 
 ### Radio
 - `LoRaRadio` interface (`src/Hardware/LoRaRadio.h`), driver chosen per board.
-- Both drivers on **RadioLib 7.1.2** (`Radio_SX1276`, `Radio_SX1262`): CRC
+- Both drivers on **RadioLib 7.8.1** (`Radio_SX1276`, `Radio_SX1262`; pinned,
+  same version as the sensor firmware): CRC
   errors are rejected (the old SX1276 driver ignored the flag), RSSI/SNR per
   datasheet, sync word 0x12 (= 0x1424 on SX126x).
 - The radio is re-initialized if it stops answering (checked every 10 min).
@@ -86,7 +87,7 @@ log buffer size) and `variants/<env>/platformio.ini`.
 
 ### Sensors, storage, time
 - New sensor type **SHT40 (0x05)**: temperature + humidity (see
-  `~/Git/expLORA-Sensor-v3` for the test sensor firmware).
+  the sensor repository (expLORA-Sensors-gen2) for the test sensor firmware).
 - `sensors.json` and `config.json` written atomically (tmp + rename, recovery),
   JSON documents sized and overflow-checked; corrupt files kept as `.corrupt`.
 - Locking: sensor list, config (`ConfigManager::mutex()`), logger; cross-task

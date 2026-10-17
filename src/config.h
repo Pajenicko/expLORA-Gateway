@@ -110,7 +110,9 @@ inline String makeApName()
 #define MQTT_DEFAULT_PASS ""
 #define MQTT_DEFAULT_ENABLED false
 #define MQTT_DEFAULT_TLS false
+#ifndef MQTT_RECONNECT_INTERVAL
 #define MQTT_RECONNECT_INTERVAL 30000 // 30 seconds in milliseconds
+#endif
 #define MQTT_DEFAULT_PREFIX "explora"
 #define HA_DISCOVERY_DEFAULT_ENABLED true
 #define HA_DISCOVERY_DEFAULT_PREFIX "homeassistant"

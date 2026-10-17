@@ -56,6 +56,10 @@
 #include "Web/WebServer.h"
 #include "Web/HTMLGenerator.h"
 
+#ifdef SPIKE_PINGPONG
+#include "SpikePingPong.h" // protocol v2 M0 timing spike (spike/gateway)
+#endif
+
 // Global object instances
 Logger logger;                // Logging system
 ConfigManager *configManager; // Configuration manager
@@ -211,7 +215,11 @@ void setup()
                               configManager->configMode, *configManager, configManager->timezone);
 
     // LoRa module initialization
+#ifdef SPIKE_PINGPONG
+    loraModule = spikeCreateRadio(logger, spiManager);
+#else
     loraModule = createLoRaRadio(logger, spiManager);
+#endif
     if (!loraModule->init())
     {
         logger.error("Failed to initialize LoRa module");
@@ -372,6 +380,10 @@ void loop()
         sensorManager->process(millis());
     }
 
+#ifdef SPIKE_PINGPONG
+    spikeLoop(sensorManager);
+#endif
+
     // Serial console: "reset-password" clears a forgotten web admin password
     static String serialLine;
     while (Serial.available())
@@ -384,9 +396,15 @@ void loop()
             {
                 webPortal->resetAdminPassword();
             }
+#ifdef SPIKE_PINGPONG
+            else if (serialLine.startsWith("spike-"))
+            {
+                spikeCommand(serialLine, sensorManager);
+            }
+#endif
             serialLine = "";
         }
-        else if (serialLine.length() < 32)
+        else if (serialLine.length() < 48)
         {
             serialLine += c;
         }

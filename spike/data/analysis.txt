@@ -1,0 +1,125 @@
+=== idle (beacon 303 s, ping 720 s)
+  pro  beacon err    n=140 min=435 p50=438 p90=442 p99=460 max=462
+  pro  beacon start  n=140 min=0 p50=0 p90=0 p99=1 max=1
+  pro  beacon lag    n=140 min=234 p50=240 p90=243 p99=245 max=245
+  pro  beacon launch n=140 min=434 p50=438 p90=442 p99=460 max=462  prep n=140 min=2719 p50=2733 p90=2773 p99=3020 max=3117
+  pro  beacon busyAtSwitch=1 stateErr=0
+  pro  ping   err    n=18 min=435 p50=438 p90=441 p99=443 max=443
+  pro  ping   start  n=18 min=0 p50=0 p90=0 p99=1 max=1
+  pro  ping   lag    n=18 min=234 p50=240 p90=242 p99=243 max=243
+  pro  ping   launch n=18 min=434 p50=437 p90=441 p99=443 max=443  prep n=18 min=2743 p50=2770 p90=2787 p99=2803 max=2803
+  pro  ping   notify n=18 min=8 p50=9 p90=9 p99=12 max=12
+  pro  ping   busyAtSwitch=0 stateErr=0
+  lite beacon err    n=140 min=364 p50=370 p90=398 p99=454 max=507
+  lite beacon start  n=140 min=0 p50=1 p90=1 p99=1 max=1
+  lite beacon lag    n=140 min=-402 p50=-390 p90=-388 p99=-369 max=-367
+  lite beacon launch n=140 min=363 p50=369 p90=398 p99=454 max=506  prep n=140 min=1465 p50=1467 p90=1472 p99=1646 max=1665
+  lite beacon busyAtSwitch=1 stateErr=0
+  lite ping   err    n=18 min=365 p50=370 p90=384 p99=400 max=400
+  lite ping   start  n=18 min=0 p50=1 p90=1 p99=1 max=1
+  lite ping   lag    n=18 min=-395 p50=-390 p90=-388 p99=-388 max=-388
+  lite ping   launch n=18 min=364 p50=369 p90=383 p99=399 max=399  prep n=18 min=1477 p50=1478 p90=1479 p99=1581 max=1581
+  lite ping   notify n=18 min=8 p50=11 p90=11 p99=12 max=12
+  lite ping   busyAtSwitch=0 stateErr=0
+  sensor->pro  pings=18 {'HIT': 18} hit=100.0%  offset n=18 min=6780 p50=6810 p90=6810 p99=6810 max=6810
+  sensor->lite pings=18 {'HIT': 18} hit=100.0%  offset n=18 min=6261 p50=6291 p90=6291 p99=6352 max=6352
+  sensor wake err n=36 min=90 p50=90 p90=90 p99=90 max=90
+=== save (beacon 303 s, ping 600 s)
+  pro  beacon err    n=140 min=415 p50=462 p90=466 p99=483 max=485
+  pro  beacon start  n=140 min=0 p50=0 p90=0 p99=1 max=1
+  pro  beacon lag    n=140 min=230 p50=237 p90=242 p99=265 max=6195
+  pro  beacon launch n=140 min=415 p50=462 p90=466 p99=483 max=485  prep n=140 min=2534 p50=2905 p90=2942 p99=3081 max=3230
+  pro  beacon busyAtSwitch=1 stateErr=0
+  pro  ping   err    n=15 min=459 p50=462 p90=472 p99=482 max=482
+  pro  ping   start  n=15 min=0 p50=0 p90=0 p99=1 max=1
+  pro  ping   lag    n=15 min=234 p50=237 p90=241 p99=253 max=253
+  pro  ping   launch n=15 min=459 p50=462 p90=471 p99=482 max=482  prep n=15 min=2916 p50=2931 p90=2977 p99=2981 max=2981
+  pro  ping   notify n=15 min=10 p50=10 p90=42 p99=45 max=45
+  pro  ping   busyAtSwitch=0 stateErr=0
+  lite beacon err    n=139 min=364 p50=370 p90=456 p99=17798 max=18658
+  lite beacon start  n=139 min=0 p50=1 p90=1 p99=17434 max=18294
+  lite beacon lag    n=139 min=-422 p50=-389 p90=12765 p99=23639 max=24372
+  lite beacon launch n=139 min=363 p50=368 p90=409 p99=455 max=472  prep n=139 min=1453 p50=1467 p90=1477 p99=1524 max=1569
+  lite beacon busyAtSwitch=21 stateErr=0
+  lite ping   err    n=15 min=364 p50=366 p90=408 p99=14135 max=14135
+  lite ping   start  n=15 min=0 p50=1 p90=1 p99=13771 max=13771
+  lite ping   lag    n=15 min=-393 p50=-389 p90=11993 p99=18965 max=18965
+  lite ping   launch n=15 min=364 p50=365 p90=404 p99=407 max=407  prep n=15 min=1477 p50=1478 p90=1545 p99=1581 max=1581
+  lite ping   notify n=15 min=8 p50=10 p90=44 p99=47 max=47
+  lite ping   busyAtSwitch=0 stateErr=0
+  sensor->pro  pings=15 {'HIT': 15} hit=100.0%  offset n=15 min=6810 p50=6841 p90=8641 p99=10503 max=10503
+  sensor->lite pings=15 {'HIT': 15} hit=100.0%  offset n=15 min=6261 p50=6291 p90=20055 p99=34032 max=34032
+  sensor wake err n=30 min=90 p50=90 p90=90 p99=90 max=90
+=== mqtt-tls (beacon 303 s, ping 600 s)
+  pro  beacon err    n=139 min=442 p50=467 p90=486 p99=2766 max=27730
+  pro  beacon start  n=139 min=0 p50=0 p90=0 p99=243 max=2275
+  pro  beacon lag    n=139 min=-27033 p50=235 p90=239 p99=252 max=274
+  pro  beacon launch n=139 min=442 p50=466 p90=486 p99=716 max=27730  prep n=139 min=2595 p50=2961 p90=3238 p99=3638 max=12303
+  pro  beacon busyAtSwitch=1 stateErr=0
+  pro  ping   err    n=16 min=441 p50=471 p90=493 p99=506 max=506
+  pro  ping   start  n=16 min=0 p50=0 p90=1 p99=1 max=1
+  pro  ping   lag    n=16 min=223 p50=235 p90=240 p99=241 max=241
+  pro  ping   launch n=16 min=441 p50=471 p90=492 p99=506 max=506  prep n=16 min=2930 p50=3020 p90=3246 p99=3404 max=3404
+  pro  ping   notify n=16 min=10 p50=10 p90=15 p99=30 max=30
+  pro  ping   busyAtSwitch=0 stateErr=0
+  lite beacon err    n=140 min=364 p50=371 p90=447 p99=480 max=482
+  lite beacon start  n=140 min=0 p50=1 p90=1 p99=2 max=3
+  lite beacon lag    n=140 min=-402 p50=-389 p90=-387 p99=-384 max=-354
+  lite beacon launch n=140 min=363 p50=370 p90=446 p99=479 max=482  prep n=140 min=1463 p50=1470 p90=1511 p99=1674 max=1730
+  lite beacon busyAtSwitch=1 stateErr=0
+  lite ping   err    n=15 min=364 p50=370 p90=469 p99=498 max=498
+  lite ping   start  n=15 min=0 p50=1 p90=1 p99=1 max=1
+  lite ping   lag    n=15 min=-397 p50=-391 p90=-387 p99=-386 max=-386
+  lite ping   launch n=15 min=364 p50=369 p90=469 p99=498 max=498  prep n=15 min=1475 p50=1483 p90=1532 p99=1734 max=1734
+  lite ping   notify n=15 min=11 p50=11 p90=12 p99=12 max=12
+  lite ping   busyAtSwitch=0 stateErr=0
+  sensor->pro  pings=14 {'HIT': 14} hit=100.0%  offset n=14 min=6780 p50=6841 p90=6841 p99=6871 max=6871
+  sensor->lite pings=15 {'HIT': 15} hit=100.0%  offset n=15 min=6230 p50=6291 p90=6383 p99=6413 max=6413
+  sensor wake err n=29 min=90 p50=90 p90=90 p99=90 max=90
+=== upload (beacon 303 s, ping 581 s)
+  pro  beacon err    n=139 min=420 p50=445 p90=12276 p99=82679 max=85101
+  pro  beacon start  n=139 min=0 p50=0 p90=6661 p99=82206 max=84631
+  pro  beacon lag    n=139 min=-3133 p50=242 p90=41608 p99=84223 max=85202
+  pro  beacon launch n=139 min=397 p50=444 p90=490 p99=5621 max=5628  prep n=139 min=2499 p50=2881 p90=3181 p99=8958 max=89028
+  pro  beacon busyAtSwitch=0 stateErr=0
+  pro  ping   err    n=14 min=425 p50=443 p90=1700 p99=5044 max=5044
+  pro  ping   start  n=14 min=0 p50=0 p90=1250 p99=4583 max=4583
+  pro  ping   lag    n=14 min=238 p50=241 p90=244 p99=247 max=247
+  pro  ping   launch n=14 min=425 p50=443 p90=454 p99=461 max=461  prep n=14 min=2640 p50=2880 p90=3909 p99=4086 max=4086
+  pro  ping   notify n=14 min=10 p50=16 p90=50 p99=815 max=815
+  pro  ping   busyAtSwitch=0 stateErr=0
+  lite beacon err    n=138 min=364 p50=434 p90=58923 p99=156727 max=160140
+  lite beacon start  n=138 min=0 p50=1 p90=58467 p99=150608 max=156197
+  lite beacon lag    n=138 min=-9913 p50=-387 p90=47854 p99=145281 max=153770
+  lite beacon launch n=138 min=363 p50=416 p90=535 p99=10232 max=10290  prep n=138 min=1464 p50=1471 p90=1884 p99=11215 max=11353
+  lite beacon busyAtSwitch=3 stateErr=0
+  lite ping   err    n=15 min=366 p50=437 p90=108916 p99=150866 max=150866
+  lite ping   start  n=15 min=0 p50=1 p90=108480 p99=150411 max=150411
+  lite ping   lag    n=15 min=-398 p50=5946 p90=132623 p99=164173 max=164173
+  lite ping   launch n=15 min=365 p50=405 p90=514 p99=564 max=564  prep n=15 min=1477 p50=1796 p90=1902 p99=1912 max=1912
+  lite ping   notify n=15 min=8 p50=11 p90=185 p99=186 max=186
+  lite ping   busyAtSwitch=0 stateErr=0
+  sensor->pro  pings=14 {'HIT': 14} hit=100.0%  offset n=14 min=6780 p50=6810 p90=15386 p99=52831 max=52831
+  sensor->lite pings=14 {'HIT': 11, 'PREAMBLE': 3} hit=78.6%  offset n=11 min=6291 p50=6352 p90=25792 p99=48741 max=48741
+  sensor wake err n=25 min=90 p50=90 p90=90 p99=90 max=90
+=== lte (beacon 303 s, ping 600 s)
+  pro  beacon err    n=140 min=392 p50=439 p90=457 p99=471 max=484
+  pro  beacon start  n=140 min=0 p50=0 p90=0 p99=1 max=1
+  pro  beacon lag    n=140 min=236 p50=241 p90=244 p99=246 max=248
+  pro  beacon launch n=140 min=392 p50=439 p90=457 p99=471 max=484  prep n=140 min=2019 p50=2782 p90=3030 p99=3148 max=3378
+  pro  beacon busyAtSwitch=0 stateErr=0
+  pro  ping   err    n=15 min=391 p50=396 p90=403 p99=403 max=403
+  pro  ping   start  n=15 min=0 p50=0 p90=0 p99=0 max=0
+  pro  ping   lag    n=15 min=235 p50=241 p90=243 p99=244 max=244
+  pro  ping   launch n=15 min=391 p50=396 p90=403 p99=403 max=403  prep n=15 min=2050 p50=2073 p90=2184 p99=2391 max=2391
+  pro  ping   notify n=15 min=9 p50=10 p90=10 p99=16 max=16
+  pro  ping   busyAtSwitch=0 stateErr=0
+  lite ping   err    n=15 min=365 p50=367 p90=399 p99=400 max=400
+  lite ping   start  n=15 min=0 p50=1 p90=1 p99=1 max=1
+  lite ping   lag    n=15 min=-396 p50=-390 p90=-388 p99=-387 max=-387
+  lite ping   launch n=15 min=364 p50=366 p90=398 p99=399 max=399  prep n=15 min=1478 p50=1478 p90=1482 p99=1483 max=1483
+  lite ping   notify n=15 min=8 p50=11 p90=11 p99=11 max=11
+  lite ping   busyAtSwitch=0 stateErr=0
+  sensor->pro  pings=14 {'HIT': 14} hit=100.0%  offset n=14 min=6749 p50=6749 p90=6780 p99=6780 max=6780
+  sensor->lite pings=15 {'HIT': 15} hit=100.0%  offset n=15 min=6261 p50=6261 p90=6291 p99=6291 max=6291
+  sensor wake err n=29 min=90 p50=90 p90=90 p99=90 max=90

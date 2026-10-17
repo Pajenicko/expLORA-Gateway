@@ -1,0 +1,8 @@
+{
+  "name": "explora-protocol",
+  "version": "0.1.0",
+  "description": "expLORA protocol generation 2: frame codec, TLV, key derivation, CMAC/CTR over a platform AES-128 primitive, counter window. Pure C++17, no Arduino dependency.",
+  "license": "GPL-3.0-or-later",
+  "frameworks": "*",
+  "platforms": "*"
+}
