@@ -56,6 +56,11 @@ bool Uplink::stationEnabled() const
 // Start AP and/or station
 void Uplink::begin()
 {
+    // Credentials live in our own configuration: do not let the WiFi library
+    // write them to NVS on every mode change / begin() (a flash write outside
+    // the flash write permit, Hardware/FlashPermit.h)
+    WiFi.persistent(false);
+
     logger.info("Configuring WiFi. ConfigMode: " + String(config.configMode ? "true" : "false") +
                 ", SSID length: " + String(config.wifiSSID.length()));
 

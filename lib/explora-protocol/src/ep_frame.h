@@ -121,17 +121,20 @@ size_t buildData(AesEncryptFn aes, const KeyPair &keys, FrameType type, uint32_t
                  uint32_t confFcnt, uint8_t fctrl, const uint8_t *payload, size_t payloadLen, uint8_t *out,
                  size_t outCap);
 
-// Verify the MIC with the expanded counter and decrypt. payloadOut must hold
-// len - kDataOverhead bytes. Nothing is written when the MIC fails.
+// Verify the MIC with the expanded counter and decrypt. expected is the
+// frame type this receiver accepts (sensor: Down, gateway: Up); any other
+// type is rejected before the MIC, so a replayed frame of the opposite
+// direction can never be parsed with the wrong TLV registry. payloadOut must
+// hold len - kDataOverhead bytes. Nothing is written when a check fails.
 // Mandatory order on reception:
-//   1. peekFrame()  - type, DevID, FCnt16 (no crypto)
+//   1. peekFrame()  - check info.type == the expected type; DevID, FCnt16
 //   2. expandFcnt() - FCnt32 against the last accepted counter (ep_counter.h)
-//   3. openData()   - MIC check + decryption with that FCnt32
+//   3. openData()   - type check again, FCnt16 match, MIC, decryption
 //   4. only now store FCnt32 as the last accepted counter
 // Storing the counter before the MIC verified lets a forged frame block the
 // session; skipping step 2 accepts replays.
-bool openData(AesEncryptFn aes, const KeyPair &keys, const uint8_t *frame, size_t len, uint32_t fcnt32,
-              uint32_t confFcnt, uint8_t *payloadOut, size_t &payloadLen);
+bool openData(AesEncryptFn aes, const KeyPair &keys, FrameType expected, const uint8_t *frame, size_t len,
+              uint32_t fcnt32, uint32_t confFcnt, uint8_t *payloadOut, size_t &payloadLen);
 
 // --- JOIN_REQ --------------------------------------------------------------
 

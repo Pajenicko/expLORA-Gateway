@@ -21,6 +21,8 @@
 
 #include "LoRaRadio.h"
 #include "board_config.h"
+#include <esp_timer.h>
+#include "FlashPermit.h"
 
 #if defined(RADIO_SX1276)
 #include "Radio_SX1276.h"
@@ -30,25 +32,74 @@
 #error "board_config.h must define RADIO_SX1276 or RADIO_SX1262"
 #endif
 
-// Initialization of static variables
-volatile bool LoRaRadio::interruptOccurred = false;
+// Shared between the DIO interrupt and the tasks, always under isrLock
+static portMUX_TYPE isrLock = portMUX_INITIALIZER_UNLOCKED;
+static TaskHandle_t notifyTask = nullptr;
+static int64_t interruptTimeUs = 0;
+static bool interruptDuringWrite = false; // a flash write section was open at the interrupt
+static uint32_t interruptClosedSections = 0; // closed write sections at the interrupt
+static bool interruptPending = false; // came before notifyTask was set
 
-// Interrupt handler
+// DIO interrupt: timestamp first, then wake the radio task
 void IRAM_ATTR LoRaRadio::handleInterrupt()
 {
-    interruptOccurred = true;
+    int64_t now = esp_timer_get_time();
+    bool writing = FlashPermit::flashWriteSections != 0;
+    uint32_t closed = FlashPermit::flashSectionsClosed;
+    portENTER_CRITICAL_ISR(&isrLock);
+    interruptTimeUs = now;
+    interruptDuringWrite = writing;
+    interruptClosedSections = closed;
+    TaskHandle_t task = notifyTask;
+    if (task == nullptr)
+    {
+        interruptPending = true;
+    }
+    portEXIT_CRITICAL_ISR(&isrLock);
+    if (task == nullptr)
+    {
+        return;
+    }
+    BaseType_t woken = pdFALSE;
+    vTaskNotifyGiveFromISR(task, &woken);
+    if (woken)
+    {
+        portYIELD_FROM_ISR();
+    }
 }
 
-// Check if interrupt occurred
-bool LoRaRadio::hasInterrupt()
+void LoRaRadio::setNotifyTask(TaskHandle_t task)
 {
-    return interruptOccurred;
+    portENTER_CRITICAL(&isrLock);
+    notifyTask = task;
+    bool pending = interruptPending && task != nullptr;
+    if (pending)
+    {
+        interruptPending = false;
+    }
+    portEXIT_CRITICAL(&isrLock);
+    if (pending)
+    {
+        xTaskNotifyGive(task);
+    }
 }
 
-// Clear interrupt flag
-void LoRaRadio::clearInterrupt()
+int64_t LoRaRadio::lastInterruptUs(bool *duringWrite, uint32_t *closedSections)
 {
-    interruptOccurred = false;
+    portENTER_CRITICAL(&isrLock); // 64-bit value, no torn read
+    int64_t t = interruptTimeUs;
+    bool w = interruptDuringWrite;
+    uint32_t c = interruptClosedSections;
+    portEXIT_CRITICAL(&isrLock);
+    if (duringWrite)
+    {
+        *duringWrite = w;
+    }
+    if (closedSections)
+    {
+        *closedSections = c;
+    }
+    return t;
 }
 
 // Create the radio driver selected in board_config.h

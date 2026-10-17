@@ -23,6 +23,7 @@
 #include "SensorCalibration.h"
 #include <ArduinoJson.h>
 #include <LittleFS.h>
+#include "../Hardware/FlashPermit.h"
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <memory>
@@ -556,7 +557,7 @@ bool SensorManager::updateSensorConfig(int index, const String &name, SensorType
                                        float windSpeedCorr, int windDirCorr,
                                        float rainAmountCorr, float rainRateCorr)
 {
-    std::lock_guard<std::mutex> lock(sensorMutex);
+    std::unique_lock<std::mutex> lock(sensorMutex);
 
     if (index < 0 || index >= sensorCount || !sensors[index].configured)
     {
@@ -603,13 +604,13 @@ bool SensorManager::updateSensorConfig(int index, const String &name, SensorType
     sensors[index].rainRateCorrection = rainRateCorr;
 
     logger.info("Updated configuration for sensor: " + name + " (SN: " + formatSN(serialNumber) + ")");
-    return saveSensors(false); // false: kept in RAM, but not on flash
+    return saveAndUnlock(lock);
 }
 
 // Delete sensor
 bool SensorManager::deleteSensor(int index)
 {
-    std::lock_guard<std::mutex> lock(sensorMutex);
+    std::unique_lock<std::mutex> lock(sensorMutex);
 
     if (index < 0 || index >= sensorCount || !sensors[index].configured)
     {
@@ -624,7 +625,7 @@ bool SensorManager::deleteSensor(int index)
     sensors[index].configured = false;
 
     logger.info("Deleted sensor: " + name + " (SN: " + formatSN(serialNumber) + ")");
-    return saveSensors(false);
+    return saveAndUnlock(lock);
 }
 
 // Get number of sensors
@@ -716,32 +717,52 @@ static constexpr unsigned long RAIN_SAVE_INTERVAL = 600000;
 
 void SensorManager::process(unsigned long now)
 {
-    std::lock_guard<std::mutex> lock(sensorMutex);
+    std::unique_lock<std::mutex> lock(sensorMutex);
     if (rainDirty && now - lastRainSave > RAIN_SAVE_INTERVAL)
     {
         // Next attempt after a full interval even when this one fails
         lastRainSave = now;
-        saveSensorsLocked();
+        saveAndUnlock(lock);
     }
 }
 
 // JSON members per stored sensor (see saveSensorsLocked)
 static constexpr size_t SENSOR_JSON_FIELDS = 20;
 
-// Save sensor configuration to file
-bool SensorManager::saveSensors(bool lockMutex)
+// Save sensor configuration to file (caller must not hold sensorMutex)
+bool SensorManager::saveSensors()
 {
-    if (lockMutex)
-    {
-        std::lock_guard<std::mutex> lock(sensorMutex);
-        return saveSensorsLocked();
-    }
-    return saveSensorsLocked();
+    std::unique_lock<std::mutex> lock(sensorMutex);
+    return saveAndUnlock(lock);
 }
 
-// Caller holds sensorMutex. Written to a temporary file and renamed, so a
-// failure never leaves a truncated configuration behind.
-bool SensorManager::saveSensorsLocked()
+// Snapshot under the held lock, release it, then write: the flash write
+// (and the wait for the flash write permit, Hardware/FlashPermit.h) never
+// blocks other users of sensorMutex, and the permit is never requested
+// while sensorMutex is held
+bool SensorManager::saveAndUnlock(std::unique_lock<std::mutex> &lock)
+{
+    String json;
+    bool hasRain = rainDirty;
+    if (!snapshotLocked(json))
+    {
+        return false;
+    }
+    uint32_t seq = ++snapshotSeq;
+    rainDirty = false;
+    lock.unlock();
+
+    bool ok = writeSnapshot(json, seq);
+    if (!ok && hasRain)
+    {
+        std::lock_guard<std::mutex> relock(sensorMutex);
+        rainDirty = true; // retried after the next interval
+    }
+    return ok;
+}
+
+// Caller holds sensorMutex: serialize the configured sensors
+bool SensorManager::snapshotLocked(String &json)
 {
     size_t textSize = 0;
     for (size_t i = 0; i < sensorCount; i++)
@@ -794,7 +815,26 @@ bool SensorManager::saveSensorsLocked()
         logger.error("Sensor configuration does not fit the JSON document - not saved");
         return false;
     }
+    if (serializeJson(doc, json) == 0)
+    {
+        logger.error("Not enough memory to serialize the sensor configuration");
+        return false;
+    }
+    return true;
+}
 
+// Write a snapshot without sensorMutex. Writers are serialized by the flash
+// write permit; a snapshot older than the last one written is skipped
+bool SensorManager::writeSnapshot(const String &json, uint32_t seq)
+{
+    FlashWriteGuard flashGuard;
+    // Writers that timed out on the permit run concurrently: the file itself
+    // (tmp file, remove, rename, writtenSeq) is still written by one at a time
+    std::lock_guard<std::mutex> fileLock(fileMutex);
+    if ((int32_t)(seq - writtenSeq) <= 0)
+    {
+        return true; // a newer snapshot is already on flash
+    }
     String tmpFile = String(sensorsFile) + ".tmp";
     File file = LittleFS.open(tmpFile, "w");
     if (!file)
@@ -802,10 +842,9 @@ bool SensorManager::saveSensorsLocked()
         logger.error("Failed to open " + tmpFile + " for writing");
         return false;
     }
-    size_t jsonSize = measureJson(doc);
-    size_t bytesWritten = serializeJson(doc, file);
+    size_t bytesWritten = file.print(json);
     file.close();
-    if (jsonSize == 0 || bytesWritten != jsonSize)
+    if (json.length() == 0 || bytesWritten != json.length())
     {
         logger.error("Failed to write sensor configuration");
         LittleFS.remove(tmpFile);
@@ -818,15 +857,15 @@ bool SensorManager::saveSensorsLocked()
         return false;
     }
 
-    rainDirty = false;
-    lastRainSave = millis();
-    logger.info("Saved " + String(sensorArray.size()) + " sensors to " + String(sensorsFile));
+    writtenSeq = seq;
+    logger.info("Saved the sensor configuration to " + String(sensorsFile));
     return true;
 }
 
 // Load sensor configuration from file
 bool SensorManager::loadSensors()
 {
+    FlashWriteGuard flashGuard; // lock order: flash permit before sensorMutex
     std::lock_guard<std::mutex> lock(sensorMutex);
 
     // Reset sensor count

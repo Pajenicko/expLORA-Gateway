@@ -1,5 +1,10 @@
 # Protocol v2 – milestone M0 timing spike (throw-away)
 
+> Since milestone M2a the hooks in `src/main.cpp` and the `pro_spike` /
+> `lite_spike` environments are gone (the production radio task replaced
+> them). To repeat the measurements check out commit `3d78ed1` and add
+> `spike/platformio.ini` to `extra_configs` again. The results stay valid.
+
 Measures how precisely the gateway can answer a sensor 1000 ms after RxDone
 on 869.525 MHz (the planned RX1 window), idle and under load, on both
 gateways. The code is not production code: the radio task of milestone M2a

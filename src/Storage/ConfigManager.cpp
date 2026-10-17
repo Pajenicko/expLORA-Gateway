@@ -24,6 +24,7 @@
 #include <WiFi.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
+#include "../Hardware/FlashPermit.h"
 
 // Constructor
 ConfigManager::ConfigManager(Logger &log, const char *file)
@@ -47,7 +48,8 @@ ConfigManager::~ConfigManager()
 // Initialization
 bool ConfigManager::init()
 {
-    // Initialize Preferences
+    // Initialize Preferences (creates the namespace on the first boot)
+    FlashWriteGuard flashGuard; // see Hardware/FlashPermit.h
     preferencesInitialized = preferences.begin("sverio", false);
 
     if (!preferencesInitialized)
@@ -66,6 +68,7 @@ bool ConfigManager::init()
 // Load configuration from both sources
 bool ConfigManager::load()
 {
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
     std::lock_guard<std::recursive_mutex> guard(configMutex);
     bool fsSuccess = loadFromFS();
     bool prefSuccess = loadFromPreferences();
@@ -86,6 +89,7 @@ bool ConfigManager::load()
 // Save configuration to both sources
 bool ConfigManager::save()
 {
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
     std::lock_guard<std::recursive_mutex> guard(configMutex);
     bool fsSuccess = saveToFS();
     bool prefSuccess = saveToPreferences();
@@ -114,6 +118,7 @@ bool ConfigManager::save()
 // Loading from LittleFS
 bool ConfigManager::loadFromFS()
 {
+    FlashWriteGuard flashGuard; // see Hardware/FlashPermit.h
     // Power lost between removing the old file and renaming the new one
     String tmpFile = String(configFile) + ".tmp";
     if (!LittleFS.exists(configFile) && LittleFS.exists(tmpFile))
@@ -205,6 +210,7 @@ bool ConfigManager::saveToFS()
     }
 
     String tmpFile = String(configFile) + ".tmp";
+    FlashWriteGuard flashGuard; // see Hardware/FlashPermit.h
     File file = LittleFS.open(tmpFile, "w");
     if (!file)
     {
@@ -320,6 +326,7 @@ bool ConfigManager::loadFromPreferences()
 // Saving to Preferences
 bool ConfigManager::saveToPreferences()
 {
+    FlashWriteGuard flashGuard; // see Hardware/FlashPermit.h
     if (!preferencesInitialized)
     {
         return false;
@@ -363,6 +370,7 @@ bool ConfigManager::saveToPreferences()
 // Add a new method to set MQTT configuration
 bool ConfigManager::setLteConfig(bool enabled, const String &apn, const String &pin, bool saveConfig)
 {
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
     std::lock_guard<std::recursive_mutex> guard(configMutex);
     // PIN: empty or 4-8 digits
     bool pinOk = pin.length() == 0 || (pin.length() >= 4 && pin.length() <= 8);
@@ -434,6 +442,7 @@ static bool parseIPv4(const String &text, String &normalized)
 String ConfigManager::setEthernetConfig(bool useStatic, const String &ip, const String &mask, const String &gateway,
                                         const String &dns1, const String &dns2, bool saveConfig)
 {
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
     std::lock_guard<std::recursive_mutex> guard(configMutex);
     String nIp, nMask, nGateway, nDns1, nDns2;
     bool ipOk = parseIPv4(ip, nIp);
@@ -502,6 +511,7 @@ String ConfigManager::setEthernetConfig(bool useStatic, const String &ip, const 
 
 void ConfigManager::setLtePinRejected(bool rejected)
 {
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
     std::lock_guard<std::recursive_mutex> guard(configMutex);
     ltePinRejected = rejected;
     if (preferencesInitialized)
@@ -512,6 +522,7 @@ void ConfigManager::setLtePinRejected(bool rejected)
 
 bool ConfigManager::setAdminPasswordHash(const String &hash)
 {
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
     std::lock_guard<std::recursive_mutex> guard(configMutex);
     if (!preferencesInitialized)
     {
@@ -541,6 +552,7 @@ bool ConfigManager::setMqttConfig(const String &host, int port, const String &us
                                   const String &rootPrefix, const String &haPrefix, bool haEnable,
                                   bool saveConfig)
 {
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
     std::lock_guard<std::recursive_mutex> guard(configMutex);
     // Validate MQTT topic format (basic validation)
     // A prefix stored by an older version (e.g. with '/') may be kept as it is
@@ -679,6 +691,7 @@ String ConfigManager::getDeviceName() const
 // Set WiFi configuration
 bool ConfigManager::setWiFiConfig(const String &ssid, const String &password, bool saveConfig)
 {
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
     std::lock_guard<std::recursive_mutex> guard(configMutex);
     wifiSSID = ssid;
     wifiPassword = password;
@@ -696,6 +709,7 @@ bool ConfigManager::setWiFiConfig(const String &ssid, const String &password, bo
 // Switch to configuration mode (AP)
 void ConfigManager::enableConfigMode(bool enable, bool saveConfig)
 {
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
     std::lock_guard<std::recursive_mutex> guard(configMutex);
     // Called on every boot - only write flash when it changes
     if (configMode == enable)
@@ -713,6 +727,7 @@ void ConfigManager::enableConfigMode(bool enable, bool saveConfig)
 // Set logging level
 void ConfigManager::setLogLevel(LogLevel level, bool saveConfig)
 {
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
     std::lock_guard<std::recursive_mutex> guard(configMutex);
     logLevel = level;
 

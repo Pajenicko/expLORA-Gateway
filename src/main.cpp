@@ -38,6 +38,7 @@
 
 // Hardware
 #include "Hardware/LoRaRadio.h"
+#include "Hardware/RadioTask.h"
 #include "Network/Uplink.h"
 #include "Hardware/PSRAM_Manager.h"
 #include "Hardware/PowerSource.h"
@@ -55,10 +56,6 @@
 // Web interface
 #include "Web/WebServer.h"
 #include "Web/HTMLGenerator.h"
-
-#ifdef SPIKE_PINGPONG
-#include "SpikePingPong.h" // protocol v2 M0 timing spike (spike/gateway)
-#endif
 
 // Global object instances
 Logger logger;                // Logging system
@@ -215,11 +212,8 @@ void setup()
                               configManager->configMode, *configManager, configManager->timezone);
 
     // LoRa module initialization
-#ifdef SPIKE_PINGPONG
-    loraModule = spikeCreateRadio(logger, spiManager);
-#else
+    // The radio and its SPI bus belong to the radio task from here on
     loraModule = createLoRaRadio(logger, spiManager);
-#endif
     if (!loraModule->init())
     {
         logger.error("Failed to initialize LoRa module");
@@ -228,9 +222,14 @@ void setup()
     {
         logger.info(String("LoRa module initialized successfully (") + loraModule->getChipName() + ")");
     }
+    // Started even after a failed init: the health check re-initializes the chip
+    if (!RadioTask::start(loraModule, logger))
+    {
+        logger.error("Failed to start the radio task");
+    }
 
     // LoRa protocol initialization
-    loraProtocol = new LoRaProtocol(*loraModule, *sensorManager, logger);
+    loraProtocol = new LoRaProtocol(*sensorManager, logger);
 
     // Initialize MQTT Manager
     mqttManager = new MQTTManager(*sensorManager, *configManager, logger);
@@ -291,14 +290,6 @@ void loop()
     uplink->process();
     powerSource->process();
 
-    // Process LoRa packets
-    // if (loraModule && loraProtocol) {
-    //    if (LoRaRadio::hasInterrupt()) {
-    //        logger.debug("LoRa interrupt detected");
-    //        loraProtocol->processReceivedPacket();
-    //    }
-    //}
-
     // If in AP mode, process DNS captive portal:
     if (webPortal && webPortal->isInAPMode())
     {
@@ -317,18 +308,18 @@ void loop()
         mqttManager->process(); // pauses the watchdog itself around socket work
     }
 
-    // Add a check for LoRa packet processing to publish to MQTT
-    static unsigned int lastProcessedIndex = -1;
-    if (loraModule && loraProtocol && LoRaRadio::hasInterrupt())
+    // What the radio task counted (it never logs itself)
+    RadioTask::logEvents(logger);
+
+    // LoRa packets queued by the radio task (a few per pass, the rest wait
+    // in the queue), published to MQTT when decoded
+    static RadioPacket packet; // 280 bytes, kept off the loop stack
+    for (int i = 0; i < 4 && loraProtocol && RadioTask::receive(packet); i++)
     {
-        if (loraProtocol->processReceivedPacket())
+        if (loraProtocol->processPacket(packet) && mqttManager && uplink->isOnline())
         {
-            // If we have a mqttManager and it's connected, publish the latest sensor data
-            if (mqttManager && uplink->isOnline())
-            {
-                WatchdogPause pause;
-                mqttManager->publishSensorData(loraProtocol->getLastProcessedSensorIndex());
-            }
+            WatchdogPause pause;
+            mqttManager->publishSensorData(loraProtocol->getLastProcessedSensorIndex());
         }
     }
 
@@ -351,7 +342,7 @@ void loop()
             logger.error("Heap fragmented for 15 minutes - restarting");
             if (sensorManager)
             {
-                sensorManager->saveSensors(true); // keep the rain totals
+                sensorManager->saveSensors(); // keep the rain totals
             }
             delay(200);
             ESP.restart();
@@ -362,27 +353,10 @@ void loop()
         lowBlockSince = 0;
     }
 
-    // Radio health: a chip that stopped answering (brown-out, ESD) is
-    // re-initialized instead of silently receiving nothing
-    static unsigned long lastRadioCheck = 0;
-    if (loraModule && millis() - lastRadioCheck > 600000)
-    {
-        lastRadioCheck = millis();
-        if (!loraModule->isConnected())
-        {
-            logger.error("LoRa radio not responding - resetting it");
-            loraModule->reset();
-        }
-    }
-
     if (sensorManager)
     {
         sensorManager->process(millis());
     }
-
-#ifdef SPIKE_PINGPONG
-    spikeLoop(sensorManager);
-#endif
 
     // Serial console: "reset-password" clears a forgotten web admin password
     static String serialLine;
@@ -396,15 +370,10 @@ void loop()
             {
                 webPortal->resetAdminPassword();
             }
-#ifdef SPIKE_PINGPONG
-            else if (serialLine.startsWith("spike-"))
-            {
-                spikeCommand(serialLine, sensorManager);
-            }
-#endif
+
             serialLine = "";
         }
-        else if (serialLine.length() < 48)
+        else if (serialLine.length() < 32)
         {
             serialLine += c;
         }

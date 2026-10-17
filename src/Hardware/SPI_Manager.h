@@ -31,6 +31,8 @@
  * Class for SPI communication management
  *
  * Ensures initialization and management of SPI interface for communication with LoRa module and other peripherals.
+ * After setup() the bus is private to the radio task (RadioTask.h): no other
+ * code may use it.
  */
 class SPIManager
 {
@@ -51,7 +53,7 @@ public:
     ~SPIManager();
 
     // SPI initialization
-    bool init();
+    bool init(bool quiet = false); // quiet: no logging (radio task)
 
     // SPI reset
     bool reset();

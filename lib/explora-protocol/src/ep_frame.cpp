@@ -132,12 +132,12 @@ size_t buildData(AesEncryptFn aes, const KeyPair &keys, FrameType type, uint32_t
     return len + kMicLen;
 }
 
-bool openData(AesEncryptFn aes, const KeyPair &keys, const uint8_t *frame, size_t len, uint32_t fcnt32,
-              uint32_t confFcnt, uint8_t *payloadOut, size_t &payloadLen)
+bool openData(AesEncryptFn aes, const KeyPair &keys, FrameType expected, const uint8_t *frame, size_t len,
+              uint32_t fcnt32, uint32_t confFcnt, uint8_t *payloadOut, size_t &payloadLen)
 {
     FrameInfo info;
-    if (!peekFrame(frame, len, info) || (info.type != FrameType::Up && info.type != FrameType::Down) ||
-        (uint16_t)fcnt32 != info.fcnt16)
+    if ((expected != FrameType::Up && expected != FrameType::Down) || !peekFrame(frame, len, info) ||
+        info.type != expected || (uint16_t)fcnt32 != info.fcnt16)
     {
         return false;
     }
@@ -215,8 +215,13 @@ size_t buildJoinAccept(AesEncryptFn aes, const KeyPair &joinKeys, uint32_t devId
                        uint32_t gwNonce, uint8_t configVersion, const uint8_t *tlv, size_t tlvLen, uint8_t *out,
                        size_t outCap)
 {
+    // Bound tlvLen before adding, so a huge value cannot wrap the sum
+    if (tlvLen > kMaxFrame - kJoinAcceptMinLen || (tlvLen > 0 && tlv == nullptr))
+    {
+        return 0;
+    }
     const size_t len = kJoinAcceptMinLen + tlvLen;
-    if (len > kMaxFrame || outCap < len || (tlvLen > 0 && tlv == nullptr))
+    if (outCap < len)
     {
         return 0;
     }

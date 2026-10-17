@@ -24,8 +24,8 @@
 #include "SensorParsers.h"
 
 // Constructor
-LoRaProtocol::LoRaProtocol(LoRaRadio &module, SensorManager &manager, Logger &log)
-    : loraModule(module), sensorManager(manager), logger(log), lastProcessedSensorIndex(-1)
+LoRaProtocol::LoRaProtocol(SensorManager &manager, Logger &log)
+    : sensorManager(manager), logger(log), lastProcessedSensorIndex(-1)
 {
 }
 
@@ -35,26 +35,15 @@ LoRaProtocol::~LoRaProtocol()
     // Nothing specific to release
 }
 
-// Process received packet
-bool LoRaProtocol::processReceivedPacket()
+// Process a packet received by the radio task
+bool LoRaProtocol::processPacket(const RadioPacket &packet)
 {
-    yield();
-    // Check if data was received
-    if (!loraModule.hasInterrupt())
+    const uint8_t length = packet.length;
+    if (length == 0)
     {
         return false;
     }
-
-    // Reset interrupt flag
-    loraModule.clearInterrupt();
-
-    // Attempt to receive packet
-    uint8_t length = 0;
-    if (!loraModule.receivePacket(packetBuffer, &length))
-    {
-        logger.warning("Failed to receive packet from LoRa module");
-        return false;
-    }
+    memcpy(packetBuffer, packet.data, length);
 
     // Hex dumps only at DEBUG (each is a heap String per packet)
     const bool dump = Logger::getLogLevel() >= LogLevel::DEBUG;
@@ -71,11 +60,12 @@ bool LoRaProtocol::processReceivedPacket()
         logger.debug(hexData);
     }
 
-    // Get RSSI for diagnostics
-    int rssi = loraModule.getRSSI();
+    // Reception metadata from the radio task
+    int rssi = packet.rssi;
     if (dump)
     {
-        logger.debug("RSSI: " + String(rssi) + " dBm, SNR: " + String(loraModule.getSNR()) + " dB");
+        logger.debug("RSSI: " + String(rssi) + " dBm, SNR: " + String(packet.snr) + " dB, frequency error: " +
+                     String(packet.freqError, 0) + " Hz");
     }
 
     // Attempt to decrypt packet

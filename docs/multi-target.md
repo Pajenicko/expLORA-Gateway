@@ -38,7 +38,22 @@ log buffer size) and `variants/<env>/platformio.ini`.
   same version as the sensor firmware): CRC
   errors are rejected (the old SX1276 driver ignored the flag), RSSI/SNR per
   datasheet, sync word 0x12 (= 0x1424 on SX126x).
-- The radio is re-initialized if it stops answering (checked every 10 min).
+- **Radio task** (`src/Hardware/RadioTask.*`, protocol v2 M2a): a statically
+  allocated FreeRTOS task (core 1, priority 14) owns the radio and its SPI bus
+  after `setup()`. The DIO interrupt timestamps RxDone and wakes it; it reads
+  the packet with RSSI, SNR and frequency error and queues it (8 packets) for
+  `loop()`, so a stalled `loop()` (LTE, TLS) no longer delays or loses packets
+  in the radio. It never logs, never takes `sensorMutex`, never touches
+  LittleFS; `loop()` logs what it counted. A missed interrupt edge is found by
+  polling the DIO line every second. The radio is re-initialized if it stops
+  answering (checked every 10 min, every 30 s while it is not working).
+- **Flash write permit** (`src/Hardware/FlashPermit.*`): every flash writer
+  (LittleFS, Preferences, OTA) takes it first, so a future timed radio
+  response is not delayed by a flash erase (docs/protocol-v2.md §7).
+- `/diag/heap` → `radio`: packets received, CRC/read errors, queue drops and
+  high-water mark, longest RxDone → `loop()` latency, re-initializations,
+  missed interrupts, unreliable timestamps, task stack left, permit waits and
+  timeouts.
 
 ### Pro board
 - Device MAC from eFuse, board name in UI/logs, integration test supports Pro.

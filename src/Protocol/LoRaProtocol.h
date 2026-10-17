@@ -22,20 +22,19 @@
 #pragma once
 
 #include <Arduino.h>
-#include "../Hardware/LoRaRadio.h"
+#include "../Hardware/RadioTask.h"
 #include "../Data/SensorManager.h"
 #include "../Data/Logging.h"
 
 /**
  * Class for LoRa protocol processing
  *
- * Handles reception and decoding of LoRa packets, their decryption
+ * Decodes LoRa packets queued by the radio task: decryption
  * and processing according to sensor type.
  */
 class LoRaProtocol
 {
 private:
-    LoRaRadio &loraModule;       // Reference to LoRa module
     SensorManager &sensorManager; // Reference to sensor manager
     Logger &logger;               // Reference to logger
 
@@ -72,13 +71,13 @@ private:
 
 public:
     // Constructor
-    LoRaProtocol(LoRaRadio &module, SensorManager &manager, Logger &log);
+    LoRaProtocol(SensorManager &manager, Logger &log);
 
     // Destructor
     ~LoRaProtocol();
 
-    // Process received packet
-    bool processReceivedPacket();
+    // Decode one packet received by the radio task (loop() only)
+    bool processPacket(const RadioPacket &packet);
 
     // Decrypt data with key
     void decryptData(uint8_t *data, uint8_t data_len, uint32_t key);

@@ -9,6 +9,7 @@
 
 #include <unity.h>
 #include <cstdio>
+#include <cstdint>
 #include <cstring>
 #include <vector>
 
@@ -245,18 +246,18 @@ static void test_up_vector_and_roundtrip(void)
     TEST_ASSERT_EQUAL_HEX8(kFctrlAck | 1, info.fctrl);
     uint8_t p[64];
     size_t pl = 0;
-    TEST_ASSERT_TRUE(openData(aesSoftEncrypt, sessKeys(), f, n, kVecUpFcnt, 0, p, pl));
+    TEST_ASSERT_TRUE(openData(aesSoftEncrypt, sessKeys(), FrameType::Up, f, n, kVecUpFcnt, 0, p, pl));
     TEST_ASSERT_EQUAL(sizeof(kVecUpTlv), pl);
     TEST_ASSERT_EQUAL_HEX8_ARRAY(kVecUpTlv, p, pl);
     // Wrong high counter bits, flipped bit anywhere, wrong key: MIC fails
-    TEST_ASSERT_FALSE(openData(aesSoftEncrypt, sessKeys(), f, n, kVecUpFcnt + 0x10000, 0, p, pl));
+    TEST_ASSERT_FALSE(openData(aesSoftEncrypt, sessKeys(), FrameType::Up, f, n, kVecUpFcnt + 0x10000, 0, p, pl));
     for (size_t i = 0; i < n; i++)
     {
         f[i] ^= 0x01;
-        TEST_ASSERT_FALSE(openData(aesSoftEncrypt, sessKeys(), f, n, kVecUpFcnt, 0, p, pl));
+        TEST_ASSERT_FALSE(openData(aesSoftEncrypt, sessKeys(), FrameType::Up, f, n, kVecUpFcnt, 0, p, pl));
         f[i] ^= 0x01;
     }
-    TEST_ASSERT_FALSE(openData(aesSoftEncrypt, joinKeys(), f, n, kVecUpFcnt, 0, p, pl));
+    TEST_ASSERT_FALSE(openData(aesSoftEncrypt, joinKeys(), FrameType::Up, f, n, kVecUpFcnt, 0, p, pl));
 }
 
 static void test_down_vector_bound_to_acked_uplink(void)
@@ -268,10 +269,10 @@ static void test_down_vector_bound_to_acked_uplink(void)
     TEST_ASSERT_EQUAL_HEX8_ARRAY(kVecDown, f, n);
     uint8_t p[64];
     size_t pl = 0;
-    TEST_ASSERT_TRUE(openData(aesSoftEncrypt, sessKeys(), f, n, kVecDownFcnt, kVecUpFcnt, p, pl));
+    TEST_ASSERT_TRUE(openData(aesSoftEncrypt, sessKeys(), FrameType::Down, f, n, kVecDownFcnt, kVecUpFcnt, p, pl));
     TEST_ASSERT_EQUAL_HEX8_ARRAY(kVecDownTlv, p, pl);
     // Same DOWN presented as the answer to another uplink: rejected
-    TEST_ASSERT_FALSE(openData(aesSoftEncrypt, sessKeys(), f, n, kVecDownFcnt, kVecUpFcnt + 1, p, pl));
+    TEST_ASSERT_FALSE(openData(aesSoftEncrypt, sessKeys(), FrameType::Down, f, n, kVecDownFcnt, kVecUpFcnt + 1, p, pl));
 }
 
 static void test_up_and_down_keystreams_differ(void)
@@ -291,7 +292,7 @@ static void test_empty_up_is_poll(void)
     size_t n = buildData(aesSoftEncrypt, sessKeys(), FrameType::Up, kVecDevId, 1, 0, kFctrlAck, nullptr, 0, f,
                          sizeof(f));
     TEST_ASSERT_EQUAL(kDataOverhead, n);
-    TEST_ASSERT_TRUE(openData(aesSoftEncrypt, sessKeys(), f, n, 1, 0, p, pl));
+    TEST_ASSERT_TRUE(openData(aesSoftEncrypt, sessKeys(), FrameType::Up, f, n, 1, 0, p, pl));
     TEST_ASSERT_EQUAL(0, pl);
 }
 
@@ -337,6 +338,66 @@ static void test_build_limits(void)
     TEST_ASSERT_EQUAL(0, buildData(aesSoftEncrypt, sessKeys(), FrameType::Up, 1, 0, 0, 0, big, 10, f, 21)); // cap
     TEST_ASSERT_EQUAL(0, buildData(aesSoftEncrypt, sessKeys(), FrameType::JoinReq, 1, 0, 0, 0, big, 1, f,
                                    sizeof(f)));
+}
+
+static void test_open_rejects_wrong_direction(void)
+{
+    // A replayed UP played into the sensor's RX1 window: same session keys,
+    // must not verify as a DOWN
+    uint8_t p[64];
+    size_t pl = 0;
+    TEST_ASSERT_FALSE(
+        openData(aesSoftEncrypt, sessKeys(), FrameType::Down, kVecUp, sizeof(kVecUp), kVecUpFcnt, 0, p, pl));
+    TEST_ASSERT_FALSE(openData(aesSoftEncrypt, sessKeys(), FrameType::Up, kVecDown, sizeof(kVecDown), kVecDownFcnt,
+                               kVecUpFcnt, p, pl));
+    // Join frames are never data frames
+    TEST_ASSERT_FALSE(
+        openData(aesSoftEncrypt, sessKeys(), FrameType::JoinAcc, kVecUp, sizeof(kVecUp), kVecUpFcnt, 0, p, pl));
+}
+
+static void test_open_rejects_fcnt16_mismatch(void)
+{
+    uint8_t p[64];
+    size_t pl = 0;
+    TEST_ASSERT_FALSE(
+        openData(aesSoftEncrypt, sessKeys(), FrameType::Up, kVecUp, sizeof(kVecUp), kVecUpFcnt + 1, 0, p, pl));
+}
+
+static void test_peek_length_limits(void)
+{
+    FrameInfo info;
+    uint8_t f[300] = {0};
+    // UP with 223 payload bytes (one over kMaxPayload)
+    f[0] = makeMhdr(FrameType::Up);
+    TEST_ASSERT_TRUE(peekFrame(f, kDataOverhead + kMaxPayload, info));
+    TEST_ASSERT_FALSE(peekFrame(f, kDataOverhead + kMaxPayload + 1, info));
+    TEST_ASSERT_FALSE(peekFrame(f, kMaxFrame + 1, info));
+    // ACCEPT shorter than the fixed part
+    f[0] = makeMhdr(FrameType::JoinAcc);
+    f[5] = (uint8_t)JoinAccKind::Accept;
+    TEST_ASSERT_TRUE(peekFrame(f, kJoinAcceptMinLen, info));
+    TEST_ASSERT_FALSE(peekFrame(f, kJoinAcceptMinLen - 1, info));
+    // REJOIN only exactly 10 bytes
+    f[5] = (uint8_t)JoinAccKind::Rejoin;
+    TEST_ASSERT_TRUE(peekFrame(f, kRejoinLen, info));
+    TEST_ASSERT_FALSE(peekFrame(f, kRejoinLen + 1, info));
+    TEST_ASSERT_FALSE(peekFrame(f, kRejoinLen - 1, info));
+    f[5] = 7; // unknown kind
+    TEST_ASSERT_FALSE(peekFrame(f, kRejoinLen, info));
+}
+
+static void test_join_accept_size_limits(void)
+{
+    static uint8_t tlv[256] = {0};
+    static uint8_t f[300];
+    const size_t maxTlv = kMaxFrame - kJoinAcceptMinLen; // 240
+    TEST_ASSERT_EQUAL(240, maxTlv);
+    TEST_ASSERT_EQUAL(kMaxFrame, buildJoinAccept(aesSoftEncrypt, joinKeys(), 1, 1, 1, 1, tlv, maxTlv, f, sizeof(f)));
+    TEST_ASSERT_EQUAL(0, buildJoinAccept(aesSoftEncrypt, joinKeys(), 1, 1, 1, 1, tlv, maxTlv + 1, f, sizeof(f)));
+    // A length that would wrap kJoinAcceptMinLen + tlvLen
+    TEST_ASSERT_EQUAL(0, buildJoinAccept(aesSoftEncrypt, joinKeys(), 1, 1, 1, 1, tlv, SIZE_MAX - 5, f, sizeof(f)));
+    // Output buffer too small
+    TEST_ASSERT_EQUAL(0, buildJoinAccept(aesSoftEncrypt, joinKeys(), 1, 1, 1, 1, tlv, 10, f, kJoinAcceptMinLen + 9));
 }
 
 // ---------------------------------------------------------------------------
@@ -508,6 +569,10 @@ int main(int, char **)
     RUN_TEST(test_rejoin_vector_bound_to_uplink);
     RUN_TEST(test_peek_rejects_gen1_and_other_versions);
     RUN_TEST(test_build_limits);
+    RUN_TEST(test_open_rejects_wrong_direction);
+    RUN_TEST(test_open_rejects_fcnt16_mismatch);
+    RUN_TEST(test_peek_length_limits);
+    RUN_TEST(test_join_accept_size_limits);
     RUN_TEST(test_fcnt_first_frame_of_session);
     RUN_TEST(test_fcnt_window_edges);
     RUN_TEST(test_devnonce_monotonic);

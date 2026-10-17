@@ -36,6 +36,28 @@
 #include <NetworkClientSecure.h>
 #include "../config.h"
 #include "../Hardware/WatchdogPause.h"
+#include "../Hardware/FlashPermit.h"
+#include "../Hardware/RadioTask.h"
+
+// OTA flash access under the flash write permit (a pending radio response
+// is not delayed by erasing / programming the app partition)
+static bool otaBegin(size_t size)
+{
+    FlashWriteGuard guard;
+    return Update.begin(size);
+}
+
+static size_t otaWrite(uint8_t *data, size_t len)
+{
+    FlashWriteGuard guard;
+    return Update.write(data, len);
+}
+
+static bool otaEnd(bool evenIfRemaining = false)
+{
+    FlashWriteGuard guard;
+    return Update.end(evenIfRemaining);
+}
 
 // Request attribute set on a request the patched parser must drop. The
 // library keys attributes by pointer, so both sides use this one symbol
@@ -1324,6 +1346,16 @@ void WebPortal::handleDiagHeap(AsyncWebServerRequest *request)
     res->print("\"loopStackFree\":");
     res->print((unsigned long)(loopTaskHandle ? uxTaskGetStackHighWaterMark(loopTaskHandle) : 0));
     res->print(",");
+    // Radio task: queue, latency to loop(), stack, flash write permit
+    RadioTask::Stats rs = RadioTask::stats();
+    res->printf("\"radio\":{\"received\":%lu,\"crcErrors\":%lu,\"readErrors\":%lu,\"queueDrops\":%lu,"
+                "\"queueHigh\":%lu,\"maxLatencyMs\":%lu,\"resetsOk\":%lu,\"resetsFailed\":%lu,\"selfHeals\":%lu,"
+                "\"unreliableTime\":%lu,\"stackFree\":%lu,\"flashWaits\":%lu,\"flashTimeouts\":%lu},",
+                (unsigned long)rs.received, (unsigned long)rs.crcErrors, (unsigned long)rs.readErrors,
+                (unsigned long)rs.queueDrops, (unsigned long)rs.queueHigh, (unsigned long)rs.maxLatencyMs,
+                (unsigned long)rs.resetsOk, (unsigned long)rs.resetsFailed, (unsigned long)rs.selfHeals,
+                (unsigned long)rs.unreliableTime, (unsigned long)rs.stackFree,
+                (unsigned long)FlashPermit::writerWaits(), (unsigned long)FlashPermit::writerTimeouts());
     res->print("\"wifiStatus\":"); res->print((int)WiFi.status()); res->print(",");
     res->print("\"apMode\":"); res->print(isAPMode ? "true" : "false"); res->print(",");
     res->print("\"uplink\":\""); res->print(uplink->getActiveName()); res->print("\",");
@@ -1711,7 +1743,7 @@ void WebPortal::runUrlOta(const String &url)
 
     // The filesystem stays mounted: OTA writes only the other app slot, and
     // unmounting would race with the other task's file writes
-    if (!Update.begin((size_t)contentLength))
+    if (!otaBegin((size_t)contentLength))
     {
         logger.error("Update.begin failed: " + String(Update.getError()));
         http.end();
@@ -1760,7 +1792,7 @@ void WebPortal::runUrlOta(const String &url)
         {
             break;
         }
-        if (Update.write(buf, r) != (size_t)r)
+        if (otaWrite(buf, r) != (size_t)r)
         {
             error = "flash write failed";
             break;
@@ -1776,7 +1808,7 @@ void WebPortal::runUrlOta(const String &url)
     }
     http.end();
 
-    if (error.length() == 0 && !Update.end())
+    if (error.length() == 0 && !otaEnd())
     {
         error = "Update.end error " + String(Update.getError());
     }
@@ -1880,7 +1912,10 @@ void WebPortal::handleFirmwareUploadChunk(AsyncWebServerRequest *request, String
         {
             otaUploadActive = otaUploadActive || Update.isRunning();
             abortUpload("Only one firmware file per upload");
-            esp_ota_set_boot_partition(esp_ota_get_running_partition());
+            {
+                FlashWriteGuard guard; // writes the otadata partition
+                esp_ota_set_boot_partition(esp_ota_get_running_partition());
+            }
             restartRequested = false;
         }
         return;
@@ -1948,7 +1983,7 @@ void WebPortal::handleFirmwareUploadChunk(AsyncWebServerRequest *request, String
             return;
         }
         // IMPORTANT: use size UNKNOWN for multipart - otherwise risk "premature end"
-        if (!Update.begin((size_t)UPDATE_SIZE_UNKNOWN))
+        if (!otaBegin((size_t)UPDATE_SIZE_UNKNOWN))
         {
             otaUploadHasError = true;
             otaUploadErrorMsg = "Update.begin failed: " + String(Update.getError());
@@ -1990,7 +2025,7 @@ void WebPortal::handleFirmwareUploadChunk(AsyncWebServerRequest *request, String
                 abortUpload(imageError);
                 return;
             }
-            if (Update.write(otaHeader, otaHeaderLen) != otaHeaderLen)
+            if (otaWrite(otaHeader, otaHeaderLen) != otaHeaderLen)
             {
                 abortUpload("Short write of the image header");
                 return;
@@ -2002,7 +2037,7 @@ void WebPortal::handleFirmwareUploadChunk(AsyncWebServerRequest *request, String
             }
         }
 
-        size_t w = Update.write(data, len);
+        size_t w = otaWrite(data, len);
         if (w != len)
         {
             abortUpload("Short write: " + String(w) + "/" + String(len));
@@ -2039,7 +2074,7 @@ void WebPortal::handleFirmwareUploadChunk(AsyncWebServerRequest *request, String
         }
 
         // IMPORTANT: finish multipart upload with evenIfRemaining=true
-        if (!Update.end(true) || !Update.isFinished())
+        if (!otaEnd(true) || !Update.isFinished())
         {
             abortUpload("Update.end error: " + String(Update.getError()));
             return;

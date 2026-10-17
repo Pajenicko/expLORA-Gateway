@@ -271,6 +271,19 @@ The logging system is a valuable troubleshooting tool:
    - **DEBUG**: Detailed information for debugging
    - **VERBOSE**: All available information
 
+### Radio diagnostics
+
+The LoRa radio is served by its own task: every packet is read right after
+the radio reports it and queued for processing, so a busy gateway (LTE modem,
+TLS connection, firmware upload) does not lose packets in the radio. Flash
+writes (settings, sensor list, firmware upload) wait briefly while a timed
+radio response is pending (needed by the second-generation sensors).
+`/diag/heap` (after login) shows the radio counters under `radio`: packets
+received, CRC and read errors, packets dropped because the queue was full,
+the longest delay before a packet was processed, radio re-initializations,
+missed interrupts picked up by polling, task stack left and flash-permit
+waits. Errors are also written to the log.
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.

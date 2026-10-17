@@ -260,8 +260,12 @@ DevID; the list is capped and drops the oldest entry.
   most **16384** ahead (`ep::expandFcnt`). The first frame of a session must
   have FCnt < 16384.
 - The stored counter advances only after the MIC verified. Mandatory order on
-  reception: `peekFrame` → `expandFcnt` → `openData` (MIC) → only then store
-  the new counter. A counter must never wrap: the sensor rejoins before FCnt
+  reception: `peekFrame` and check the frame type is the one this side
+  receives (sensor: DOWN, gateway: UP) → `expandFcnt` → `openData` with the
+  expected type (rejects any other type before the MIC) → only then store the
+  new counter. Without the type check a replayed UP played into the sensor's
+  RX1 window would verify with the sensor's own session keys and be parsed
+  with the downlink registry. A counter must never wrap: the sensor rejoins before FCnt
   reaches 2³² − 16384.
 - FCnt is never persisted (neither side); every restart of the sensor leads to
   a join.
@@ -335,23 +339,47 @@ JOIN_ACC with full config (27 B) 259 ms, SHT40 UP (21 B) 218 ms, POLL (12 B)
 channel per 7-byte response (switch + TX + switch back): 176 ms (Pro), 171 ms
 (Lite).
 
-**Flash write permit (gateway, M2a).** Flash erase/program stalls both cores
-and defers GPIO interrupts (the dispatcher is not in IRAM): measured response
-delays up to 85 ms (Pro) / 160 ms (Lite) during firmware upload and 19 ms
-(Lite) during `saveSensors()`. The radio task therefore holds a permit from
-RxDone (when a response may follow) until TxDone of the response (or the RX2
-decision); every flash writer takes it first:
+**Flash write permit (gateway, M2a; `src/Hardware/FlashPermit.h`).** Flash
+erase/program stalls both cores and defers GPIO interrupts (the dispatcher is
+not in IRAM): measured response delays up to 85 ms (Pro) / 160 ms (Lite)
+during firmware upload and 19 ms (Lite) during `saveSensors()`. Rules:
 
-- LittleFS: `sensors.json`, `sensors.bak`, `config.json` and their temporary /
-  `.corrupt` files (SensorManager, ConfigManager), any future file writes;
-- NVS / `Preferences`: every ConfigManager save that touches Preferences
-  (Ethernet, LTE incl. the rejected-PIN flag, admin password hash) and any
-  other `Preferences`/NVS write;
-- OTA: each `Update.write()` / `Update.end()` of the web upload and of the URL
-  OTA (HTTP download), and partition erase at `Update.begin()`.
-
-Writers wait (bounded by one response, ≤ 1.5 s); the radio task never waits
-for them.
+- Once `launchMode()` has been issued the chip transmits on its own; a flash
+  write afterwards only delays the TxDone handling. The radio task therefore
+  holds the permit from RxDone until the RX1 launch (≈ 1.0 s) and, only when
+  RX2 is actually used, again from T2 − 20 ms until the RX2 launch (≈ 20 ms).
+  It never waits for the permit: **a failed `tryHoldForRadio()` means no timed
+  response to that uplink** (the sensor falls back to RX2 / the next uplink).
+- Every flash writer takes the permit **before** any other lock (order:
+  permit → sensorMutex / configMutex) and waits at most **1.5 s** (margin over the ≈ 1.0 s RX1 hold), then writes
+  anyway with a logged warning; nested write sections of a task that already
+  writes without the permit do not wait again. Covered: LittleFS (`sensors.json` written from
+  a snapshot after sensorMutex is released, `config.json`, recovery renames),
+  every ConfigManager entry point that may write Preferences/NVS (incl. LTE
+  PIN flag, admin password hash), OTA `Update.begin/write/end` of the web
+  upload and the URL OTA, the otadata write `esp_ota_set_boot_partition()`.
+- OTA chunks are written from the AsyncTCP task, which may therefore block for
+  one hold during a pending downlink – accepted (downlinks are rare;
+  `Update.write()` does not expose when its 4 kB buffer flushes).
+- A write already running at RxDone delays the RxDone interrupt itself. The
+  DIO interrupt samples "write section open" next to its timestamp, and the
+  permit keeps [start, end] of the last outermost write section. The
+  timestamp is unreliable when a section was open at the interrupt, when it
+  lies within [start, end + 2 ms] of the last section (deferred into a gap
+  between two flash operations, or the writer on the other core closed its
+  section after the deferred interrupt), or when a section is open while the
+  packet is evaluated, or when any write section closed between the interrupt
+  and the evaluation (the interrupt samples a closed-section counter; a short
+  later section must not hide the one that deferred it)
+  (`FlashTiming::rxTimeReliable`, unit-tested). No timed response to such an
+  uplink (counted as `unreliableTime`).
+- **M3 rule:** a timed response is sent only when the packet's
+  `timeReliable` is set **and** `tryHoldForRadio()` succeeds; the latter fails
+  while any write section is open (a writer that timed out writes without
+  holding the permit mutex).
+- WiFi credential persistence is off (`WiFi.persistent(false)`; credentials
+  live in the gateway configuration). **Residual risk:** flash writes inside
+  ESP-IDF (PHY calibration data, NVS of other components) are not covered.
 
 ## 8. Sensor radio notes (STM32WLE5 / E77)
 
@@ -466,7 +494,12 @@ set before PRIMASK is cleared. It programs the option bytes once (guarded by
 OBLRSTF against a reset loop): IWDG_STOP = 0 (IWDG frozen in Stop mode) and
 **BOR_LEV = 1 (2.0 V)** – decided by the owner. A TCXO cold start (cells out
 ≥ 10 s, reset cause BOR + PIN) was verified by the owner: bootloader, radio
-init and the first packet OK.
+init and the first packet OK. The bootloader hands RCC_CSR (reset cause) to the application
+in TAMP->BKP19R and clears the flags. An invalid slot A is reported three
+times on the console, then the bootloader enters Standby with all wake-up
+sources off (µA; NRST / power cycle / SWD under reset recover); bootloader
+faults (e.g. a flash ECC NMI) also end in Standby. PWR_CR3 survives Standby,
+so the bootloader re-enables the internal wake-up line at every start.
 
 ### 10.2 Deferred to the OTA phase
 

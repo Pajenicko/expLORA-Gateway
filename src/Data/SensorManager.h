@@ -49,7 +49,12 @@ private:
     bool rainDirty = false;
     unsigned long lastRainSave = 0;
 
-    bool saveSensorsLocked();
+    uint32_t snapshotSeq = 0; // under sensorMutex
+    uint32_t writtenSeq = 0;  // under fileMutex
+    std::mutex fileMutex;     // sensors.json writes (taken after the flash permit)
+    bool snapshotLocked(String &json);
+    bool saveAndUnlock(std::unique_lock<std::mutex> &lock);
+    bool writeSnapshot(const String &json, uint32_t seq);
 
 public:
     // Constructor
@@ -110,7 +115,7 @@ public:
     std::vector<ActiveSensorEntry> getActiveSensorEntries() const;
 
     // Save sensor configuration to file
-    bool saveSensors(bool lockMutex);
+    bool saveSensors(); // caller must not hold sensorMutex
 
     // Load sensor configuration from file
     bool loadSensors();
