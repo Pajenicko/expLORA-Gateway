@@ -219,6 +219,9 @@ void WebPortal::setupRoutes()
     server.on("/sensors/edit", HTTP_GET, std::bind(&WebPortal::handleSensorEdit, this, std::placeholders::_1));
     server.on("/sensors/update", HTTP_POST, std::bind(&WebPortal::handleSensorEditPost, this, std::placeholders::_1));
     server.on("/sensors/delete", HTTP_GET, std::bind(&WebPortal::handleSensorDelete, this, std::placeholders::_1));
+    server.on("/sensors/add2", HTTP_GET, std::bind(&WebPortal::handleGen2Add, this, std::placeholders::_1));
+    server.on("/sensors/add2", HTTP_POST, std::bind(&WebPortal::handleGen2AddPost, this, std::placeholders::_1));
+    server.on("/sensors/delete2", HTTP_GET, std::bind(&WebPortal::handleGen2Delete, this, std::placeholders::_1));
     server.on("/sensors", HTTP_GET, std::bind(&WebPortal::handleSensors, this, std::placeholders::_1));
 
     // Logs
@@ -661,6 +664,14 @@ void WebPortal::handleConfigPost(AsyncWebServerRequest *request)
     restartRequested = true;
 }
 
+// Response that browsers and proxies must not store (pages with key material)
+static void sendNoStore(AsyncWebServerRequest *request, int code, const char *type, const String &body)
+{
+    AsyncWebServerResponse *response = request->beginResponse(code, type, body);
+    response->addHeader("Cache-Control", "no-store");
+    request->send(response);
+}
+
 // Sensors list page
 void WebPortal::handleSensors(AsyncWebServerRequest *request)
 {
@@ -669,12 +680,19 @@ void WebPortal::handleSensors(AsyncWebServerRequest *request)
 
     // Get list of sensors
     std::vector<ActiveSensorEntry> sensorsList = sensorManager.getActiveSensorEntries();
+    std::vector<Gen2Sensor> gen2List = sensorManager.getGen2Sensors();
+    WaitingEntry waiting[8];
+    size_t waitingCount = sensorManager.getWaitingList(waiting, 8);
 
     // Generate HTML
-    String html = HTMLGenerator::generateSensorsPage(sensorsList);
+    String html = HTMLGenerator::generateSensorsPage(sensorsList, gen2List, waiting, waitingCount);
+    for (Gen2Sensor &g : gen2List)
+    {
+        g.wipeKeys();
+    }
 
-    // Send response
-    request->send(200, "text/html", html);
+    // Send response (key fingerprints: never cached)
+    sendNoStore(request, 200, "text/html", html);
 }
 
 // Sensor add page
@@ -948,6 +966,88 @@ void WebPortal::handleSensorDelete(AsyncWebServerRequest *request)
     }
 
     // Redirect to sensors list
+    request->redirect("/sensors");
+}
+
+// Generation 2 sensors (protocol v2): add by DevID + label key, delete by DevID
+void WebPortal::handleGen2Add(AsyncWebServerRequest *request)
+{
+    logger.debug("HTTP request: GET /sensors/add2");
+    if (guardAPOnly(request)) return;
+    // Prefill from the waiting list; only a valid DevID is echoed back
+    String devId;
+    uint32_t id = 0;
+    if (request->hasParam("devId") && ep::parseDevId(request->getParam("devId")->value().c_str(), id))
+    {
+        char buf[9];
+        snprintf(buf, sizeof(buf), "%08lX", (unsigned long)id);
+        devId = buf;
+    }
+    sendNoStore(request, 200, "text/html", HTMLGenerator::generateGen2AddPage(devId, ""));
+}
+
+void WebPortal::handleGen2AddPost(AsyncWebServerRequest *request)
+{
+    logger.debug("HTTP request: POST /sensors/add2");
+    if (guardAPOnly(request)) return;
+    auto param = [request](const char *name)
+    {
+        String value = request->hasParam(name, true) ? request->getParam(name, true)->value() : String();
+        value.trim();
+        return value;
+    };
+    String name = param("name");
+    String devIdText = param("devId");
+    String keyText = param("key");
+    uint32_t devId = 0;
+    uint8_t label[ep::kLabelKeyLen];
+    String error;
+    if (name.length() == 0 || name.length() > 32)
+    {
+        error = "Name must have 1 to 32 characters";
+    }
+    else if (!ep::parseDevId(devIdText.c_str(), devId))
+    {
+        error = "DevID must be exactly 8 hex digits";
+    }
+    else if (!ep::parseLabelKey(keyText.c_str(), label))
+    {
+        error = "Key must be exactly 16 hex digits (dashes and spaces are ignored)";
+    }
+    if (error.length() > 0)
+    {
+        sendNoStore(request, 400, "text/html", HTMLGenerator::generateGen2AddPage(devIdText.substring(0, 8), error));
+        return;
+    }
+    int index = sensorManager.addGen2Sensor(devId, label, name);
+    ep::wipe(label, sizeof(label));
+    keyText = String();
+    if (index == -2)
+    {
+        request->send(409, "text/plain", "A generation 2 sensor with this DevID already exists");
+        return;
+    }
+    if (index < 0)
+    {
+        request->send(500, "text/plain",
+                      "Failed to add the sensor (list full, or the flash write failed - see Logs)");
+        return;
+    }
+    request->redirect("/sensors");
+}
+
+void WebPortal::handleGen2Delete(AsyncWebServerRequest *request)
+{
+    logger.debug("HTTP request: GET /sensors/delete2");
+    if (guardAPOnly(request)) return;
+    uint32_t devId = 0;
+    if (request->hasParam("devId") && ep::parseDevId(request->getParam("devId")->value().c_str(), devId))
+    {
+        if (!sensorManager.deleteGen2Sensor(devId))
+        {
+            logger.warning("Delete of a generation 2 sensor ignored or not saved");
+        }
+    }
     request->redirect("/sensors");
 }
 

@@ -150,16 +150,22 @@ bool acquireForWrite(uint32_t timeoutMs)
     portEXIT_CRITICAL(&lock);
 
     bool got = xSemaphoreTakeRecursive(h, 0) == pdTRUE;
+    portENTER_CRITICAL(&lock);
+    // Open the section before any wait: from here tryHoldForRadio() fails, so
+    // there is no gap between a timeout decision and the write in which the
+    // radio could take a hold
+    openSection();
     if (!got)
     {
-        portENTER_CRITICAL(&lock);
         waits++;
-        portEXIT_CRITICAL(&lock);
+    }
+    portEXIT_CRITICAL(&lock);
+    if (!got)
+    {
         got = xSemaphoreTakeRecursive(h, pdMS_TO_TICKS(timeoutMs)) == pdTRUE;
     }
 
     portENTER_CRITICAL(&lock);
-    openSection();
     if (!got)
     {
         timeouts++;

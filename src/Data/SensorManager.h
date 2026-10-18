@@ -25,6 +25,8 @@
 #include <mutex>
 #include <vector>
 #include "SensorData.h"
+#include "Gen2Sensor.h"
+#include "../Protocol/WaitingList.h"
 #include "Logging.h"
 
 /**
@@ -48,6 +50,18 @@ private:
     // Daily rain totals changed since the last save (saved from process())
     bool rainDirty = false;
     unsigned long lastRainSave = 0;
+
+    // Generation 2 sensors (protocol v2) and unknown DevIDs seen in JOIN_REQs
+    Gen2Sensor gen2[MAX_GEN2_SENSORS];
+    size_t gen2Count = 0;
+    WaitingList<8> waiting;
+    bool waitingLogged = false;
+    unsigned long lastWaitingLogMs = 0;
+    int findGen2Locked(uint32_t devId) const;
+    void removeGen2Locked(uint32_t devId);
+    void clearLocked();
+    int readSensorsFile(const char *path, String &content);
+    bool parseSensorsLocked(const String &fileContent);
 
     uint32_t snapshotSeq = 0; // under sensorMutex
     uint32_t writtenSeq = 0;  // under fileMutex
@@ -117,8 +131,18 @@ public:
     // Save sensor configuration to file
     bool saveSensors(); // caller must not hold sensorMutex
 
-    // Load sensor configuration from file
+    // Load sensor configuration from file (sensors.bak when it is damaged)
     bool loadSensors();
+
+    // Generation 2 sensors. add: index, -1 full, -2 DevID exists, -3 save failed
+    int addGen2Sensor(uint32_t devId, const uint8_t label[ep::kLabelKeyLen], const String &name);
+    bool deleteGen2Sensor(uint32_t devId);
+    bool isKnownGen2(uint32_t devId) const;
+    std::vector<Gen2Sensor> getGen2Sensors() const; // copies without key material except the label
+    size_t getWaitingList(WaitingEntry *out, size_t max) const;
+    void recordWaitingJoin(const ep::JoinRequest &req, int16_t rssi, unsigned long nowMs);
+    void handleGen2Frame(const uint8_t *frame, size_t len, const ep::FrameInfo &info, int16_t rssi, float snr,
+                         float freqError, unsigned long nowMs);
 
     // Forward sensor data to HTTP (blocking - never call with the lock held)
     bool forwardSensorData(const SensorData &sensor);

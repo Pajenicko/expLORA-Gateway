@@ -50,6 +50,23 @@ generations with one radio (§6).
   load time and never leave RAM (not in files, exports or logs).
   **Sessions are never stored**; after a gateway restart the sensor is sent a
   REJOIN (§5.4).
+- Gateway storage: `sensors.json` keeps generation 1 sensors in `"sensors"`
+  and generation 2 sensors in a separate `"gen2"` array (`devId` 8 hex,
+  `name`, `label` 16 hex, `devNonce` once a join was accepted); firmware
+  without protocol v2 ignores the array. Before `sensors.json` is replaced,
+  the current file becomes `sensors.bak`; a damaged `sensors.json` is kept as
+  `.corrupt` and the configuration is restored from `sensors.bak`. At most 10
+  generation 2 sensors (RAM of the Pro), separate from the 20 generation 1
+  sensors.
+- A restore from `sensors.bak` undoes exactly one save (e.g. a sensor deleted
+  last comes back). The restored state is written as `sensors.json` at once
+  (the same backup is never applied twice) and `.corrupt` is deleted, so keys
+  of deleted sensors do not linger. **M3 rule:** after a restore the gateway
+  keeps the devNonce high-water mark per DevID (maximum of the backup value
+  and any value accepted since boot); a restore must never re-open a replay.
+- **Downgrade warning:** firmware without protocol v2 drops the `"gen2"`
+  array (and the label keys) on its next save of the sensor list, and two saves
+  later also from `sensors.bak`.
 - devNonce: 32-bit counter in the sensor's config page, incremented and
   persisted **before** each JOIN_REQ is sent. gwNonce: 32 bits from the
   gateway's TRNG (`esp_random()`) per JOIN_ACC. The sensor's own random needs
@@ -236,8 +253,14 @@ JOIN_REQ with devNonce ≤ last accepted is dropped silently (a replayed request
 cannot force a rekey).
 
 Unknown DevID with a structurally valid JOIN_REQ: listed as "waiting to be
-added" (HW type, firmware version, RSSI) after two JOIN_REQs with the same
-DevID; the list is capped and drops the oldest entry.
+added" (HW type, firmware version, RSSI) after two consistent JOIN_REQs with
+the same DevID (same HW/FW/caps, devNonce increasing); the list holds 8
+entries, evicts unlisted entries before listed ones and lives in RAM. These
+frames are unauthenticated: two-frame forgeries can still list fake entries
+or flush genuine ones, and one forged frame with a listed DevID but different
+fields de-lists it - the eviction rule only raises the cost; the user
+confirms by comparing the DevID with the label. The "waiting to be added" log
+line is limited to one per minute.
 
 ### 5.2 Data
 
@@ -409,6 +432,9 @@ during firmware upload and 19 ms (Lite) during `saveSensors()`. Rules:
   POLLs and event retransmissions are dropped first, periodic data is delayed
   to the next slot, JOIN_REQ backoff is extended. 10-minute SHT40 reports use
   ≈ 1.3 s/h.
+- **Reset loops:** resets before a completed cycle (brown-out under TX,
+  watchdog) delay the sensor's first transmission by 30 s · 2^(n−1), capped at
+  the maximum interval (counter in a TAMP backup register, no flash writes).
 - **Bench override:** test firmware may raise the sensor budget at build time
   with `-DEP_SENSOR_DUTY_PERMILLE=<n>` (default 1 = 0.1 %; e.g. 10 for 60 s
   test intervals ≈ 13 s/h). A build with a value other than 1 prints
@@ -439,6 +465,12 @@ the air.
 | 0x0803E800 | 4 kB | 125–126 | reserved |
 | 0x0803F800 | 2 kB | 127 | identity: DevID, label key, HW revision, production calibration – never erased by firmware |
 
+Identity record (start of the identity page, little endian): u32 magic
+"EXID" ‖ u32 DevID ‖ u8 label key[8] ‖ u16 HW revision ‖ u16 reserved ‖
+u32 CRC-32 over bytes 0–19. Development boards without a record derive a
+DevID and key from the chip UID and announce them as a development identity
+(never for production).
+
 ### 10.0 Configuration store
 
 The configuration is **one TLV snapshot** (the downlink registry of §4.2 for
@@ -460,14 +492,22 @@ log-structured in the active copy (A or B):
 | 12 | n | payload: u32 devNonce ‖ TLV snapshot |
 | 12+n | pad | 0xFF up to the next 8-byte boundary |
 
-- Reading: the copy with a valid header and the higher generation is active;
-  its last record with a valid CRC is the current configuration (a record cut
-  off by a power loss fails the CRC and the previous one stays valid). An
-  erased header (0xFFFF magic) ends the scan.
-- Writing: a new record is appended to the active copy. When it does not fit,
-  the other copy is erased, the full current snapshot is written there with
-  the copy header (generation + 1) written **last**; the old copy stays valid
-  until then, so a power loss during the erase never loses devNonce.
+- Reading: the valid record (CRC) with the highest sequence number in either
+  copy is the current configuration - a damaged copy header or an
+  interrupted switch never makes devNonce go backwards. Damaged areas (bad
+  magic, bad CRC, a double word raising a flash ECC error) are skipped in
+  8-byte steps, so a damaged record never hides newer ones. The copy with a
+  valid header and the higher generation is the active one for appends.
+- Flash ECC: an uncorrectable ECC error (interrupted program or erase) raises
+  an NMI on the read; the handler records it and returns, the store treats
+  the area as damaged.
+- Writing: a new record is appended behind the last double word of the
+  active copy that is not erased (a torn, partly programmed tail counts as
+  used). When it does not fit or the append fails, the other copy is erased,
+  the full current snapshot is written there with the copy header
+  (generation + 1) written **last**; the old copy stays valid until then, so a
+  power loss during the erase never loses devNonce. Without an active copy
+  the copy holding the newest record is never the one erased.
 - devNonce is written (a new record) before every JOIN_REQ.
 
 ### 10.1 Image trailer
@@ -528,6 +568,19 @@ L = `A1B2-C3D4-E5F6-0718`, DevID = 0x3EA4191D, devNonce = 7, gwNonce =
 0x11223344, UP FCnt 5 (FCtrl 0x81, SHT40 TLVs + invalid channel-2
 temperature + board data), DOWN FCnt 0x10002 answering UP 5, REJOIN answering
 that UP. Expected bytes: `test/test_protocol_v2/vectors.h`.
+
+## 12a. Open decisions for M3
+
+- devNonce recovery when the sensor's config store is lost (both copies
+  damaged, board reflashed with an erase): the sensor restarts at devNonce 1
+  and the gateway drops its JOIN_REQs until the counter passes the stored
+  value. Options: a gateway-side "reset devNonce" action for an authenticated
+  admin, or a recovery JOIN_REQ flag combined with a fresh label.
+- Wear: once the TLV configuration is repeated in every devNonce record, a
+  devNonce-only record type (short) may be needed so a join does not rewrite
+  the whole snapshot.
+- `FlashPermit::tryHoldForRadio()` has no caller yet (M3 adds the timed
+  responses); its rule is tested only through the pure timestamp decision.
 
 ## 13. Deviations from the proposal
 

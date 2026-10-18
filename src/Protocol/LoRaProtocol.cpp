@@ -20,6 +20,7 @@
  */
 
 #include "LoRaProtocol.h"
+#include "Gen2Dispatch.h"
 #include "LoRaCrypto.h"
 #include "SensorParsers.h"
 
@@ -44,6 +45,27 @@ bool LoRaProtocol::processPacket(const RadioPacket &packet)
         return false;
     }
     memcpy(packetBuffer, packet.data, length);
+
+    // Generation 2 first (docs/protocol-v2.md section 6): a frame of a
+    // configured gen2 DevID never reaches the generation 1 decoder
+    ep::FrameInfo info;
+    Gen2Dispatch::Route route = Gen2Dispatch::classify(
+        packetBuffer, length, [this](uint32_t devId) { return sensorManager.isKnownGen2(devId); }, info);
+    if (route == Gen2Dispatch::Route::Gen2Known)
+    {
+        sensorManager.handleGen2Frame(packetBuffer, length, info, packet.rssi, packet.snr, packet.freqError,
+                                      millis());
+        return false;
+    }
+    if (route == Gen2Dispatch::Route::JoinUnknown)
+    {
+        ep::JoinRequest req;
+        if (ep::parseJoinRequest(packetBuffer, length, req))
+        {
+            sensorManager.recordWaitingJoin(req, packet.rssi, millis());
+        }
+        return false;
+    }
 
     // Hex dumps only at DEBUG (each is a heap String per packet)
     const bool dump = Logger::getLogLevel() >= LogLevel::DEBUG;

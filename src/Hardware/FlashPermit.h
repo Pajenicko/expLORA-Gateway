@@ -21,6 +21,8 @@
  *   WRITER_TIMEOUT_MS and then writes anyway (logged once): a missed
  *   response is better than a lost setting. Nested guards of a task that is
  *   already writing without the permit do not wait again.
+ *   A writer's section opens before it waits, so a waiting writer already
+ *   makes tryHoldForRadio() fail and timestamps unreliable.
  * - OTA chunks are written from the AsyncTCP task; during a pending downlink
  *   that task may block for up to one hold. Accepted: downlinks are rare and
  *   Update.write() does not tell when its 4 kB buffer will hit the flash.

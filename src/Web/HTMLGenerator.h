@@ -24,6 +24,8 @@
 #include <Arduino.h>
 #include <vector>
 #include "../Data/SensorData.h"
+#include "../Data/Gen2Sensor.h"
+#include "../Protocol/WaitingList.h"
 #include "../Data/Logging.h"
 #include "../Storage/ConfigManager.h"
 
@@ -76,7 +78,12 @@ public:
                                       const String &timezone, bool apMode);
 
     // Generate sensor list page
-    static String generateSensorsPage(const std::vector<ActiveSensorEntry>& sensors);
+    static String generateSensorsPage(const std::vector<ActiveSensorEntry>& sensors,
+                                      const std::vector<Gen2Sensor> &gen2 = {},
+                                      const WaitingEntry *waiting = nullptr, size_t waitingCount = 0);
+
+    // Add a generation 2 sensor (DevID + label key)
+    static String generateGen2AddPage(const String &devId, const String &error);
 
     // Generate sensor add page
     static String generateSensorAddPage();

@@ -54,7 +54,7 @@ struct Stats
     uint32_t readErrors;    // RxDone without a valid packet (read error, length)
     uint32_t queueDrops;    // queue full (loop() stalled for more than 8 packets): newest dropped
     uint32_t queueHigh;     // most packets waiting at once
-    uint32_t maxLatencyMs;  // longest RxDone -> loop() pickup
+    uint32_t maxLatencyMs;  // longest RxDone -> loop() pickup (packets received after loop() started)
     uint32_t resetsOk;      // health check re-initializations that worked
     uint32_t resetsFailed;  // ... that failed (retried every RADIO_RETRY_MS)
     uint32_t selfHeals;     // RxDone found by polling the DIO line (missed interrupt edge)
@@ -66,7 +66,9 @@ struct Stats
 // Start the task for an initialized radio (once, from setup())
 bool start(LoRaRadio *radio, Logger &logger);
 
-// loop(): next queued packet, false when none
+// loop(): next queued packet, false when none. The first call marks the
+// start of loop(): packets received while setup() was still running (up to
+// ~1 s after the task started) are not counted in maxLatencyMs.
 bool receive(RadioPacket &packet);
 
 Stats stats();

@@ -24,6 +24,7 @@
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 #include "../Hardware/FlashPermit.h"
+#include "../Protocol/Gen2Crypto.h"
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <memory>
@@ -742,10 +743,12 @@ bool SensorManager::saveSensors()
 // while sensorMutex is held
 bool SensorManager::saveAndUnlock(std::unique_lock<std::mutex> &lock)
 {
+    // Always returns with the lock released
     String json;
     bool hasRain = rainDirty;
     if (!snapshotLocked(json))
     {
+        lock.unlock();
         return false;
     }
     uint32_t seq = ++snapshotSeq;
@@ -769,9 +772,14 @@ bool SensorManager::snapshotLocked(String &json)
     {
         textSize += sensors[i].name.length() + sensors[i].customUrl.length() + 2;
     }
+    for (size_t i = 0; i < gen2Count; i++)
+    {
+        textSize += gen2[i].name.length() + 32; // + DevID and label hex strings
+    }
     // Sized for the sensors present (one smaller block on a fragmented heap)
-    DynamicJsonDocument doc(JSON_OBJECT_SIZE(1) + JSON_ARRAY_SIZE(sensorCount) +
-                            sensorCount * JSON_OBJECT_SIZE(SENSOR_JSON_FIELDS) + textSize + 256);
+    DynamicJsonDocument doc(JSON_OBJECT_SIZE(2) + JSON_ARRAY_SIZE(sensorCount) +
+                            sensorCount * JSON_OBJECT_SIZE(SENSOR_JSON_FIELDS) + JSON_ARRAY_SIZE(gen2Count) +
+                            gen2Count * JSON_OBJECT_SIZE(4) + textSize + 256);
     if (doc.capacity() == 0)
     {
         logger.error("Not enough memory to save the sensor configuration");
@@ -808,6 +816,31 @@ bool SensorManager::snapshotLocked(String &json)
             sensor["windDirectionCorrection"] = sensors[i].windDirectionCorrection;
             sensor["rainAmountCorrection"] = sensors[i].rainAmountCorrection;
             sensor["rainRateCorrection"] = sensors[i].rainRateCorrection;
+        }
+    }
+    // Generation 2 sensors in their own array: firmware without protocol v2
+    // ignores it, so a downgrade keeps the generation 1 sensors working
+    if (gen2Count > 0)
+    {
+        JsonArray gen2Array = doc.createNestedArray("gen2");
+        for (size_t i = 0; i < gen2Count; i++)
+        {
+            const Gen2Sensor &g = gen2[i];
+            char devId[9], label[17];
+            snprintf(devId, sizeof(devId), "%08lX", (unsigned long)g.devId);
+            for (size_t b = 0; b < ep::kLabelKeyLen; b++)
+            {
+                snprintf(label + 2 * b, 3, "%02X", g.label[b]);
+            }
+            JsonObject obj = gen2Array.createNestedObject();
+            obj["devId"] = devId; // copied (char array)
+            obj["name"] = g.name;
+            obj["label"] = label;
+            if (g.hasDevNonce)
+            {
+                obj["devNonce"] = g.lastDevNonce;
+            }
+            ep::wipe(label, sizeof(label));
         }
     }
     if (doc.overflowed())
@@ -850,7 +883,15 @@ bool SensorManager::writeSnapshot(const String &json, uint32_t seq)
         LittleFS.remove(tmpFile);
         return false;
     }
-    LittleFS.remove(sensorsFile);
+    // The current file becomes the last good copy, then the new one replaces it
+    if (LittleFS.exists(sensorsFile))
+    {
+        LittleFS.remove(SENSORS_BACKUP_FILE);
+        if (!LittleFS.rename(sensorsFile, SENSORS_BACKUP_FILE))
+        {
+            LittleFS.remove(sensorsFile);
+        }
+    }
     if (!LittleFS.rename(tmpFile, sensorsFile))
     {
         logger.error("Failed to replace " + String(sensorsFile));
@@ -868,12 +909,7 @@ bool SensorManager::loadSensors()
     FlashWriteGuard flashGuard; // lock order: flash permit before sensorMutex
     std::lock_guard<std::mutex> lock(sensorMutex);
 
-    // Reset sensor count
-    sensorCount = 0;
-    for (size_t i = 0; i < MAX_SENSORS; i++)
-    {
-        sensors[i].configured = false;
-    }
+    clearLocked();
 
     // Power lost between removing the old file and renaming the new one
     String tmpFile = String(sensorsFile) + ".tmp";
@@ -883,56 +919,84 @@ bool SensorManager::loadSensors()
         LittleFS.rename(tmpFile, sensorsFile);
     }
 
-    // Check if file exists
-    if (!LittleFS.exists(sensorsFile))
+    String content;
+    int primary = readSensorsFile(sensorsFile, content);
+    bool present = primary > 0;
+    bool ok = present && parseSensorsLocked(content);
+    if (primary < 0 || (present && !ok))
     {
-        logger.info("Sensors file not found: " + String(sensorsFile) + ", starting with empty configuration");
-        return true; // Not an error, we just start with an empty configuration
-    }
-
-    // Open file for reading
-    File file = LittleFS.open(sensorsFile, "r");
-    if (!file)
-    {
-        logger.error("Failed to open sensors file for reading: " + String(sensorsFile));
-        return false;
-    }
-
-    // Check file size
-    size_t fileSize = file.size();
-    if (fileSize == 0)
-    {
-        logger.warning("Sensors file is empty, starting with empty configuration");
-        file.close();
-        LittleFS.remove(sensorsFile); // Remove empty file
-        return true;
-    }
-
-    // Read content and check for whitespace-only files
-    String fileContent = file.readString();
-    file.close();
-
-    fileContent.trim();
-    if (fileContent.length() == 0)
-    {
-        logger.warning("Sensors file contains only whitespace, removing it");
-        LittleFS.remove(sensorsFile);
-        return true;
-    }
-
-    // Strings are copied into the document, so its size follows the file
-    DynamicJsonDocument doc(fileContent.length() + JSON_OBJECT_SIZE(1) + JSON_ARRAY_SIZE(MAX_SENSORS) +
-                            MAX_SENSORS * JSON_OBJECT_SIZE(SENSOR_JSON_FIELDS) + 256);
-    DeserializationError error = deserializeJson(doc, fileContent);
-    if (error)
-    {
-        // Keep the file for recovery instead of overwriting it with the next
-        // save, and start empty
+        // Unreadable or unparsable: move it aside first (kept for recovery),
+        // so restoring and saving below never overwrite the good backup with it
         String corruptFile = String(sensorsFile) + ".corrupt";
         LittleFS.remove(corruptFile);
-        LittleFS.rename(sensorsFile, corruptFile);
-        logger.error("Failed to parse sensors file (" + String(error.c_str()) + "), moved to " + corruptFile);
-        return true;
+        if (!LittleFS.rename(sensorsFile, corruptFile))
+        {
+            // Never let the broken file rotate over sensors.bak in the restore
+            LittleFS.remove(sensorsFile);
+        }
+        logger.error(String(primary < 0 ? "Failed to read " : "Failed to parse ") + String(sensorsFile) +
+                     ", moved to " + corruptFile);
+    }
+    if (!ok)
+    {
+        // Last good copy (written before every replacement of sensors.json)
+        clearLocked();
+        String backup;
+        if (readSensorsFile(SENSORS_BACKUP_FILE, backup) > 0 && parseSensorsLocked(backup))
+        {
+            // A restore undoes exactly one save. Save the restored state as the
+            // current file at once (the same backup is never applied twice) and
+            // drop the broken copy, so keys of deleted sensors do not linger
+            logger.warning("Sensor configuration restored from " + String(SENSORS_BACKUP_FILE) +
+                           " (the last change before the damage is lost)");
+            ok = true;
+            String json;
+            if (snapshotLocked(json) && writeSnapshot(json, ++snapshotSeq))
+            {
+                LittleFS.remove(String(sensorsFile) + ".corrupt");
+            }
+        }
+        else
+        {
+            clearLocked();
+        }
+    }
+    if (!ok && primary == 0)
+    {
+        logger.info("Sensors file not found: " + String(sensorsFile) + ", starting with empty configuration");
+    }
+    return ok || primary == 0; // false: the file exists but could not be read or restored
+}
+
+// Read a sensors file: 1 content, 0 missing or empty, -1 could not be opened
+int SensorManager::readSensorsFile(const char *path, String &content)
+{
+    if (!LittleFS.exists(path))
+    {
+        return 0;
+    }
+    File file = LittleFS.open(path, "r");
+    if (!file)
+    {
+        logger.error("Failed to open " + String(path) + " for reading");
+        return -1;
+    }
+    content = file.readString();
+    file.close();
+    content.trim();
+    return content.length() > 0 ? 1 : 0;
+}
+
+// Caller holds sensorMutex: generation 1 and generation 2 sensors from JSON
+bool SensorManager::parseSensorsLocked(const String &fileContent)
+{
+    // Strings are copied into the document, so its size follows the file
+    DynamicJsonDocument doc(fileContent.length() + JSON_OBJECT_SIZE(2) + JSON_ARRAY_SIZE(MAX_SENSORS) +
+                            MAX_SENSORS * JSON_OBJECT_SIZE(SENSOR_JSON_FIELDS) + JSON_ARRAY_SIZE(MAX_GEN2_SENSORS) +
+                            MAX_GEN2_SENSORS * JSON_OBJECT_SIZE(4) + 256);
+    if (doc.capacity() == 0 || deserializeJson(doc, fileContent))
+    {
+        return false;
     }
 
     // Load sensors from JSON
@@ -1038,8 +1102,53 @@ bool SensorManager::loadSensors()
         }
     }
 
-    logger.info("Loaded " + String(sensorCount) + " sensors from configuration");
+    // Generation 2 sensors (absent in files written before protocol v2;
+    // older firmware ignores the array)
+    JsonArray gen2Array = doc["gen2"].as<JsonArray>();
+    for (JsonObject obj : gen2Array)
+    {
+        uint32_t devId = 0;
+        uint8_t label[ep::kLabelKeyLen];
+        if (gen2Count >= MAX_GEN2_SENSORS || !ep::parseDevId(obj["devId"] | "", devId) ||
+            !ep::parseLabelKey(obj["label"] | "", label) || findGen2Locked(devId) >= 0)
+        {
+            logger.warning("Ignoring an invalid or surplus generation 2 sensor entry");
+            continue;
+        }
+        Gen2Sensor &g = gen2[gen2Count++];
+        g = Gen2Sensor();
+        g.configured = true;
+        g.devId = devId;
+        g.name = obj["name"] | "";
+        memcpy(g.label, label, sizeof(label));
+        if (obj.containsKey("devNonce"))
+        {
+            g.hasDevNonce = true;
+            g.lastDevNonce = obj["devNonce"].as<uint32_t>();
+        }
+        Gen2Crypto::deriveJoinKeys(g); // K and the join keys live in RAM only
+        ep::wipe(label, sizeof(label));
+    }
+
+    logger.info("Loaded " + String(sensorCount) + " sensors and " + String(gen2Count) +
+                " generation 2 sensors from configuration");
     return true;
+}
+
+// Caller holds sensorMutex
+void SensorManager::clearLocked()
+{
+    sensorCount = 0;
+    for (size_t i = 0; i < MAX_SENSORS; i++)
+    {
+        sensors[i].configured = false;
+    }
+    gen2Count = 0;
+    for (size_t i = 0; i < MAX_GEN2_SENSORS; i++)
+    {
+        gen2[i].wipeKeys();
+        gen2[i] = Gen2Sensor();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1078,5 +1187,220 @@ void SensorManager::tickSensorHealth(unsigned long nowMillis)
             SensorHealth::advanceBucketsIfNeeded(sensors[i].health, nowMillis);
             SensorHealth::latchStale(sensors[i].health, nowMillis);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Generation 2 sensors (protocol v2)
+
+int SensorManager::findGen2Locked(uint32_t devId) const
+{
+    for (size_t i = 0; i < gen2Count; i++)
+    {
+        if (gen2[i].devId == devId)
+        {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+bool SensorManager::isKnownGen2(uint32_t devId) const
+{
+    std::lock_guard<std::mutex> lock(sensorMutex);
+    return findGen2Locked(devId) >= 0;
+}
+
+int SensorManager::addGen2Sensor(uint32_t devId, const uint8_t label[ep::kLabelKeyLen], const String &name)
+{
+    std::unique_lock<std::mutex> lock(sensorMutex);
+    if (findGen2Locked(devId) >= 0)
+    {
+        return -2;
+    }
+    if (gen2Count >= MAX_GEN2_SENSORS)
+    {
+        return -1;
+    }
+    size_t index = gen2Count++;
+    Gen2Sensor &g = gen2[index];
+    g = Gen2Sensor();
+    g.configured = true;
+    g.devId = devId;
+    g.name = name;
+    memcpy(g.label, label, ep::kLabelKeyLen);
+    Gen2Crypto::deriveJoinKeys(g);
+    waiting.remove(devId);
+    char id[9];
+    snprintf(id, sizeof(id), "%08lX", (unsigned long)devId);
+    // Snapshot under the same lock: if it fails, the entry is taken back out
+    // before any other writer can see it
+    String json;
+    if (!snapshotLocked(json))
+    {
+        removeGen2Locked(devId);
+        return -3;
+    }
+    uint32_t seq = ++snapshotSeq;
+    lock.unlock();
+    if (!writeSnapshot(json, seq))
+    {
+        // Not on flash: take it back out so a retry does not hit "exists". A
+        // save by another writer in between may already contain the entry;
+        // then it returns after a restart (logged)
+        lock.lock();
+        removeGen2Locked(devId);
+        logger.warning("Generation 2 sensor " + String(id) + " not saved (flash write failed)");
+        return -3;
+    }
+    logger.info("Added generation 2 sensor " + name + " (DevID " + String(id) + ")");
+    return (int)index;
+}
+
+// Caller holds sensorMutex
+void SensorManager::removeGen2Locked(uint32_t devId)
+{
+    int i = findGen2Locked(devId);
+    if (i < 0)
+    {
+        return;
+    }
+    gen2[i].wipeKeys();
+    gen2[i] = gen2[gen2Count - 1];
+    gen2[gen2Count - 1].wipeKeys();
+    gen2[gen2Count - 1] = Gen2Sensor();
+    gen2Count--;
+}
+
+bool SensorManager::deleteGen2Sensor(uint32_t devId)
+{
+    std::unique_lock<std::mutex> lock(sensorMutex);
+    if (findGen2Locked(devId) < 0)
+    {
+        return false;
+    }
+    removeGen2Locked(devId);
+    logger.info("Deleted a generation 2 sensor");
+    return saveAndUnlock(lock);
+}
+
+std::vector<Gen2Sensor> SensorManager::getGen2Sensors() const
+{
+    std::lock_guard<std::mutex> lock(sensorMutex);
+    std::vector<Gen2Sensor> out(gen2, gen2 + gen2Count);
+    for (Gen2Sensor &g : out)
+    {
+        ep::wipe(&g.joinKeys, sizeof(g.joinKeys)); // callers only display
+    }
+    return out;
+}
+
+size_t SensorManager::getWaitingList(WaitingEntry *out, size_t max) const
+{
+    std::lock_guard<std::mutex> lock(sensorMutex);
+    return waiting.listed(out, max);
+}
+
+void SensorManager::recordWaitingJoin(const ep::JoinRequest &req, int16_t rssi, unsigned long nowMs)
+{
+    std::lock_guard<std::mutex> lock(sensorMutex);
+    if (findGen2Locked(req.devId) >= 0)
+    {
+        return;
+    }
+    if (waiting.record(req, rssi, (uint32_t)nowMs) &&
+        (!waitingLogged || nowMs - lastWaitingLogMs >= 60000)) // global limit: 1 line per minute
+    {
+        waitingLogged = true;
+        lastWaitingLogMs = nowMs;
+        char id[9];
+        snprintf(id, sizeof(id), "%08lX", (unsigned long)req.devId);
+        logger.info("Generation 2 sensor waiting to be added: DevID " + String(id) + ", HW " + String(req.hwType) +
+                    ", firmware " + String(req.fwMajor) + "." + String(req.fwMinor) + "." + String(req.fwPatch));
+    }
+}
+
+// A frame of a configured gen2 sensor. Phase A (M2b): JOIN_REQ is verified
+// and its content shown; nothing is answered or decrypted yet. Counters
+// always; at most one log line per DevID and kind per GEN2_LOG_INTERVAL_MS.
+static constexpr unsigned long GEN2_LOG_INTERVAL_MS = 600000;
+
+static bool logDue(bool &done, unsigned long &lastMs, unsigned long nowMs)
+{
+    if (done && nowMs - lastMs < GEN2_LOG_INTERVAL_MS)
+    {
+        return false;
+    }
+    done = true;
+    lastMs = nowMs;
+    return true;
+}
+
+void SensorManager::handleGen2Frame(const uint8_t *frame, size_t len, const ep::FrameInfo &info, int16_t rssi,
+                                    float snr, float freqError, unsigned long nowMs)
+{
+    std::lock_guard<std::mutex> lock(sensorMutex);
+    int i = findGen2Locked(info.devId);
+    if (i < 0)
+    {
+        return;
+    }
+    Gen2Sensor &g = gen2[i];
+    char id[9];
+    snprintf(id, sizeof(id), "%08lX", (unsigned long)info.devId);
+
+    switch (info.type)
+    {
+    case ep::FrameType::JoinReq:
+    {
+        ep::JoinRequest req;
+        if (!ep::parseJoinRequest(frame, len, req) ||
+            !ep::verifyJoinRequest(Gen2Crypto::aes, g.joinKeys, frame, len))
+        {
+            g.micFailures++;
+            if (logDue(g.warned, g.lastWarnMs, nowMs))
+            {
+                logger.warning("Generation 2 JOIN_REQ from " + String(id) + " failed the MIC check (" +
+                               String(g.micFailures) +
+                               " so far) - wrong label key, or the sensor is paired with another gateway?");
+            }
+            return;
+        }
+        if (g.seen && req.devNonce <= g.lastJoinDevNonce)
+        {
+            g.replayedJoins++; // old devNonce: a replay, the status stays as it is
+            return;
+        }
+        g.seen = true;
+        g.lastSeenMs = nowMs;
+        g.rssi = rssi;
+        g.snr = snr;
+        g.freqError = freqError;
+        g.hwType = req.hwType;
+        g.fwMajor = req.fwMajor;
+        g.fwMinor = req.fwMinor;
+        g.fwPatch = req.fwPatch;
+        g.caps = req.caps;
+        g.configVersion = req.configVersion;
+        g.lastJoinDevNonce = req.devNonce;
+        g.joinRequests++;
+        if (logDue(g.logged, g.lastLogMs, nowMs))
+        {
+            logger.info("Generation 2 JOIN_REQ from " + g.name + " (" + String(id) + "), devNonce " +
+                        String(req.devNonce) + ", RSSI " + String(rssi) + " dBm - join answers come with M3");
+        }
+        return;
+    }
+    case ep::FrameType::Up:
+        // No session yet (sessions are never persisted): REJOIN in M3
+        g.upWithoutSession++;
+        if (logDue(g.logged, g.lastLogMs, nowMs))
+        {
+            logger.info("Generation 2 UP from " + String(id) + " without a session (REJOIN comes with M3)");
+        }
+        return;
+    default:
+        // A downlink frame carrying this DevID (another gateway?) - ignored
+        return;
     }
 }

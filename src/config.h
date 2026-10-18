@@ -51,6 +51,7 @@
 // File system configuration
 #define CONFIG_FILE "/config.json"   // Configuration file
 #define SENSORS_FILE "/sensors.json" // Sensors file
+#define SENSORS_BACKUP_FILE "/sensors.bak" // last good copy of SENSORS_FILE
 
 // NTP configuration
 // Format uint32_t as zero-padded uppercase hex string

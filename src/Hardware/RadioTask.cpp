@@ -202,13 +202,18 @@ bool start(LoRaRadio *r, Logger &logger)
 
 bool receive(RadioPacket &packet)
 {
+    static int64_t loopStartUs = 0;
+    if (loopStartUs == 0)
+    {
+        loopStartUs = esp_timer_get_time();
+    }
     if (queue == nullptr || xQueueReceive(queue, &packet, 0) != pdTRUE)
     {
         return false;
     }
     uint32_t latencyMs = (uint32_t)((esp_timer_get_time() - packet.rxTimeUs) / 1000);
     portENTER_CRITICAL(&statsLock);
-    if (latencyMs > counters.maxLatencyMs)
+    if (packet.rxTimeUs >= loopStartUs && latencyMs > counters.maxLatencyMs)
     {
         counters.maxLatencyMs = latencyMs;
     }

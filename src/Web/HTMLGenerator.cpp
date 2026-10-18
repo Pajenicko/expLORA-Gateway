@@ -802,10 +802,13 @@ static String renderHealthBadge(const SensorHealth::Stats &h, unsigned long nowM
     return badge;
 }
 
-String HTMLGenerator::generateSensorsPage(const std::vector<ActiveSensorEntry> &entries)
+String HTMLGenerator::generateSensorsPage(const std::vector<ActiveSensorEntry> &entries,
+                                          const std::vector<Gen2Sensor> &gen2, const WaitingEntry *waiting,
+                                          size_t waitingCount)
 {
     String html;
-    html.reserve(12288);
+    // One allocation for the whole page (no PSRAM on the Pro): sized by the rows
+    html.reserve(6144 + 700 * entries.size() + 600 * gen2.size() + 300 * waitingCount);
     addHtmlHeader(html, "Sensors");
 
     html += "<div class='card'><h2>Configured Sensors</h2>";
@@ -893,6 +896,108 @@ String HTMLGenerator::generateSensorsPage(const std::vector<ActiveSensorEntry> &
 
     html += "<p><a class='btn' href='/sensors/add'>Add New Sensor</a></p>";
     html += "</div>";
+
+    // Generation 2 sensors (protocol v2): identity and what they reported
+    const unsigned long now = millis();
+    html += "<div class='card'><h2>Generation 2 Sensors</h2>";
+    if (gen2.empty())
+    {
+        html += "<p>No generation 2 sensors added yet.</p>";
+    }
+    else
+    {
+        html += "<table><tr><th>Name</th><th>DevID</th><th>Key</th><th>Reported</th>"
+                "<th>Last JOIN_REQ</th><th>Counters</th><th>Actions</th></tr>";
+        for (const Gen2Sensor &g : gen2)
+        {
+            // The label key is the root secret: only its first 4 hex digits,
+            // enough to tell which label was entered
+            char id[9], key[16];
+            snprintf(id, sizeof(id), "%08lX", (unsigned long)g.devId);
+            snprintf(key, sizeof(key), "%02X%02X&hellip;", g.label[0], g.label[1]);
+            html += "<tr><td>" + htmlEscape(g.name) + "</td><td><code>" + String(id) + "</code></td>";
+            html += "<td><code>" + String(key) + "</code></td><td>";
+            if (g.seen)
+            {
+                html += "HW " + String(g.hwType) + ", FW " + String(g.fwMajor) + "." + String(g.fwMinor) + "." +
+                        String(g.fwPatch) + "<br><small>" + String(g.rssi) + " dBm, SNR " + String(g.snr, 1) +
+                        " dB, " + String(g.freqError / 1000.0f, 1) + " kHz</small>";
+            }
+            else
+            {
+                html += "&mdash;";
+            }
+            html += "</td><td>" + formatRelativeMillis(now, g.lastSeenMs, g.seen);
+            if (g.seen)
+            {
+                html += "<br><small>devNonce " + String(g.lastJoinDevNonce) + "</small>";
+            }
+            html += "</td><td><small>JOIN_REQ " + String(g.joinRequests) + "<br>MIC failed " +
+                    String(g.micFailures);
+            if (g.micFailures > 0 && g.joinRequests == 0)
+            {
+                html += " <span style='color:#c0392b;'>(wrong key, or paired with another gateway?)</span>";
+            }
+            html += "<br>replayed " + String(g.replayedJoins) + "<br>UP w/o session " + String(g.upWithoutSession) +
+                    "</small></td>";
+            html += "<td><a class='btn btn-delete' href='/sensors/delete2?devId=" + String(id) +
+                    "' onclick='return confirm(\"Delete this generation 2 sensor?\")'>Delete</a></td></tr>";
+        }
+        html += "</table>";
+    }
+    html += "<p><a class='btn' href='/sensors/add2'>Add Generation 2 Sensor</a></p>";
+
+    html += "<h3>Waiting to be added</h3>";
+    if (waitingCount == 0)
+    {
+        html += "<p><small>No unknown generation 2 sensors heard (a sensor appears here after two "
+                "consistent join requests).</small></p>";
+    }
+    else
+    {
+        html += "<table><tr><th>DevID</th><th>HW / FW</th><th>RSSI</th><th>Requests</th><th>Last heard</th>"
+                "<th></th></tr>";
+        for (size_t i = 0; i < waitingCount; i++)
+        {
+            const WaitingEntry &w = waiting[i];
+            char id[9];
+            snprintf(id, sizeof(id), "%08lX", (unsigned long)w.devId);
+            html += "<tr><td><code>" + String(id) + "</code></td><td>HW " + String(w.hwType) + ", FW " +
+                    String(w.fwMajor) + "." + String(w.fwMinor) + "." + String(w.fwPatch) + "</td><td>" +
+                    String(w.rssi) + " dBm</td><td>" + String(w.frames) + "</td><td>" +
+                    formatRelativeMillis(now, w.lastSeenMs, true) + "</td>";
+            html += "<td><a class='btn' href='/sensors/add2?devId=" + String(id) + "'>Add</a></td></tr>";
+        }
+        html += "</table><p><small>Join requests are not authenticated until the label key is entered: "
+                "compare the DevID with the label.</small></p>";
+    }
+    html += "</div>";
+    addHtmlFooter(html);
+    return html;
+}
+
+String HTMLGenerator::generateGen2AddPage(const String &devId, const String &error)
+{
+    String html;
+    html.reserve(3072);
+    addHtmlHeader(html, "Add Generation 2 Sensor");
+    html += "<div class='card'><h2>Add Generation 2 Sensor</h2>";
+    if (error.length() > 0)
+    {
+        html += "<p style='color:#c0392b;'>" + htmlEscape(error) + "</p>";
+    }
+    html += "<form method='post' action='/sensors/add2'>";
+    html += "<label for='name'>Sensor Name:</label>";
+    html += "<input type='text' id='name' name='name' maxlength='32' required>";
+    html += "<label for='devId'>DevID (8 hex digits from the label):</label>";
+    html += "<input type='text' id='devId' name='devId' maxlength='8' pattern='[0-9A-Fa-f]{8}' required value='" +
+            htmlEscape(devId) + "'>";
+    html += "<label for='key'>Key (16 hex digits from the label, dashes optional):</label>";
+    html += "<input type='text' id='key' name='key' maxlength='19' autocomplete='off' "
+            "pattern='[0-9A-Fa-f]{4}-?[0-9A-Fa-f]{4}-?[0-9A-Fa-f]{4}-?[0-9A-Fa-f]{4}' required "
+            "placeholder='A1B2-C3D4-E5F6-0718'>";
+    html += "<button type='submit'>Add Sensor</button> <a class='btn' href='/sensors'>Cancel</a>";
+    html += "</form></div>";
     addHtmlFooter(html);
     return html;
 }

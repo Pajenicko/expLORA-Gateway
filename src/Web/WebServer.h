@@ -137,6 +137,9 @@ private:
     void handleSensorEdit(AsyncWebServerRequest *request);
     void handleSensorEditPost(AsyncWebServerRequest *request);
     void handleSensorDelete(AsyncWebServerRequest *request);
+    void handleGen2Add(AsyncWebServerRequest *request);
+    void handleGen2AddPost(AsyncWebServerRequest *request);
+    void handleGen2Delete(AsyncWebServerRequest *request);
     void handleLogs(AsyncWebServerRequest *request);
     void handleLogsClear(AsyncWebServerRequest *request);
     void handleLogLevel(AsyncWebServerRequest *request);
