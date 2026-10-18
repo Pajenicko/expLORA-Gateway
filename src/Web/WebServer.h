@@ -140,6 +140,11 @@ private:
     void handleGen2Add(AsyncWebServerRequest *request);
     void handleGen2AddPost(AsyncWebServerRequest *request);
     void handleGen2Delete(AsyncWebServerRequest *request);
+    void handleGen2Detail(AsyncWebServerRequest *request);
+    void handleGen2Config(AsyncWebServerRequest *request);
+    void handleGen2Status(AsyncWebServerRequest *request);
+    void handleGen2ResetNonce(AsyncWebServerRequest *request);
+    void sendGen2Detail(AsyncWebServerRequest *request, uint32_t devId, const String &message, int code = 200);
     void handleLogs(AsyncWebServerRequest *request);
     void handleLogsClear(AsyncWebServerRequest *request);
     void handleLogLevel(AsyncWebServerRequest *request);

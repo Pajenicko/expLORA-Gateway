@@ -25,6 +25,8 @@
 #include <LittleFS.h>
 #include "../Hardware/FlashPermit.h"
 #include "../Protocol/Gen2Crypto.h"
+#include "../Protocol/Gen2Response.h"
+#include "DueTime.h"
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <memory>
@@ -713,12 +715,29 @@ bool SensorManager::getSensorCopy(int index, SensorData &out) const
     return true;
 }
 
+// devNonce is written after the response (the radio task holds the flash
+// permit until the launch, RX2 ends ~2 s after RxDone)
+static constexpr unsigned long DEVNONCE_SAVE_DELAY_MS = 2500;
+static constexpr unsigned long DEVNONCE_RETRY_MS = 60000;
+
 // Rain totals: at most one flash write per interval
 static constexpr unsigned long RAIN_SAVE_INTERVAL = 600000;
 
 void SensorManager::process(unsigned long now)
 {
     std::unique_lock<std::mutex> lock(sensorMutex);
+    if (devNonceSaveDue && DueTime::reached((uint32_t)now, devNonceSaveAtMs))
+    {
+        devNonceSaveDue = false;
+        if (!saveAndUnlock(lock))
+        {
+            logger.error("devNonce of a generation 2 sensor not saved, retrying in 60 s");
+            lock.lock();
+            devNonceSaveDue = true;
+            devNonceSaveAtMs = (uint32_t)now + DEVNONCE_RETRY_MS;
+        }
+        return; // a successful save also wrote the rain totals
+    }
     if (rainDirty && now - lastRainSave > RAIN_SAVE_INTERVAL)
     {
         // Next attempt after a full interval even when this one fails
@@ -774,12 +793,12 @@ bool SensorManager::snapshotLocked(String &json)
     }
     for (size_t i = 0; i < gen2Count; i++)
     {
-        textSize += gen2[i].name.length() + 32; // + DevID and label hex strings
+        textSize += gen2[i].name.length() + 32 + 12; // + DevID, label and firmware version strings
     }
     // Sized for the sensors present (one smaller block on a fragmented heap)
     DynamicJsonDocument doc(JSON_OBJECT_SIZE(2) + JSON_ARRAY_SIZE(sensorCount) +
                             sensorCount * JSON_OBJECT_SIZE(SENSOR_JSON_FIELDS) + JSON_ARRAY_SIZE(gen2Count) +
-                            gen2Count * JSON_OBJECT_SIZE(4) + textSize + 256);
+                            gen2Count * JSON_OBJECT_SIZE(14) + textSize + 256);
     if (doc.capacity() == 0)
     {
         logger.error("Not enough memory to save the sensor configuration");
@@ -839,6 +858,24 @@ bool SensorManager::snapshotLocked(String &json)
             if (g.hasDevNonce)
             {
                 obj["devNonce"] = g.lastDevNonce;
+            }
+            obj["interval"] = g.config.intervalS;
+            obj["slot"] = g.config.slotS;
+            obj["txPower"] = g.config.txPowerDbm;
+            obj["ackEvery"] = g.config.ackEvery;
+            obj["ackRetries"] = g.config.ackRetries;
+            obj["ackBackoff"] = g.config.ackBackoffS;
+            obj["cfgVersion"] = g.cfgVersion;
+            if (g.hasFw)
+            {
+                char fw[12];
+                snprintf(fw, sizeof(fw), "%u.%u.%u", g.fwMajor, g.fwMinor, g.fwPatch);
+                obj["fw"] = fw; // copied (char array)
+                obj["hw"] = g.hwType;
+            }
+            if (g.bootState != 0xFF)
+            {
+                obj["bootState"] = g.bootState;
             }
             ep::wipe(label, sizeof(label));
         }
@@ -993,7 +1030,7 @@ bool SensorManager::parseSensorsLocked(const String &fileContent)
     // Strings are copied into the document, so its size follows the file
     DynamicJsonDocument doc(fileContent.length() + JSON_OBJECT_SIZE(2) + JSON_ARRAY_SIZE(MAX_SENSORS) +
                             MAX_SENSORS * JSON_OBJECT_SIZE(SENSOR_JSON_FIELDS) + JSON_ARRAY_SIZE(MAX_GEN2_SENSORS) +
-                            MAX_GEN2_SENSORS * JSON_OBJECT_SIZE(4) + 256);
+                            MAX_GEN2_SENSORS * JSON_OBJECT_SIZE(14) + 256);
     if (doc.capacity() == 0 || deserializeJson(doc, fileContent))
     {
         return false;
@@ -1126,6 +1163,29 @@ bool SensorManager::parseSensorsLocked(const String &fileContent)
             g.hasDevNonce = true;
             g.lastDevNonce = obj["devNonce"].as<uint32_t>();
         }
+        // Configuration (defaults for entries written before M3)
+        g.config.intervalS = obj["interval"] | g.config.intervalS;
+        g.config.slotS = obj["slot"] | g.config.slotS;
+        g.config.txPowerDbm = obj["txPower"] | g.config.txPowerDbm;
+        g.config.ackEvery = obj["ackEvery"] | g.config.ackEvery;
+        g.config.ackRetries = obj["ackRetries"] | g.config.ackRetries;
+        g.config.ackBackoffS = obj["ackBackoff"] | g.config.ackBackoffS;
+        g.cfgVersion = obj["cfgVersion"] | g.cfgVersion;
+        if (!Gen2Config::validVersion(g.cfgVersion))
+        {
+            g.cfgVersion = 1;
+        }
+        Gen2Config::clamp(g.config);
+        unsigned maj = 0, min = 0, pat = 0;
+        if (sscanf(obj["fw"] | "", "%u.%u.%u", &maj, &min, &pat) == 3)
+        {
+            g.hasFw = true;
+            g.fwMajor = (uint8_t)maj;
+            g.fwMinor = (uint8_t)min;
+            g.fwPatch = (uint8_t)pat;
+            g.hwType = obj["hw"] | 0;
+        }
+        g.bootState = obj["bootState"] | 0xFF;
         Gen2Crypto::deriveJoinKeys(g); // K and the join keys live in RAM only
         ep::wipe(label, sizeof(label));
     }
@@ -1291,6 +1351,7 @@ std::vector<Gen2Sensor> SensorManager::getGen2Sensors() const
     for (Gen2Sensor &g : out)
     {
         ep::wipe(&g.joinKeys, sizeof(g.joinKeys)); // callers only display
+        g.sessions.clear();
     }
     return out;
 }
@@ -1320,9 +1381,10 @@ void SensorManager::recordWaitingJoin(const ep::JoinRequest &req, int16_t rssi, 
     }
 }
 
-// A frame of a configured gen2 sensor. Phase A (M2b): JOIN_REQ is verified
-// and its content shown; nothing is answered or decrypted yet. Counters
-// always; at most one log line per DevID and kind per GEN2_LOG_INTERVAL_MS.
+// A frame of a configured gen2 sensor: JOIN_REQ -> JOIN_ACC, UP -> verify
+// (dual session), ACK when requested, REJOIN when there is no session.
+// Counters always; at most one log line per DevID and kind per
+// GEN2_LOG_INTERVAL_MS.
 static constexpr unsigned long GEN2_LOG_INTERVAL_MS = 600000;
 
 static bool logDue(bool &done, unsigned long &lastMs, unsigned long nowMs)
@@ -1336,25 +1398,42 @@ static bool logDue(bool &done, unsigned long &lastMs, unsigned long nowMs)
     return true;
 }
 
-void SensorManager::handleGen2Frame(const uint8_t *frame, size_t len, const ep::FrameInfo &info, int16_t rssi,
-                                    float snr, float freqError, unsigned long nowMs)
+static bool joinAccAllowed(bool sent, unsigned long lastMs, unsigned long nowMs)
 {
+    return !sent || nowMs - lastMs >= Gen2Response::JOIN_ACC_INTERVAL_MS;
+}
+
+// Caller holds sensorMutex: write sensors.json shortly after the response
+// (the radio task holds the flash permit until the launch)
+void SensorManager::scheduleGen2SaveLocked(unsigned long nowMs)
+{
+    devNonceSaveDue = true;
+    devNonceSaveAtMs = (uint32_t)nowMs + DEVNONCE_SAVE_DELAY_MS;
+}
+
+bool SensorManager::handleGen2Frame(const RadioPacket &packet, const ep::FrameInfo &info, unsigned long nowMs,
+                                    TxRequest &req)
+{
+    const uint8_t *frame = packet.data;
+    const size_t len = packet.length;
+    const uint32_t slot = packet.responseSlot;
     std::lock_guard<std::mutex> lock(sensorMutex);
     int i = findGen2Locked(info.devId);
     if (i < 0)
     {
-        return;
+        return false;
     }
     Gen2Sensor &g = gen2[i];
     char id[9];
     snprintf(id, sizeof(id), "%08lX", (unsigned long)info.devId);
+    req.slot = slot;
 
     switch (info.type)
     {
     case ep::FrameType::JoinReq:
     {
-        ep::JoinRequest req;
-        if (!ep::parseJoinRequest(frame, len, req) ||
+        ep::JoinRequest jr;
+        if (!ep::parseJoinRequest(frame, len, jr) ||
             !ep::verifyJoinRequest(Gen2Crypto::aes, g.joinKeys, frame, len))
         {
             g.micFailures++;
@@ -1364,43 +1443,260 @@ void SensorManager::handleGen2Frame(const uint8_t *frame, size_t len, const ep::
                                String(g.micFailures) +
                                " so far) - wrong label key, or the sensor is paired with another gateway?");
             }
-            return;
+            return false;
         }
-        if (g.seen && req.devNonce <= g.lastJoinDevNonce)
+        if ((g.hasDevNonce && jr.devNonce <= g.lastDevNonce) || (g.seen && jr.devNonce <= g.lastJoinDevNonce))
         {
-            g.replayedJoins++; // old devNonce: a replay, the status stays as it is
-            return;
+            // Old devNonce: a replay - or the sensor lost its configuration
+            // store (spec 12a: admin "reset devNonce")
+            g.replayedJoins++;
+            g.staleJoinStreak++;
+            if (g.staleJoinStreak >= 3 && logDue(g.warned, g.lastWarnMs, nowMs))
+            {
+                logger.warning("Generation 2 sensor " + g.name + " (" + String(id) + ") keeps sending JOIN_REQ with devNonce " +
+                               String(jr.devNonce) + " <= " + String(g.lastDevNonce) +
+                               " - lost its configuration? Reset its devNonce on the sensor page");
+            }
+            return false;
         }
         g.seen = true;
         g.lastSeenMs = nowMs;
-        g.rssi = rssi;
-        g.snr = snr;
-        g.freqError = freqError;
-        g.hwType = req.hwType;
-        g.fwMajor = req.fwMajor;
-        g.fwMinor = req.fwMinor;
-        g.fwPatch = req.fwPatch;
-        g.caps = req.caps;
-        g.configVersion = req.configVersion;
-        g.lastJoinDevNonce = req.devNonce;
+        g.rssi = packet.rssi;
+        g.snr = packet.snr;
+        g.freqError = packet.freqError;
+        if (!g.hasFw || g.hwType != jr.hwType || g.fwMajor != jr.fwMajor || g.fwMinor != jr.fwMinor ||
+            g.fwPatch != jr.fwPatch)
+        {
+            if (g.hasFw)
+            {
+                // another firmware: the boot state of the old one no longer applies
+                g.bootState = 0xFF;
+                g.blVersion = 0;
+            }
+            g.hasFw = true;
+            scheduleGen2SaveLocked(nowMs); // the firmware version survives a gateway restart
+        }
+        g.hwType = jr.hwType;
+        g.fwMajor = jr.fwMajor;
+        g.fwMinor = jr.fwMinor;
+        g.fwPatch = jr.fwPatch;
+        g.caps = jr.caps;
+        g.configVersion = jr.configVersion;
+        g.lastJoinDevNonce = jr.devNonce;
         g.joinRequests++;
+        if (slot == 0)
+        {
+            g.noSlot++; // the sensor retries with a new devNonce
+            return false;
+        }
+        if (!joinAccAllowed(g.acceptSent, g.lastAcceptMs, nowMs))
+        {
+            g.joinLimited++;
+            return false;
+        }
+        if (!Gen2Response::buildJoinAccept(g, jr.devNonce, packet.rxTimeUs, req))
+        {
+            return false;
+        }
+        g.staleJoinStreak = 0;
+        g.lastDevNonce = jr.devNonce;
+        g.hasDevNonce = true;
+        scheduleGen2SaveLocked(nowMs);
+        g.acceptSent = true;
+        g.lastAcceptMs = nowMs;
+        g.joinAccepts++;
         if (logDue(g.logged, g.lastLogMs, nowMs))
         {
-            logger.info("Generation 2 JOIN_REQ from " + g.name + " (" + String(id) + "), devNonce " +
-                        String(req.devNonce) + ", RSSI " + String(rssi) + " dBm - join answers come with M3");
+            logger.info("Generation 2 JOIN_REQ from " + g.name + " (" + String(id) + ") accepted, devNonce " +
+                        String(jr.devNonce) + ", RSSI " + String(packet.rssi) + " dBm");
         }
-        return;
+        return true;
     }
     case ep::FrameType::Up:
-        // No session yet (sessions are never persisted): REJOIN in M3
-        g.upWithoutSession++;
-        if (logDue(g.logged, g.lastLogMs, nowMs))
+    {
+        if (len < ep::kDataOverhead)
         {
-            logger.info("Generation 2 UP from " + String(id) + " without a session (REJOIN comes with M3)");
+            return false;
         }
-        return;
+        uint8_t payload[ep::kMaxFrame]; // >= len - kDataOverhead
+        size_t payloadLen = 0;
+        uint32_t fcnt32 = 0;
+        SessionUse use = g.sessions.openUp(Gen2Crypto::aes, frame, len, payload, payloadLen, fcnt32);
+        if (use == SessionUse::None)
+        {
+            if (g.sessions.current.valid)
+            {
+                g.micFailures++; // forged, replayed or another session
+                return false;
+            }
+            // No session (gateway restarted), or only a pending one the
+            // sensor never got (JOIN_ACC lost): REJOIN bound to this uplink
+            // (spec 5.4)
+            g.upWithoutSession++;
+            if (slot == 0)
+            {
+                g.noSlot++;
+                return false;
+            }
+            if (!joinAccAllowed(g.rejoinSent, g.lastRejoinMs, nowMs))
+            {
+                g.joinLimited++;
+                return false;
+            }
+            if (!Gen2Response::buildRejoin(g, frame, len, info.fcnt16, req))
+            {
+                return false;
+            }
+            g.rejoinSent = true;
+            g.lastRejoinMs = nowMs;
+            g.rejoins++;
+            if (logDue(g.logged, g.lastLogMs, nowMs))
+            {
+                logger.info("Generation 2 UP from " + g.name + " (" + String(id) + ") without a session - REJOIN");
+            }
+            return true;
+        }
+        g.seen = true;
+        g.lastSeenMs = nowMs;
+        g.rssi = packet.rssi;
+        g.snr = packet.snr;
+        g.freqError = packet.freqError;
+        g.upFrames++;
+        g.lastFcnt = fcnt32;
+        g.configVersion = info.fctrl & ep::kFctrlCfgMask; // version the sensor runs
+        const uint8_t bootStateBefore = g.bootState;
+        const bool confirmed = Gen2Response::decodeUp(g, payload, payloadLen, nowMs);
+        if (g.bootState != bootStateBefore)
+        {
+            scheduleGen2SaveLocked(nowMs);
+            logger.info("Generation 2 sensor " + g.name + ": boot state " + String(g.bootState));
+        }
+        ep::wipe(payload, payloadLen);
+        if (use == SessionUse::Promoted)
+        {
+            g.sessionUp = true;
+            logger.info("Generation 2 sensor " + g.name + " (" + String(id) + "): session established");
+        }
+        const bool ackRequested = info.fctrl & ep::kFctrlAck;
+        if (!Gen2Response::needsDown(g, ackRequested))
+        {
+            return false;
+        }
+        if (slot == 0)
+        {
+            g.noSlot++;
+            return false;
+        }
+        return Gen2Response::buildDown(g, fcnt32, ackRequested, confirmed, packet.rxTimeUs, req);
+    }
     default:
         // A downlink frame carrying this DevID (another gateway?) - ignored
+        return false;
+    }
+}
+
+bool SensorManager::getGen2Sensor(uint32_t devId, Gen2Sensor &out) const
+{
+    std::lock_guard<std::mutex> lock(sensorMutex);
+    int i = findGen2Locked(devId);
+    if (i < 0)
+    {
+        return false;
+    }
+    out = gen2[i];
+    ep::wipe(&out.joinKeys, sizeof(out.joinKeys));
+    out.sessions.clear();
+    return true;
+}
+
+int SensorManager::setGen2Config(uint32_t devId, const Gen2Config::Values &values)
+{
+    std::unique_lock<std::mutex> lock(sensorMutex);
+    int i = findGen2Locked(devId);
+    if (i < 0)
+    {
+        return -1;
+    }
+    Gen2Sensor &g = gen2[i];
+    Gen2Config::Values v = values;
+    Gen2Config::clamp(v);
+    if (v == g.config)
+    {
+        return 0;
+    }
+    Gen2Config::Values old = g.config;
+    g.config = v;
+    g.cfgVersion = Gen2Config::nextVersion(g.cfgVersion, g.configVersion);
+    logger.info("Generation 2 sensor " + g.name + ": configuration v" + String(g.cfgVersion) + " (interval " +
+                String(v.intervalS) + " s, TX " + String(v.txPowerDbm) + " dBm) - sent with the next uplink");
+    if (saveAndUnlock(lock))
+    {
+        return 1;
+    }
+    // Not on flash: take the values back so the UI does not show a state
+    // that a restart would lose. loop() may already have sent them under
+    // the raised version, so the old values get yet another version: a
+    // number is never reused for different content (spec 4.2).
+    lock.lock();
+    i = findGen2Locked(devId);
+    if (i >= 0)
+    {
+        gen2[i].config = old;
+        gen2[i].cfgVersion = Gen2Config::nextVersion(gen2[i].cfgVersion, gen2[i].configVersion);
+    }
+    return -2;
+}
+
+bool SensorManager::requestGen2Status(uint32_t devId)
+{
+    std::lock_guard<std::mutex> lock(sensorMutex);
+    int i = findGen2Locked(devId);
+    if (i < 0)
+    {
+        return false;
+    }
+    gen2[i].statusRequested = true;
+    return true;
+}
+
+bool SensorManager::resetGen2DevNonce(uint32_t devId)
+{
+    std::unique_lock<std::mutex> lock(sensorMutex);
+    int i = findGen2Locked(devId);
+    if (i < 0)
+    {
+        return false;
+    }
+    Gen2Sensor &g = gen2[i];
+    g.hasDevNonce = false;
+    g.lastDevNonce = 0;
+    g.lastJoinDevNonce = 0;
+    g.staleJoinStreak = 0;
+    logger.warning("Generation 2 sensor " + g.name +
+                   ": devNonce reset by the admin - the next valid JOIN_REQ is accepted with any devNonce");
+    return saveAndUnlock(lock);
+}
+
+void SensorManager::recordTxResult(const TxResult &result)
+{
+    std::lock_guard<std::mutex> lock(sensorMutex);
+    int i = findGen2Locked(result.devId);
+    if (i < 0)
+    {
         return;
+    }
+    Gen2Sensor &g = gen2[i];
+    g.lastDownOutcome = (uint8_t)result.outcome;
+    if (result.outcome == TxOutcome::Rx1)
+    {
+        g.downRx1++;
+    }
+    else if (result.outcome == TxOutcome::Rx2)
+    {
+        g.downRx2++;
+    }
+    else
+    {
+        g.downNotSent++;
     }
 }

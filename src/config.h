@@ -38,6 +38,9 @@
 #define LORA_CODING_RATE 5      // 4/5
 #define LORA_SYNC_WORD 0x12     // private network (SX126x: 0x1424)
 #define LORA_PREAMBLE_LENGTH 16
+// Protocol v2 downlink (docs/protocol-v2.md section 1): 869.525 MHz, same
+// modulation; power per board in board_config.h (LORA_DOWNLINK_POWER_DBM)
+#define LORA_DOWNLINK_MHZ 869.525
 
 // Application configuration
 #define MAX_SENSORS 20                // Maximum number of sensors

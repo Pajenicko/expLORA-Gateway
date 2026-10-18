@@ -35,4 +35,12 @@ void deriveJoinKeys(Gen2Sensor &sensor)
     ep::wipe(rootKey, sizeof(rootKey));
 }
 
+void deriveSessionKeys(const Gen2Sensor &sensor, uint32_t devNonce, uint32_t gwNonce, ep::KeyPair &out)
+{
+    uint8_t rootKey[ep::kKeyLen];
+    ep::deriveRootKey(aes, sensor.label, sensor.devId, rootKey);
+    ep::deriveSessionKeys(aes, rootKey, sensor.devId, devNonce, gwNonce, out);
+    ep::wipe(rootKey, sizeof(rootKey));
+}
+
 } // namespace Gen2Crypto

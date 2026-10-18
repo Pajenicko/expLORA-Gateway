@@ -23,4 +23,7 @@ void aes(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]);
 
 // K from the label key, then the join keys; K is wiped
 void deriveJoinKeys(Gen2Sensor &sensor);
+
+// Session keys Ks_enc / Ks_mic from the label key (K is wiped)
+void deriveSessionKeys(const Gen2Sensor &sensor, uint32_t devNonce, uint32_t gwNonce, ep::KeyPair &out);
 } // namespace Gen2Crypto

@@ -9,6 +9,8 @@
 
 // Radio chip: RFM95W = SX1276
 #define RADIO_SX1276
+#define LORA_DOWNLINK_POWER_DBM 14  // max 17 dBm on PA_BOOST (the +20 dBm mode allows only 1 %)
+#define LORA_CHIP_OFFSET_US 5900    // RxDone -> response timing offset measured in M0
 
 // RFM95W pin definitions
 #define LORA_CS 5       // NSS pin

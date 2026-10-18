@@ -27,6 +27,7 @@
 #include "../Hardware/PowerSource.h"
 #include "../Network/Uplink.h"
 #include "../config.h"
+#include "../Hardware/RadioTask.h"
 
 String HTMLGenerator::htmlEscape(const String &text)
 {
@@ -764,6 +765,34 @@ String HTMLGenerator::generateNetworkPage(const ConfigManager &config, const Str
     return html;
 }
 
+// Boot state of status report byte 22 (spec 10.3)
+static String bootStateText(uint8_t state)
+{
+    switch (state)
+    {
+    case 0:
+        return "normal";
+    case 1:
+        return "updated, not confirmed yet";
+    case 2:
+        return "updated and confirmed";
+    case 3:
+        return "reverted (new image not confirmed)";
+    case 4:
+        return "update rejected (invalid image)";
+    case 5:
+        return "update rejected (HW type / identity)";
+    case 6:
+        return "unconfirmed image kept (previous image invalid)";
+    case 7:
+        return "update aborted (flash verify)";
+    case 0xFF:
+        return "unknown";
+    default:
+        return "state " + String(state);
+    }
+}
+
 // Generating page with sensor list
 // Format milliseconds-since-event as a short relative string ("3 min ago",
 // "2 h ago", "5 d ago"). Returns "—" if `hasValue` is false.
@@ -900,6 +929,20 @@ String HTMLGenerator::generateSensorsPage(const std::vector<ActiveSensorEntry> &
     // Generation 2 sensors (protocol v2): identity and what they reported
     const unsigned long now = millis();
     html += "<div class='card'><h2>Generation 2 Sensors</h2>";
+    {
+        // Downlink duty cycle of the gateway (869.525 MHz, 10 % = 360 s per hour)
+        RadioTask::Stats rs = RadioTask::stats();
+        bool high = (uint64_t)rs.dutyUsedMs * 100 >= 360000ULL * 80;
+        html += "<p><small>Downlink duty cycle: " + String(rs.dutyUsedMs / 1000.0f, 1) +
+                " s of 360 s in the last hour (JOIN_ACC " + String(rs.joinUsedMs / 1000.0f, 1) + " s); responses RX1 " +
+                String(rs.txRx1) + ", RX2 " + String(rs.txRx2) + "</small>";
+        if (high)
+        {
+            html += " <span style='color:#c0392b;'>above 80 % &ndash; only join answers once the data share is used "
+                    "up</span>";
+        }
+        html += "</p>";
+    }
     if (gen2.empty())
     {
         html += "<p>No generation 2 sensors added yet.</p>";
@@ -907,7 +950,7 @@ String HTMLGenerator::generateSensorsPage(const std::vector<ActiveSensorEntry> &
     else
     {
         html += "<table><tr><th>Name</th><th>DevID</th><th>Key</th><th>Reported</th>"
-                "<th>Last JOIN_REQ</th><th>Counters</th><th>Actions</th></tr>";
+                "<th>Last heard</th><th>Counters</th><th>Actions</th></tr>";
         for (const Gen2Sensor &g : gen2)
         {
             // The label key is the root secret: only its first 4 hex digits,
@@ -917,11 +960,32 @@ String HTMLGenerator::generateSensorsPage(const std::vector<ActiveSensorEntry> &
             snprintf(key, sizeof(key), "%02X%02X&hellip;", g.label[0], g.label[1]);
             html += "<tr><td>" + htmlEscape(g.name) + "</td><td><code>" + String(id) + "</code></td>";
             html += "<td><code>" + String(key) + "</code></td><td>";
-            if (g.seen)
+            if (g.hasFw)
             {
                 html += "HW " + String(g.hwType) + ", FW " + String(g.fwMajor) + "." + String(g.fwMinor) + "." +
-                        String(g.fwPatch) + "<br><small>" + String(g.rssi) + " dBm, SNR " + String(g.snr, 1) +
+                        String(g.fwPatch);
+                if (g.bootState != 0xFF && g.bootState != 0)
+                {
+                    html += "<br><small>" + bootStateText(g.bootState) + "</small>";
+                }
+                html += "<br>";
+            }
+            if (g.seen)
+            {
+                html += "<small>" + String(g.rssi) + " dBm, SNR " + String(g.snr, 1) +
                         " dB, " + String(g.freqError / 1000.0f, 1) + " kHz</small>";
+                if (g.temperature != INT16_MIN)
+                {
+                    html += "<br>" + String(g.temperature / 100.0f, 2) + " &deg;C";
+                }
+                if (g.humidity != 0xFFFF)
+                {
+                    html += ", " + String(g.humidity / 100.0f, 1) + " %";
+                }
+                if (g.batteryMv != 0xFFFF)
+                {
+                    html += ", " + String(g.batteryMv) + " mV";
+                }
             }
             else
             {
@@ -930,7 +994,18 @@ String HTMLGenerator::generateSensorsPage(const std::vector<ActiveSensorEntry> &
             html += "</td><td>" + formatRelativeMillis(now, g.lastSeenMs, g.seen);
             if (g.seen)
             {
-                html += "<br><small>devNonce " + String(g.lastJoinDevNonce) + "</small>";
+                html += "<br><small>devNonce " + String(g.lastJoinDevNonce) + "<br>";
+                html += g.sessionUp ? "session up, FCnt " + String(g.lastFcnt) : String("no session yet");
+                if (g.sessionUp && !Gen2Config::inSync(g.configVersion, g.cfgVersion))
+                {
+                    html += "<br><span style='color:#e67e22;'>config v" + String(g.cfgVersion) +
+                            " waiting for the sensor</span>";
+                }
+                if (g.downlinkRssi != INT8_MIN)
+                {
+                    html += "<br>downlink " + String(g.downlinkRssi) + " dBm at the sensor";
+                }
+                html += "</small>";
             }
             html += "</td><td><small>JOIN_REQ " + String(g.joinRequests) + "<br>MIC failed " +
                     String(g.micFailures);
@@ -938,10 +1013,15 @@ String HTMLGenerator::generateSensorsPage(const std::vector<ActiveSensorEntry> &
             {
                 html += " <span style='color:#c0392b;'>(wrong key, or paired with another gateway?)</span>";
             }
-            html += "<br>replayed " + String(g.replayedJoins) + "<br>UP w/o session " + String(g.upWithoutSession) +
-                    "</small></td>";
-            html += "<td><a class='btn btn-delete' href='/sensors/delete2?devId=" + String(id) +
-                    "' onclick='return confirm(\"Delete this generation 2 sensor?\")'>Delete</a></td></tr>";
+            html += "<br>replayed " + String(g.replayedJoins) + "<br>UP " + String(g.upFrames) + ", w/o session " +
+                    String(g.upWithoutSession) + "<br>JOIN_ACC " + String(g.joinAccepts) + ", REJOIN " +
+                    String(g.rejoins) + "<br>DOWN RX1 " + String(g.downRx1) + ", RX2 " + String(g.downRx2) +
+                    ", not sent " + String(g.downNotSent) + "</small></td>";
+            html += "<td><a class='btn' href='/sensors/gen2?devId=" + String(id) + "'>Details</a> ";
+            html += "<form method='post' action='/sensors/delete2' style='display:inline' "
+                    "onsubmit='return confirm(\"Delete this generation 2 sensor?\")'><input type='hidden' "
+                    "name='devId' value='" + String(id) + "'><button type='submit' class='btn-delete'>Delete</button>"
+                    "</form></td></tr>";
         }
         html += "</table>";
     }
@@ -998,6 +1078,262 @@ String HTMLGenerator::generateGen2AddPage(const String &devId, const String &err
             "placeholder='A1B2-C3D4-E5F6-0718'>";
     html += "<button type='submit'>Add Sensor</button> <a class='btn' href='/sensors'>Cancel</a>";
     html += "</form></div>";
+    addHtmlFooter(html);
+    return html;
+}
+
+// One uplink TLV as text (known types scaled, others in hex)
+static String describeTlv(const ep::Tlv &t)
+{
+    String name, value;
+    switch (t.type)
+    {
+    case ep::up::kTemperature:
+        name = "Temperature";
+        value = String((int16_t)ep::tlvU16(t) / 100.0f, 2) + " &deg;C";
+        break;
+    case ep::up::kHumidity:
+        name = "Humidity";
+        value = String(ep::tlvU16(t) / 100.0f, 1) + " %";
+        break;
+    case ep::up::kPressure:
+        name = "Pressure";
+        value = String(ep::tlvU16(t) / 10.0f, 1) + " hPa";
+        break;
+    case ep::up::kCo2:
+        name = "CO2";
+        value = String(ep::tlvU16(t)) + " ppm";
+        break;
+    case ep::up::kBattery:
+        name = "Battery";
+        value = String(ep::tlvU16(t)) + " mV";
+        break;
+    case ep::up::kDownlinkRssi:
+        name = "Downlink RSSI";
+        value = String((int8_t)t.value[0]) + " dBm";
+        break;
+    case ep::up::kDownlinkSnr:
+        name = "Downlink SNR";
+        value = String((int8_t)t.value[0] / 4.0f, 2) + " dB";
+        break;
+    case ep::up::kResetCause:
+        name = "Reset cause";
+        value = "0x" + String(t.value[0], HEX);
+        break;
+    case ep::up::kRainTips:
+        name = "Rain tips";
+        value = String(ep::tlvU32(t));
+        break;
+    case ep::up::kPulses:
+        name = "Pulses";
+        value = String(ep::tlvU32(t));
+        break;
+    case ep::up::kStatus:
+        name = "Status report";
+        value = String(t.len) + " bytes";
+        break;
+    default:
+        name = "Type 0x" + String(t.type, HEX);
+        for (uint8_t i = 0; i < t.len && i < 16; i++)
+        {
+            value += (t.value[i] < 0x10 ? "0" : "") + String(t.value[i], HEX);
+        }
+        break;
+    }
+    if (t.channel != 0)
+    {
+        name += " (channel " + String(t.channel) + ")";
+    }
+    return "<tr><td>" + name + "</td><td>" + value + "</td></tr>";
+}
+
+// Status report (up::kStatus, docs/protocol-v2.md 4.1)
+static String describeStatus(const uint8_t *v, size_t len)
+{
+    if (len < 22 || v[0] != 1)
+    {
+        return "<p>Unknown status format (" + String(len) + " bytes)</p>";
+    }
+    auto u16 = [v](size_t o) { return (uint16_t)(v[o] << 8 | v[o + 1]); };
+    auto u32 = [v](size_t o) { return (uint32_t)v[o] << 24 | (uint32_t)v[o + 1] << 16 | (uint32_t)v[o + 2] << 8 | v[o + 3]; };
+    String html = "<table>";
+    html += "<tr><td>Firmware</td><td>" + String(v[1]) + "." + String(v[2]) + "." + String(v[3]) + "</td></tr>";
+    html += "<tr><td>Reset cause</td><td>0x" + String(v[4], HEX) + "</td></tr>";
+    html += "<tr><td>Uptime</td><td>" + String(u32(5) / 3600.0f, 1) + " h</td></tr>";
+    html += "<tr><td>devNonce</td><td>" + String(u32(9)) + "</td></tr>";
+    html += "<tr><td>Battery</td><td>" + String(u16(13)) + " mV</td></tr>";
+    html += "<tr><td>TX power</td><td>" + String((int8_t)v[15]) + " dBm</td></tr>";
+    html += "<tr><td>Interval</td><td>" + String(u16(16)) + " s</td></tr>";
+    html += "<tr><td>ACK every</td><td>" + String(v[18]) + ". uplink</td></tr>";
+    html += "<tr><td>Missed ACKs</td><td>" + String(v[19]) + "</td></tr>";
+    html += "<tr><td>Config version</td><td>v" + String(v[20]) + "</td></tr>";
+    html += "<tr><td>Clock</td><td>" + String((v[21] & 1) ? "set" : "not set") + "</td></tr>";
+    if (v[21] & 4)
+    {
+        html += "<tr><td>RTC</td><td><span style='color:#c0392b;'>not usable (LSE / binary mode / clock source) "
+                "&ndash; updates cannot be confirmed</span></td></tr>";
+    }
+    if (v[21] & 2)
+    {
+        html += "<tr><td>Watchdog</td><td><span style='color:#c0392b;'>not started (IWDG_STOP option byte not "
+                "programmed)</span></td></tr>";
+    }
+    if (len >= 24)
+    {
+        html += "<tr><td>Boot state</td><td>" + bootStateText(v[22]) + "</td></tr>";
+        html += "<tr><td>Bootloader</td><td>" + String(v[23] >> 4) + "." + String(v[23] & 0x0F) + "</td></tr>";
+    }
+    html += "</table>";
+    return html;
+}
+
+String HTMLGenerator::generateGen2DetailPage(const Gen2Sensor &g, const String &message)
+{
+    String html;
+    html.reserve(9000);
+    char id[9];
+    snprintf(id, sizeof(id), "%08lX", (unsigned long)g.devId);
+    const unsigned long now = millis();
+    addHtmlHeader(html, "Generation 2 Sensor");
+    html += "<div class='card'><h2>" + htmlEscape(g.name) + " <small><code>" + String(id) + "</code></small></h2>";
+    if (message.length() > 0)
+    {
+        html += "<p><strong>" + htmlEscape(message) + "</strong></p>";
+    }
+    html += "<table>";
+    html += "<tr><td>Last heard</td><td>" + formatRelativeMillis(now, g.lastSeenMs, g.seen) + "</td></tr>";
+    if (g.hasFw)
+    {
+        html += "<tr><td>Hardware / firmware</td><td>HW " + String(g.hwType) + ", FW " + String(g.fwMajor) + "." +
+                String(g.fwMinor) + "." + String(g.fwPatch) + "</td></tr>";
+    }
+    html += "<tr><td>Boot state</td><td>" + bootStateText(g.bootState) +
+            (g.blVersion ? " <small>(bootloader " + String(g.blVersion >> 4) + "." + String(g.blVersion & 0x0F) + ")</small>"
+                         : String("")) +
+            "</td></tr>";
+    if (g.seen)
+    {
+        html += "<tr><td>Signal at the gateway</td><td>" + String(g.rssi) + " dBm, SNR " + String(g.snr, 1) +
+                " dB, " + String(g.freqError / 1000.0f, 1) + " kHz</td></tr>";
+    }
+    html += "<tr><td>Session</td><td>" +
+            String(g.sessionUp ? "up, last FCnt " + String(g.lastFcnt) : String("none (the sensor joins or is answered with REJOIN)")) +
+            "</td></tr>";
+    html += "</table>";
+    if (g.lastUpLen > 0)
+    {
+        html += "<h3>Last uplink</h3><table>";
+        ep::TlvReader r(g.lastUp, g.lastUpLen);
+        ep::Tlv t;
+        while (r.next(t) == 1)
+        {
+            html += describeTlv(t);
+        }
+        html += "</table>";
+    }
+    html += "</div>";
+
+    // Configuration
+    const bool inSync = Gen2Config::inSync(g.configVersion, g.cfgVersion);
+    const Gen2Config::Values &c = g.config;
+    html += "<div class='card'><h2>Configuration</h2><p>";
+    if (!g.sessionUp)
+    {
+        html += "Configuration v" + String(g.cfgVersion) + " is sent with the next join.";
+    }
+    else if (inSync)
+    {
+        html += "<span style='color:#27ae60;'>Set</span> &ndash; the sensor runs v" + String(g.cfgVersion) + ".";
+    }
+    else
+    {
+        html += "<span style='color:#e67e22;'>Waiting for the sensor</span> &ndash; v" + String(g.cfgVersion) +
+                " goes out with its next uplink (it reports v" + String(g.configVersion) + ").";
+    }
+    html += "</p><form method='post' action='/sensors/gen2/config'>";
+    html += "<input type='hidden' name='devId' value='" + String(id) + "'>";
+    html += "<label for='interval'>Report interval (s, " + String(Gen2Config::MIN_INTERVAL_S) + "&ndash;" +
+            String(Gen2Config::MAX_INTERVAL_S) + "):</label>";
+    html += "<input type='number' id='interval' name='interval' min='" + String(Gen2Config::MIN_INTERVAL_S) +
+            "' max='" + String(Gen2Config::MAX_INTERVAL_S) + "' value='" + String(c.intervalS) + "' required>";
+    html += "<small>Below " + String(Gen2Config::DUTY_SAFE_INTERVAL_S) +
+            " s the sensor stretches the interval to its 0.1 % duty-cycle limit.</small>";
+    html += "<label for='slot'>Slot offset within the interval (s):</label>";
+    html += "<input type='number' id='slot' name='slot' min='0' max='" + String(Gen2Config::MAX_INTERVAL_S - 1) +
+            "' value='" + String(c.slotS) + "'>";
+    html += "<label for='txPower'>Sensor TX power (dBm, " + String(Gen2Config::MIN_TX_POWER_DBM) + " to " +
+            String(Gen2Config::MAX_TX_POWER_DBM) + "):</label>";
+    html += "<input type='number' id='txPower' name='txPower' min='" + String(Gen2Config::MIN_TX_POWER_DBM) +
+            "' max='" + String(Gen2Config::MAX_TX_POWER_DBM) + "' value='" + String(c.txPowerDbm) + "'>";
+    html += "<small>After a power change the sensor asks for an ACK on the next 2 uplinks and goes back to the "
+            "previous power if none arrives.</small>";
+    html += "<label for='ackEvery'>Request an ACK every N-th uplink (0 = never):</label>";
+    html += "<input type='number' id='ackEvery' name='ackEvery' min='0' max='255' value='" + String(c.ackEvery) + "'>";
+    html += "<label for='ackRetries'>Retries of confirmed reports (0&ndash;15):</label>";
+    html += "<input type='number' id='ackRetries' name='ackRetries' min='0' max='15' value='" +
+            String(c.ackRetries) + "'>";
+    html += "<label for='ackBackoff'>Retry backoff base (s, 1&ndash;15):</label>";
+    html += "<input type='number' id='ackBackoff' name='ackBackoff' min='1' max='15' value='" +
+            String(c.ackBackoffS) + "'>";
+    html += "<button type='submit'>Save configuration</button></form></div>";
+
+    // Status report
+    html += "<div class='card'><h2>Status report</h2>";
+    if (g.statusLen > 0)
+    {
+        html += "<p>Received " + formatRelativeMillis(now, g.statusMs, true) + "</p>";
+        html += describeStatus(g.status, g.statusLen);
+    }
+    else
+    {
+        html += "<p>No status report received yet.</p>";
+    }
+    html += "<form method='post' action='/sensors/gen2/status'><input type='hidden' name='devId' value='" +
+            String(id) + "'>";
+    html += g.statusRequested ? "<p>Requested &ndash; the sensor answers after its next uplink.</p>"
+                              : "<button type='submit'>Request status</button>";
+    html += "</form></div>";
+
+    // Downlink
+    html += "<div class='card'><h2>Downlink</h2><table>";
+    html += "<tr><td>Sent in RX1 / RX2</td><td>" + String(g.downRx1) + " / " + String(g.downRx2) + "</td></tr>";
+    html += "<tr><td>Not sent</td><td>" + String(g.downNotSent);
+    if (g.lastDownOutcome != 0xFF)
+    {
+        html += " <small>(last response: " + String(RadioTask::txOutcomeName((TxOutcome)g.lastDownOutcome)) +
+                ")</small>";
+    }
+    html += "</td></tr>";
+    html += "<tr><td>No timed response possible</td><td>" + String(g.noSlot) + "</td></tr>";
+    html += "<tr><td>JOIN_ACC / REJOIN</td><td>" + String(g.joinAccepts) + " / " + String(g.rejoins) +
+            " <small>(" + String(g.joinLimited) + " held back by the 10 s limit)</small></td></tr>";
+    html += "<tr><td>DOWN with configuration</td><td>" + String(g.configDowns) + "</td></tr>";
+    if (g.downlinkRssi != INT8_MIN)
+    {
+        html += "<tr><td>Downlink at the sensor</td><td>" + String(g.downlinkRssi) + " dBm, SNR " +
+                String(g.downlinkSnr / 4.0f, 2) + " dB</td></tr>";
+    }
+    html += "<tr><td>Uplinks verified</td><td>" + String(g.upFrames) + " <small>(MIC failed " +
+            String(g.micFailures) + ", without session " + String(g.upWithoutSession) + ")</small></td></tr>";
+    html += "</table></div>";
+
+    // Join / devNonce
+    html += "<div class='card'><h2>Join</h2><table>";
+    html += "<tr><td>Last accepted devNonce</td><td>" + (g.hasDevNonce ? String(g.lastDevNonce) : String("none")) +
+            "</td></tr>";
+    html += "<tr><td>JOIN_REQ verified</td><td>" + String(g.joinRequests) + "</td></tr>";
+    html += "<tr><td>JOIN_REQ rejected: devNonce not above the last accepted one</td><td>" +
+            String(g.replayedJoins) + "</td></tr></table>";
+    if (g.staleJoinStreak >= 3)
+    {
+        html += "<p style='color:#c0392b;'>The sensor keeps joining with an old devNonce: it has probably lost "
+                "its configuration (reflashed with a full erase, damaged store). Reset the devNonce right before "
+                "restarting the sensor.</p>";
+    }
+    html += "<form method='post' action='/sensors/gen2/resetnonce' onsubmit='return confirm(\"Accept the next join "
+            "of this sensor with any devNonce?\")'><input type='hidden' name='devId' value='" +
+            String(id) + "'><button type='submit' class='btn-delete'>Reset devNonce</button></form></div>";
+    html += "<p><a class='btn' href='/sensors'>Back to Sensors</a></p>";
     addHtmlFooter(html);
     return html;
 }

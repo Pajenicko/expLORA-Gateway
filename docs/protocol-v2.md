@@ -206,17 +206,37 @@ i16 0x8000, u16 0xFFFF, u32 0xFFFFFFFF.
 | 0x82 | pulses | u32 counter (per channel) |
 | 0xC0 | board data | board specific |
 | 0xC1 | Modbus | u8 slave ‖ u8 function ‖ u16 first register ‖ u16 values… |
-| 0xC2 | status | answer to a status request (reserved) |
+| 0xC2 | status | answer to a status request, format below |
 
 Event sequence numbers let the gateway drop duplicates of confirmed events
 that were retransmitted (each retransmission has a new FCnt).
+
+**Status report** (0xC2, 24 bytes, big endian): u8 format 1 ‖ u8 ×3 firmware
+major, minor, patch ‖ u8 reset cause (RCC_CSR >> 24 at boot) ‖ u32 uptime s ‖
+u32 devNonce ‖ u16 battery mV ‖ i8 TX power dBm ‖ u16 interval s ‖ u8 ACK
+every N ‖ u8 missed ACKs ‖ u8 config version ‖ u8 flags (bit 0: clock set)
+‖ (M4a, format stays 1) u8 boot state ‖ u8 bootloader version (§10.3);
+flags bit 1 (M4a): the IWDG was not started by the bootloader; bit 2: the
+RTC is not usable (binary mode on the LSE failed, e.g. a backup domain still
+holding another RTC clock source – only a backup-domain reset or a power
+cycle changes it): no update can be confirmed. A
+receiver accepts ≥ 22 bytes and ignores what it does not know. The gateway
+keeps the firmware version of the last verified JOIN_REQ and the boot state in
+`sensors.json` and shows both on the sensor pages; the boot state is cleared
+when a JOIN_REQ brings another firmware version or a status report is shorter
+than 24 bytes (a reflash with the same version keeps it until the next status
+report).
+The UP carrying it is confirmed: ACK requested, retransmitted up to
+`retries` times with backoff base · (1…3) s (never shorter than the
+duty-cycle gap) until a DOWN arrives. The gateway keeps the request queued
+(in every DOWN) until a report arrives.
 
 ### 4.2 Downlink types (`ep::down`)
 
 | Code | Name | Value |
 |---|---|---|
 | 0x01 | TX power | i8 dBm; the sensor clamps to its band limit |
-| 0x02 | status request | u8 (reserved) |
+| 0x02 | status request | u8 0 (the sensor answers with a status report, §4.1) |
 | 0x03 | reboot | u8 0xB0 |
 | 0x41 | ACK policy | u8 N: request an ACK every N-th UP (0 never) ‖ u8: high nibble retries for confirmed events, low nibble backoff base in s |
 | 0x81 | interval | u16 report interval s ‖ u16 slot offset s |
@@ -229,10 +249,46 @@ configuration vN; whenever an UP reports a different version, the next DOWN
 carries the complete configuration and vN. JOIN_ACC always carries it.
 **Radio parameter safeguard** (uplink frequency 0x83, TX power 0x01): after
 applying such a change the sensor sets the ACK-request bit on the next 2
-uplinks regardless of the ACK policy. If neither gets a valid DOWN, it reverts
-to the previous value and sets its config version to 0 (never a valid gateway
+uplinks regardless of the ACK policy. A valid DOWN, a MIC-verified REJOIN
+bound to that UP, or a JOIN_ACC confirms the change (each proves the gateway
+received an uplink sent with the new parameters); the sensor then persists
+the configuration. If none of the 2 uplinks gets a valid DOWN, REJOIN or
+JOIN_ACC, it reverts to the previous value and sets its config version to 0 (never a valid gateway
 version) so the gateway resends the configuration. The
-gateway uses config versions 1–15 only.
+gateway uses config versions 1–15 only. A new version never equals the version the
+sensor last reported, and when saving a change fails the gateway restores the
+previous values under yet another new version (loop() may already have sent
+the failed one), so these two cases never reuse a number. Not covered: a
+version the sensor holds but has not reported yet (unconfirmed radio change,
+or right after a gateway restart, when the reported version is unknown until
+the first UP). A reuse with different content then needs 14 or more changes
+while the sensor is silent; the sensor re-syncs with the next change.
+The sensor writes a changed TX power / uplink frequency (and the version that
+brought it) to its store only after a DOWN, REJOIN or JOIN_ACC confirmed it; until then the
+store keeps the previous configuration, so a reset in between comes back with
+the old radio parameters and old version, and the gateway resends.
+
+- The gateway answers a verified UP with a DOWN when the UP requests an ACK,
+  when the reported version differs from vN, or when a command (status
+  request) is queued. The DOWN payload is at most 40 bytes: time (when the
+  gateway has a valid clock), then the complete configuration if the
+  versions differ, then commands; each part goes in whole or waits. If
+  something had to wait, FCtrl carries "more pending" and the sensor sends an
+  empty UP (POLL, ACK requested) after its duty-cycle gap, at most 3 in a row.
+- The sensor adopts the DOWN's version only from a DOWN that carried the
+  configuration (interval TLV present) or from a JOIN_ACC, and persists the
+  applied configuration together with the version (store-only TLV 0x1F,
+  §12a); a DOWN with only the time or commands leaves the version alone.
+- Gateway limits (web form, clamped again on load): interval 60–43200 s
+  (below 300 s the sensor stretches it to its duty-cycle limit), slot offset
+  < interval, TX power −9…14 dBm (regulatory clamp, 14 dBm ERP on 868.0 MHz;
+  the sensor clamps again), ACK every 0–255, retries 0–15, backoff 1–15 s.
+  The gateway does not send the uplink frequency in phase A (it listens on
+  one channel); the sensor accepts 863.0–868.6 MHz and applies the
+  safeguard.
+- Slot: when the sensor has the time, it sends at unix times t with
+  t mod interval = slot offset (never sooner than its duty-cycle gap);
+  without the time it simply sleeps one interval.
 
 ## 5. Procedures
 
@@ -241,14 +297,22 @@ gateway uses config versions 1–15 only.
 1. Sensor: devNonce += 1, persist, send JOIN_REQ. Open RX1 and, if nothing
    valid arrived, RX2 (§8).
 2. Gateway: DevID known, MIC (K_join_mic) valid, devNonce > last accepted →
-   persist devNonce, draw gwNonce, derive the new session, answer ACCEPT.
+   raise the stored devNonce, draw gwNonce, derive the new session, answer
+   ACCEPT. The devNonce is written to `sensors.json` right after the response
+   (a flash write before it would wait for the permit the radio task holds
+   until the launch). If the gateway loses power in between, the same
+   JOIN_REQ can be replayed once: it only creates a pending session that
+   never verifies (the sensor already uses a newer devNonce), so no session
+   is lost or forced.
    The old session (if any) stays valid until the first UP under the new
    session verifies, then it is dropped.
 3. Sensor: verifies ACCEPT with its devNonce, derives Ks, resets both FCnts to
    0, applies the configuration and the time.
 
-Limits on the gateway: at most one JOIN_ACC (ACCEPT or REJOIN) per DevID per
-10 s, and JOIN_ACC airtime at most 20 % of the downlink budget (§9). A
+Limits on the gateway: at most one ACCEPT and at most one REJOIN per DevID per
+10 s, counted separately (a forged UP - the DevID is in clear - that triggers
+REJOINs must not hold back the answer to a MIC-verified JOIN_REQ), and
+JOIN_ACC airtime at most 20 % of the downlink budget (§9). A
 JOIN_REQ with devNonce ≤ last accepted is dropped silently (a replayed request
 cannot force a rekey).
 
@@ -296,13 +360,15 @@ line is limited to one per minute.
 ### 5.4 REJOIN
 
 When the gateway receives an UP from a **known** DevID for which it has no
-session (typically after its own restart), it answers in RX1 with a REJOIN
+session (typically after its own restart) - or only a pending one that the UP
+does not verify under (the sensor never got the JOIN_ACC) - it answers with a REJOIN
 bound to that uplink's FCnt16 and MIC. The sensor accepts a REJOIN only if it
 matches its last uplink and then starts a join (JOIN_REQ with backoff rules of
 §5.5). A REJOIN answers an UP the gateway **cannot verify** (no session), so
 anyone replaying an old UP can trigger one: every REJOIN counts against the
-JOIN_ACC limits – at most one JOIN_ACC or REJOIN per DevID per 10 s and their
-airtime together ≤ 20 % of the downlink budget (§9). A frame with the gen2
+JOIN_ACC limits – at most one REJOIN per DevID per 10 s (separate from the
+ACCEPT limit, §5.1) and JOIN_ACC + REJOIN airtime together ≤ 20 % of the
+downlink budget (§9). A frame with the gen2
 marker and a known DevID is never passed to the generation 1 decoder.
 
 ### 5.5 Sensor state machine
@@ -327,7 +393,10 @@ all timings.
 
 `NO_SESSION` (after boot / added) → JOIN_REQ accepted → `SESSION_NEW`
 (old session kept if present) → first UP verifies under the new keys →
-`SESSION`. UP without a session → REJOIN.
+`SESSION`. UP that verifies under neither session while there is no
+current session → REJOIN. The response itself (§7) is built in `loop()`
+(`Protocol/Gen2Response`) and handed to the radio task, which checks the
+duty cycle (§9) and launches it in RX1 or RX2 (`Hardware/RadioTask`).
 
 ## 6. Generation 1 coexistence (gateway dispatch)
 
@@ -352,8 +421,8 @@ all timings.
 | Header valid | ≈ 116 ms after TX start | preamble 16 + 4.25 symbols = 83 ms, symbol 4.096 ms |
 | Accepted response start | ≈ T − 50 … T + 64 ms | outside: miss |
 | RX2 | **T + 2000 ms**, same frequency, same window | only if RX1 got nothing valid |
-| Gateway mid-reception check | before switching to TX | if a header is being received: defer to RX2 / next uplink; only JOIN_ACC, event ACKs (and later OTA) pre-empt |
-| Gateway late check | skip RX1 if the launch would be > 40 ms late | answer in RX2 instead |
+| Gateway mid-reception check | before switching to TX | if a header is being received: defer to RX2 / next uplink; only JOIN_ACC ACCEPT, REJOIN and the ACK of a confirmed UP (one carrying a status report or an event; later OTA) pre-empt |
+| Gateway decision / late check | the radio task decides at launch − 20 ms (`Gen2Downlink::decisionTime`): a response handed over by loop() until then goes out in that window, a later one in RX2, after the RX2 decision it is reported late; a launch more than 40 ms late (flash stall, preemption) is aborted - checked before the radio leaves receive and again right before the launch | answer in RX2 instead |
 | Gateway radio task | core 1, priority 14 | never blocks, never takes `sensorMutex`, never touches LittleFS |
 
 Airtimes at SF9/125 kHz: JOIN_REQ (22 B) 239 ms, REJOIN (10 B) 177 ms,
@@ -428,23 +497,33 @@ during firmware upload and 19 ms (Lite) during `saveSensors()`. Rules:
 ## 9. Duty cycle
 
 - **Sensor (868.0 MHz):** budget 0.1 % = 3.6 s per sliding hour, kept by the
-  sensor (airtime per 10-minute bucket, 6 buckets). When the budget is short:
-  POLLs and event retransmissions are dropped first, periodic data is delayed
-  to the next slot, JOIN_REQ backoff is extended. 10-minute SHT40 reports use
-  ≈ 1.3 s/h.
+  sensor (airtime per 10-minute bucket, 6 buckets, `eplink::DutyBuckets`).
+  When the budget is short: POLLs and retransmissions may use only 3/4 of it
+  (dropped first), a periodic report that does not fit is skipped until the
+  next slot, a JOIN_REQ that does not fit waits for the next backoff step. In
+  addition every transmission of airtime t is followed by ≥ t · 1000 /
+  permille of silence (per-frame off time, kept across resets). 10-minute
+  SHT40 reports use ≈ 1.3 s/h.
 - **Reset loops:** resets before a completed cycle (brown-out under TX,
   watchdog) delay the sensor's first transmission by 30 s · 2^(n−1), capped at
   the maximum interval (counter in a TAMP backup register, no flash writes).
+  A reset between a transmission and the end of the following sleep (marker in
+  TAMP BKP17R) waits at least the duty-cycle gap of that transmission; its
+  airtime is kept next to the marker (BKP16R, ms; unknown → 1.3 s).
 - **Bench override:** test firmware may raise the sensor budget at build time
   with `-DEP_SENSOR_DUTY_PERMILLE=<n>` (default 1 = 0.1 %; e.g. 10 for 60 s
   test intervals ≈ 13 s/h). A build with a value other than 1 prints
   `DUTY CYCLE OVERRIDE <n> permille - TEST BUILD` on the console at every boot.
   Production builds must not set it.
-- **Gateway (869.525 MHz):** 10 % = 360 s per sliding hour. After each
-  transmission of airtime t the next one waits ≥ 9·t (pacing, no bursts that
-  deafen the gateway). JOIN_ACC/REJOIN ≤ 20 % of the budget. Warning in the UI
-  and log above 80 % of the budget; when exhausted, only JOIN_ACC is sent and
-  other downlinks wait.
+- **Gateway (869.525 MHz):** 10 % = 360 s per sliding hour (60 one-minute
+  buckets, kept by the radio task). After each transmission of airtime t the
+  next one waits ≥ 9·t (pacing, no bursts that deafen the gateway). The budget
+  is split: JOIN_ACC/REJOIN ≤ 20 % (72 s/h), all other downlinks ≤ 80 %
+  (288 s/h), so when the data share is exhausted JOIN_ACC is still sent while
+  the other downlinks wait, and the sum never exceeds 10 %. A response that
+  does not pass the check in RX1 (pacing) may still go out in RX2. Warning in
+  the UI and log above 80 % of the 360 s; the used airtime (total and
+  join share) is shown in `/diag/heap`.
 
 ## 10. Flash layout of the sensor (final, approved 17. 10. 2026)
 
@@ -532,21 +611,265 @@ reset vector (past the 0x138-byte vector table) are valid, and jumps with
 SysTick off, NVIC lines disabled and pending bits cleared, VTOR = slot A, MSP
 set before PRIMASK is cleared. It programs the option bytes once (guarded by
 OBLRSTF against a reset loop): IWDG_STOP = 0 (IWDG frozen in Stop mode) and
-**BOR_LEV = 1 (2.0 V)** – decided by the owner. A TCXO cold start (cells out
-≥ 10 s, reset cause BOR + PIN) was verified by the owner: bootloader, radio
-init and the first packet OK. The bootloader hands RCC_CSR (reset cause) to the application
-in TAMP->BKP19R and clears the flags. An invalid slot A is reported three
-times on the console, then the bootloader enters Standby with all wake-up
-sources off (µA; NRST / power cycle / SWD under reset recover); bootloader
-faults (e.g. a flash ECC NMI) also end in Standby. PWR_CR3 survives Standby,
-so the bootloader re-enables the internal wake-up line at every start.
+**BOR_LEV = 0** – owner decision after a measurement: Stop2 draws 2.65 µA
+(2.33 µA base + 0.32 µA for the IWDG's LSI), BOR_LEV = 1 (2.0 V, used until
+M4a) adds 1.15 µA (3.8 µA); the STM32WL runs from 1.8 V and an update is
+accepted only with the battery ≥ 2.4 V under load (M4b OTA start). A unit with
+2.0 V programmed is reprogrammed once at the next boot. A TCXO cold start
+(cells out ≥ 10 s, reset cause BOR + PIN) was verified by the owner:
+bootloader, radio init and the first packet OK. The bootloader hands RCC_CSR
+(reset cause) to the application in TAMP->BKP19R and clears the flags. An
+invalid slot A is reported three times on the console, then the bootloader
+enters Standby with all wake-up sources off (µA; NRST / power cycle / SWD
+under reset recover); bootloader faults (e.g. a flash ECC NMI) also end in
+Standby. PWR_CR3 survives Standby, so the bootloader re-enables the internal
+wake-up line at every start.
 
-### 10.2 Deferred to the OTA phase
+### 10.2 Deferred
 
-Swap-with-confirm (confirm after the first successful join, revert after N
-unconfirmed starts under IWDG), the swap status record format, write
-protection (WRP) of the bootloader and identity pages, the read-out
-protection (RDP) decision, the ROM/UART service entry, and the LoRa transfer itself.
+The LoRa transfer itself (§14, M4b), write protection of the identity page,
+the read-out protection (RDP) decision and the ROM/UART service entry.
+
+### 10.3 Swap-with-confirm (M4a)
+
+Slot B holds a new image (M4a: written over SWD by `scripts/swap_request.py`;
+M4b: received over LoRa). The bootloader exchanges A and B page by page
+through the scratch page, the application confirms the new image, and an
+unconfirmed image is swapped back. Record format, page state machine and
+resume rules live in one pure-C header (`include/swap_core.h`) used by the
+bootloader, the application and the native test (`test/test_swap`).
+
+**Swap status page (page 117, 0x0803A800): append-only records.** Every
+record starts on an 8-byte boundary with an 8-byte header, programmed as one
+double word:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | magic 0xA5 |
+| 1 | 1 | type |
+| 2 | 2 | argument (little endian) |
+| 4 | 4 | CRC-32/ISO-HDLC over bytes 0–3 and the payload |
+| 8 | … | payload (PLAN only: 8·n bytes) |
+
+| Type | Record | Argument | Payload | Written by |
+|---|---|---|---|---|
+| 1 | `PENDING` | 0 | – | application (M4a: bench script) |
+| 2 | `PLAN` | direction << 8 \| n (0 FORWARD, 1 REVERT) | n × (u32 CRC-32C of A[i], u32 CRC-32C of B[i]) | bootloader, once per swap |
+| 3 | `DONE` | page index i | – | bootloader, after page i is complete |
+| 4 | `SWAPPED` | 0 | – | bootloader, after the last page of a FORWARD swap |
+| 5 | `BOOT` | k = 1, 2, 3 | – | bootloader, before every start of an unconfirmed image |
+| 6 | `CONFIRMED` | 0 | – | application |
+| 7 | `REVERTED` | reason: 1 boot count, 2 invalid image, 3 identity, 4 verify failure | – | bootloader |
+| 8 | `KEPT` | 0 | – | bootloader: revert impossible (slot B invalid), the new image stays |
+| 9 | `IDLE` | 0 | – | application (M4b: supersedes a stale `PENDING` when an OTA starts) |
+| 10 | `REVPLAN` | n | – | bootloader: REVERT swap with the CRCs of the last FORWARD `PLAN`, swapped (crcA ↔ crcB) |
+
+- Reading: records are parsed from the page start; a damaged area (bad magic,
+  unknown type, bad CRC, a double word with a flash ECC error, a payload past
+  the page end) is skipped in 8-byte steps. The state is the **last valid
+  record**; no valid record = `IDLE`. Terminal states: `IDLE`, `CONFIRMED`,
+  `REVERTED`, `KEPT`. The swap in progress is the last `PLAN` with the `DONE`
+  records after it.
+- Appending: behind the last double word of the page that is not erased (a
+  torn, partly programmed double word counts as used).
+- Space: one update cycle needs FORWARD (`PLAN` 8 + 8n, n `DONE`, `SWAPPED`,
+  3 `BOOT`, `CONFIRMED`) + REVERT (`REVPLAN` 8, n `DONE`, `REVERTED`) =
+  64 + 24n bytes (n = 56: 1408 B) after `PENDING`. A torn record leaves dead
+  bytes (a torn `PLAN` 8 + 8n). **Space rule:** before a FORWARD `PLAN` the
+  bootloader requires 64 + 24n + 128 bytes (reserve for torn records) behind
+  the write position; otherwise it **compacts** the page: erase, then
+  `PENDING` again (a power loss in between only loses the update request, A
+  is untouched). The REVERT normally writes no payload (`REVPLAN`). Every
+  append is checked. A failed `DONE` does not stop the swap (the page is
+  recognised later by its CRCs: A[i] = crcB, B[i] = crcA). A page that is
+  nevertheless full (more than the reserve lost to torn records) is compacted
+  to the record being written (after a FORWARD swap with a `SWAPPED` marker
+  first, so "confirmed after an update" survives); a `BOOT(k)` keeps 8 bytes
+  free for `CONFIRMED`, and the application compacts too when `CONFIRMED`
+  does not fit. A program failure is retried once behind the failed double
+  word; a second failure in a row also leads to the compaction (stuck double
+  words would otherwise be hit again by every boot). The FORWARD `PLAN` is then
+  gone and a revert compacts to `SWAPPED` + `BOOT(3)` and writes a full
+  `PLAN(REVERT)` (also when the `REVPLAN` does not fit). Residual risk – the
+  compaction window covers the erase **and** the first record written after
+  it: a loss during the erase leaves damaged double words and maybe
+  `DONE`/`REVPLAN` records without a `PLAN`, a loss before the first record
+  leaves an empty page – both read like `IDLE` (`sw_idle_like`): A starts,
+  and the M4b application may erase the page before `PENDING` as in a
+  terminal state. This holds for every compaction (to `SWAPPED`, to
+  `BOOT(k)`, at the `BOOT(3)` revert, also one reached after two program
+  failures): when the image in A was still unconfirmed, it then runs as boot
+  state 0 with no revert and no T_confirm reset. A torn application
+  compaction at `BOOT(3)` can leave `BOOT(3)` readable: the bootloader
+  reverts a good image (safe, the update is lost). A `REVPLAN` without a
+  usable FORWARD `PLAN` (damaged record) is also IDLE-like (accepted).
+  Native tests: n = 56 with 0–3 torn `PLAN`s, a pre-filled page, a full page.
+  The application additionally erases page 117 before writing `PENDING`
+  (M4b) when the page is not empty (terminal state only).
+
+**Page swap.** n = number of pages covering max(size A, size B) including
+the trailer (A invalid: 56). Before the FORWARD `PLAN` the slot B pages
+behind the new image ([pages(B), n)) are erased unless already blank: they
+only receive A's tail, and a damaged double word there (interrupted slot B
+erase in M4b) could otherwise fail the copy after A[i] was erased. When A is
+invalid (n = 56), unreadable A pages are erased too (their content does not
+matter, step 1 could never read them). For page i with crcA[i] ≠
+crcB[i]:
+
+1. erase scratch, program scratch = A[i], verify CRC(scratch) = crcA[i];
+2. only if CRC(B[i]) = crcB[i] still holds (else fail with A[i] intact): erase
+   A[i], program A[i] = B[i], verify CRC(A[i]) = crcB[i];
+3. erase B[i], program B[i] = scratch, verify CRC(B[i]) = crcA[i];
+4. append `DONE(i)`.
+
+Pages with crcA[i] = crcB[i] get `DONE(i)` without data movement. There is no
+marker in the scratch page (it is exactly one slot page); its content is
+identified by its CRC. **Page CRCs are CRC-32C** (Castagnoli, reflected,
+init and final xor 0xFFFFFFFF), not the image's CRC-32: an image ends with its
+own CRC-32, so two images that differ only in the trailer (e.g. just the
+firmware version) differ by a multiple of the CRC-32 polynomial and their last
+pages have the same CRC-32 – found on the bench, the last page was skipped.
+
+**Resume rule** (power loss): for the first page i of the active `PLAN` without
+`DONE(i)`:
+
+- crcA[i] = crcB[i] → append `DONE(i)`;
+- CRC(scratch) ≠ crcA[i] → redo from step 1 (A[i] is untouched: step 2 starts
+  only after the scratch verified);
+- else CRC(A[i]) = crcB[i] → redo step 3 only;
+- else → redo step 2, then step 3.
+
+A CRC over an area with a flash ECC error counts as a mismatch (the reads go
+through the ECC guard). Two pages with identical content make the scratch
+check ambiguous only between identical contents, which is harmless. A page that
+fails its copy 3 times, a stale B page or a flash error aborts
+the swap (`SW_RUN_FAILED`). What slot A holds then decides (`sw_after_failure`,
+native tests):
+
+| PLAN | A[0..n) | Record | Then |
+|---|---|---|---|
+| FORWARD | all old (crcA), A bootable | `REVERTED(verify)` | start A (the previous image) |
+| FORWARD | all new (crcB) | `KEPT` | start A (new image, no way back) |
+| REVERT | all old again (crcB) | `REVERTED(boot count)` | start A |
+| REVERT | still new (crcA) | `KEPT` | start A |
+| any | mixed, or A not bootable | – (PLAN stays) | timed Standby, retry |
+
+A permanent step-3 failure in a middle page (B page cannot be programmed,
+A[i] already new) is such a mixed case: every retry fails and after 8 retries
+the unit stays in Standby (known limit; finishing only the A side and ending
+in `KEPT` is a possible later improvement).
+
+**Readable range before the PLAN:** every page i < n is read first. An
+unreadable page of the new image (B, i < pages(B)) or of a valid A's image
+rejects the update (`REVERTED(verify)`, A untouched) – but only when A is
+bootable; with A invalid no terminal record is written, `PENDING` stays and
+the attempt counter / timed retry apply. An unreadable A page whose content
+does not matter (A invalid, or behind A's image) is erased. **Known limit:**
+a valid A with an ECC-damaged double word behind its own trailer (in its last
+page) rejects every future update with `REVERTED(verify)`; recovery is a
+wired reflash. (Reading unreadable double words behind the image end as
+0xFF would lift it; not done – bootloader size.) The same damage in the last
+page of B with slot A invalid cannot be recovered by the unit itself:
+`PENDING` stays, the attempt counter and the retry cap end in Standby, and
+recovery is a wired reflash.
+
+**Exception to "no terminal record without a bootable A":** in `PENDING` an
+invalid B (`REVERTED(invalid)`) or a B for other hardware
+(`REVERTED(identity)`) is rejected with a terminal record also when A is
+invalid – no retry could fix that image; with A invalid the unit then
+stays in Standby (table below) until a wired reflash.
+
+Resumes without progress (same number of `DONE` records) are counted in TAMP
+BKP15R and survive failures; FORWARD `PLAN` attempts in `PENDING` in BKP13R.
+After 3 of either, or after a failure with A not bootable, the bootloader
+enters Standby with an RTC wake-up every 30 s, counts 30 wake-ups (BKP11R,
+~15 min; build option `BL_STANDBY_WAKEUPS`) and tries again – at most 8 such
+retries per swap (BKP10R), then Standby until NRST/power-on. The cap also
+counts the Standbys after 3 resumes without progress: a battery browning out
+for more than ~2 h ends in Standby until a power cycle (by design). Without a
+running RTC (never enabled, LSE dead) the timer cannot be armed: the console
+says so and the bootloader uses the plain Standby. Brown-out under a weak
+battery must not wear the flash. NRST or a power-on ends the Standby chain
+at once.
+
+**Boot decision** (bootloader, every reset), by the state:
+
+| State | Action |
+|---|---|
+| `IDLE`, `CONFIRMED`, `REVERTED`, `KEPT` | start A (invalid A: report, Standby – known limit: no swap back to a valid B in a terminal state) |
+| `PENDING` | validate B (trailer magic and version, CRC read back, load address = slot A, size ≤ slot, stack and reset vector, HW type = identity HW revision; a board without identity accepts 0x0003). Invalid → `REVERTED(invalid image)`; identity unreadable or HW mismatch → `REVERTED(identity)`; A untouched, start A. Valid → erase B beyond the new image, space rule (compaction), `PLAN(FORWARD)`, swap, `SWAPPED`, `BOOT(1)`, start A. A downgrade is allowed and logged |
+| `PLAN` (+ `DONE`s) | resume the swap; FORWARD ends with `SWAPPED` + `BOOT(1)`, REVERT with `REVERTED(boot count)`; start A |
+| `SWAPPED` | `BOOT(1)`, start A |
+| `BOOT(k)`, k < 3 | `BOOT(k+1)`, start A |
+| `BOOT(3)` | validate B (the previous image): valid → `REVPLAN`, swap, `REVERTED(boot count)`, start A; invalid → `KEPT`, start A (reported). Without a FORWARD `PLAN` in the page, or when the revert does not fit behind it: compact to `SWAPPED` + `BOOT(3)` and write a full `PLAN(REVERT)` |
+
+**Confirmation** (application): an image in state `BOOT(k)` writes
+`CONFIRMED` after the first verified DOWN that answers an UP sent after a
+**proven** interval sleep: the sleep was at least min(¾ × interval, 250 s)
+(the slot sleep is the interval minus the awake time) and the RTC counter
+measured at least 90 % of it. The proof uses only the RTC counter (SSR) and
+needs the RTC in binary mode on the LSE – not the gateway's time (a gateway
+without NTP sends no time TLV). While unconfirmed every UP requests an ACK.
+JOIN_ACC alone does not confirm. T_confirm = max(6 h, 4 × interval) (D4 base
+6 h), checked at the end of a cycle after its transmission: a healthy image
+with a 12 h interval gets several UP/DOWN chances, a sensor that never
+reaches the gateway reverts after ~3 × T_confirm. An unconfirmed image
+without a usable identity resets at once.
+
+**Sleep backstop** (every inter-cycle sleep, confirmed or not; the RX-window
+Stop2 of ≤ ~2 s has none): the inter-cycle sleep
+runs in 25 s LPTIM1 chunks; before each chunk the RTC wake-up timer is armed
+at 30 s. If it fires, the LPTIM wake-up failed and the application resets
+(an unconfirmed image: the bootloader counts the start; three → revert).
+The IWDG is reloaded after every chunk. LPTIM1 and the RTC both run on the
+LSE: Stop2 is never entered without LSERDY (then the wait is awake, at run
+current). The 25 s chunks wake the CPU ~10 × more often than 250 s chunks
+would (estimate < 0.1 µA, to be confirmed by the owner's current
+measurement). **Residual risk:** an LSE that dies during one Stop2 stops both
+wake sources (the IWDG is frozen in Stop2, D2) – the LSE clock security
+system is an option for later.
+
+**Boot state reporting** (status report byte 22, §4.1): 0 none, 1 swapped /
+unconfirmed, 2 confirmed after an update, 3 reverted: boot count, 4 reverted:
+invalid image, 5 reverted: identity, 6 kept (revert impossible), 7 reverted:
+verify failure. Byte 23: bootloader version (major << 4 | minor), handed over
+in TAMP BKP14R (low byte; bit 8: IWDG not started because the IWDG_STOP option
+byte is still 1 – then an image hanging while awake is not caught; reported
+as status byte 21 bit 1; bit 9: the bootloader wrote a swap record in this
+boot). The
+first UP after a join carries an unsolicited status report when the
+bootloader wrote a record in this boot (swap, boot count step, revert) or the
+image was just confirmed – not after every reboot.
+
+**Flash ECC guard.** An interrupted erase or program leaves double words that
+raise an ECC NMI on read. The bootloader and the application read slots A/B,
+pages 116–118, the configuration copies and the identity page with a guard:
+the NMI handler records the address and returns, the reader treats the double
+word as damaged (the bootloader accepts guarded ECC errors only in slots A/B,
+pages 116–118 and the identity page, waits for a pending NMI before the guard
+drops and flushes the flash caches after an erase and before verify reads).
+Any other ECC NMI: bootloader → Standby, application →
+reset.
+
+**Write protection (D3, build option `BL_WRP`).** The bootloader programs
+WRP1AR = pages 0–3 (STRT 0, END 3) together with OPTR in one option byte
+load (guarded by OBLRSTF). While WRP is active a mass erase is impossible and
+`pio run -e bootloader -t upload` fails. Lifting it (openocd, stm32l4x
+driver): `stm32l4x option_write 0 0x2C 0x0000007F 0x007F007F` (STRT 0x7F >
+END 0) followed by `stm32l4x option_load 0`. Bench builds leave `BL_WRP` off.
+
+### 10.4 Independent watchdog (M4a)
+
+The bootloader starts the IWDG (prescaler /256, reload 4095: 32.8 s nominal,
+31–34 s over the LSI tolerance; measured 33.0 s) right before every jump into
+the application, never before Standby – and only when the IWDG_STOP option
+byte is 0 (otherwise the IWDG would run in Stop2 and reset every long sleep;
+the application is told through BKP14R bit 8). An image that hangs before its
+own initialisation is caught too. IWDG_STOP = 0 freezes it in Stop2 (D2), so every Stop2 entry has
+an LPTIM wake-up. The application reloads it at the start of every cycle
+(`loop()`) and inside loops that can stay awake longer than 10 s. A watchdog
+reset counts as a reset before a completed cycle (§9) and shows in the reset
+cause (RCC_CSR bit IWDGRSTF).
 
 ## 11. Library (`lib/explora-protocol`)
 
@@ -569,18 +892,39 @@ L = `A1B2-C3D4-E5F6-0718`, DevID = 0x3EA4191D, devNonce = 7, gwNonce =
 temperature + board data), DOWN FCnt 0x10002 answering UP 5, REJOIN answering
 that UP. Expected bytes: `test/test_protocol_v2/vectors.h`.
 
-## 12a. Open decisions for M3
+## 12a. Decisions taken for M3
 
-- devNonce recovery when the sensor's config store is lost (both copies
-  damaged, board reflashed with an erase): the sensor restarts at devNonce 1
-  and the gateway drops its JOIN_REQs until the counter passes the stored
-  value. Options: a gateway-side "reset devNonce" action for an authenticated
-  admin, or a recovery JOIN_REQ flag combined with a fresh label.
-- Wear: once the TLV configuration is repeated in every devNonce record, a
-  devNonce-only record type (short) may be needed so a join does not rewrite
-  the whole snapshot.
-- `FlashPermit::tryHoldForRadio()` has no caller yet (M3 adds the timed
-  responses); its rule is tested only through the pure timestamp decision.
+- **devNonce recovery** (the sensor's config store is lost: both copies
+  damaged, or the board was reflashed with a full erase). The sensor restarts
+  at devNonce 1 and the gateway drops its JOIN_REQs as replays (§5.1). The
+  sensor is not changed for this (no recovery flag: an unauthenticated flag
+  would let anyone with an old JOIN_REQ force the same reset). Instead:
+  - the gateway counts MIC-valid JOIN_REQs with devNonce ≤ the last accepted
+    one per sensor and shows them on the sensor detail page ("JOIN_REQ
+    rejected: devNonce not above the last accepted one"); after 3 of them
+    without any accepted join in between the page shows the hint that the
+    sensor probably lost its configuration;
+  - an authenticated admin can **reset the devNonce** of one sensor on that
+    page. The gateway then forgets the stored devNonce (saved at once) and
+    accepts the next MIC-valid JOIN_REQ with any devNonce; from then on the
+    normal rule applies again. The action is logged. Until the sensor joins,
+    any replayed old JOIN_REQ of that sensor is accepted once (it only
+    produces a pending session that never verifies, §5.1 step 2), so the
+    reset is meant to be used right before the sensor is restarted.
+- **devNonce-only record** (config store, §10.0): a record whose payload is
+  exactly 4 bytes (devNonce, no TLV) is a devNonce-only record; a full
+  snapshot always carries at least one TLV: the config version, stored as the
+  store-only TLV 0x1F (1-byte class, id 0x1F, u8 version; never sent on the
+  air). Loading: devNonce from the
+  valid record with the highest sequence number, configuration (TLVs) from
+  the valid record with the highest sequence number that has TLVs. A copy
+  switch always writes the complete current snapshot (newest devNonce + newest
+  TLVs) as the first record of the new copy, so erasing the old copy can lose
+  neither. A JOIN_REQ costs one 16-byte record (6 kB copy ≈ 380 joins
+  between erases).
+- `FlashPermit::tryHoldForRadio()` is called by the radio task at RxDone for
+  every frame carrying the generation 2 marker whose timestamp is reliable,
+  and at T2 − 20 ms when RX2 is used (§7).
 
 ## 13. Deviations from the proposal
 
@@ -599,3 +943,14 @@ that UP. Expected bytes: `test/test_protocol_v2/vectors.h`.
   position.
 - Gateway compensates the per-chip offset (C_chip); prepare lead 20 ms
   instead of 10 ms (measured preemption under TLS).
+- M4a (phase B assignment): instead of "erase when < 1.5 kB is free" the
+  bootloader applies a space rule before every FORWARD `PLAN` (64 + 24n + 128
+  bytes, compaction otherwise) and the REVERT reuses the FORWARD CRCs
+  (`REVPLAN`, no payload) – torn `PLAN`s can no longer exhaust the page; page identity by CRC-32C (the image CRC-32 hides trailer-only
+  differences); extra records `KEPT` and `REVPLAN` and boot states 6 (kept) and 7
+  (verify failure); the bench fault test chooses the operation at run time (TAMP
+  BKP12R, `BL_FAULT_TEST`) instead of a build per operation, and on the bench
+  covers a sample (74 runs: every 32nd operation of the first two and the
+  last page, the DONE records, random others) – the exhaustive run over every
+  operation of those pages is the native test; the application's ECC guard
+  covers slot B and pages 116–118 but not slot A (it runs from there).

@@ -27,6 +27,7 @@
 #include "SensorData.h"
 #include "Gen2Sensor.h"
 #include "../Protocol/WaitingList.h"
+#include "../Hardware/RadioTask.h"
 #include "Logging.h"
 
 /**
@@ -54,6 +55,9 @@ private:
     // Generation 2 sensors (protocol v2) and unknown DevIDs seen in JOIN_REQs
     Gen2Sensor gen2[MAX_GEN2_SENSORS];
     size_t gen2Count = 0;
+    bool devNonceSaveDue = false;      // devNonce / firmware / boot state changed: write sensors.json after the response
+    uint32_t devNonceSaveAtMs = 0;     // next attempt (DueTime::reached)
+    void scheduleGen2SaveLocked(unsigned long nowMs);
     WaitingList<8> waiting;
     bool waitingLogged = false;
     unsigned long lastWaitingLogMs = 0;
@@ -141,8 +145,20 @@ public:
     std::vector<Gen2Sensor> getGen2Sensors() const; // copies without key material except the label
     size_t getWaitingList(WaitingEntry *out, size_t max) const;
     void recordWaitingJoin(const ep::JoinRequest &req, int16_t rssi, unsigned long nowMs);
-    void handleGen2Frame(const uint8_t *frame, size_t len, const ep::FrameInfo &info, int16_t rssi, float snr,
-                         float freqError, unsigned long nowMs);
+    // A frame of a configured gen2 sensor. true: req holds the response for
+    // packet.responseSlot (never with slot 0)
+    bool handleGen2Frame(const RadioPacket &packet, const ep::FrameInfo &info, unsigned long nowMs, TxRequest &req);
+    // Sensor detail page (copy without key material)
+    bool getGen2Sensor(uint32_t devId, Gen2Sensor &out) const;
+    // New desired configuration (clamped; version raised when it changed).
+    // 1 changed and saved, 0 unchanged, -1 unknown DevID, -2 save failed
+    int setGen2Config(uint32_t devId, const Gen2Config::Values &values);
+    // Ask for a status report with the next DOWN
+    bool requestGen2Status(uint32_t devId);
+    // Forget the stored devNonce (sensor lost its configuration store, spec 12a)
+    bool resetGen2DevNonce(uint32_t devId);
+    // Outcome of a response reported by the radio task
+    void recordTxResult(const TxResult &result);
 
     // Forward sensor data to HTTP (blocking - never call with the lock held)
     bool forwardSensorData(const SensorData &sensor);

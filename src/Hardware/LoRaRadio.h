@@ -35,8 +35,11 @@ struct RadioError
 /**
  * Abstract LoRa radio
  *
- * The gateway only receives. Each driver configures the chip with the
- * LORA_* parameters from config.h and stays in continuous receive mode.
+ * Each driver configures the chip with the LORA_* parameters from config.h
+ * and stays in continuous receive mode on the uplink channel; for a protocol
+ * v2 response it is switched to the downlink channel, the frame is staged
+ * (RadioLib stageMode) and launched at the exact time (launchMode), then it
+ * returns to receive.
  * The chip's "packet ready" pin timestamps the event and notifies the radio
  * task (RadioTask.h), the only user of the driver after setup().
  */
@@ -79,6 +82,25 @@ public:
     // Reason of the last failed receivePacket()/reset(); drivers never log
     // from paths the radio task uses (receivePacket, isConnected, reset)
     virtual RadioError lastError() const = 0;
+
+    // --- Downlink (radio task only; no logging) ---------------------------
+
+    // RxDone -> response launch offset of this chip (M0 measurement)
+    virtual int64_t chipOffsetUs() const = 0;
+
+    // A packet is being received right now (header seen, RxDone not yet)
+    virtual bool receivingNow() = 0;
+
+    // Standby (XOSC on SX1262), retune to the downlink channel, set the
+    // power and stage the frame; the launch follows with launchTx()
+    virtual int16_t prepareTx(const uint8_t *frame, size_t len) = 0;
+    virtual int16_t launchTx() = 0;
+
+    // After TxDone (or a failed launch): back to receive on the uplink channel
+    virtual void finishTx() = 0;
+
+    // Time on air of a frame on the downlink channel
+    virtual uint32_t timeOnAirUs(size_t len) = 0;
 
     // Chip name for logs and the web UI
     virtual const char *getChipName() const = 0;

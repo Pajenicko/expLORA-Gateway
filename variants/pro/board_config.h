@@ -10,6 +10,8 @@
 // Radio chip: E22-900M22S = SX1262, TCXO on DIO3, RF switch RXEN + DIO2 (TXEN)
 #define RADIO_SX1262
 #define LORA_TCXO_VOLTAGE 1.8
+#define LORA_DOWNLINK_POWER_DBM 14  // up to 22 dBm allowed at 869.525 MHz (27 dBm ERP)
+#define LORA_CHIP_OFFSET_US 6400    // RxDone -> response timing offset measured in M0
 
 #define LORA_CS 15   // NSS (strap MTDO)
 #define LORA_RST 32  // NRST

@@ -53,10 +53,18 @@ bool LoRaProtocol::processPacket(const RadioPacket &packet)
         packetBuffer, length, [this](uint32_t devId) { return sensorManager.isKnownGen2(devId); }, info);
     if (route == Gen2Dispatch::Route::Gen2Known)
     {
-        sensorManager.handleGen2Frame(packetBuffer, length, info, packet.rssi, packet.snr, packet.freqError,
-                                      millis());
+        // Every response slot is answered: a response, or a cancel that
+        // releases the radio task's flash write permit at once
+        static TxRequest response; // loop() only, 200 bytes off the stack
+        bool answer = sensorManager.handleGen2Frame(packet, info, millis(), response);
+        if (!answer || !RadioTask::respond(response))
+        {
+            RadioTask::cancel(packet.responseSlot);
+        }
         return false;
     }
+    // Not a known gen2 frame: no response, release the slot right away
+    RadioTask::cancel(packet.responseSlot);
     if (route == Gen2Dispatch::Route::JoinUnknown)
     {
         ep::JoinRequest req;

@@ -85,6 +85,10 @@ public:
     // Add a generation 2 sensor (DevID + label key)
     static String generateGen2AddPage(const String &devId, const String &error);
 
+    // Generation 2 sensor detail: status, configuration form, status request,
+    // downlink counters, devNonce reset
+    static String generateGen2DetailPage(const Gen2Sensor &sensor, const String &message);
+
     // Generate sensor add page
     static String generateSensorAddPage();
 

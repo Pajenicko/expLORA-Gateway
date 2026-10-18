@@ -51,7 +51,7 @@ void RadioSX1262::recordError(const char *what, int16_t state)
 bool RadioSX1262::configure()
 {
     rxRunning = false;
-    // TX power is irrelevant (receive only), RadioLib needs a value
+    // Downlink power is set per response in prepareTx(); RadioLib needs a value here
     int16_t state = radio->begin(LORA_FREQUENCY_MHZ, LORA_BANDWIDTH_KHZ, LORA_SPREADING_FACTOR, LORA_CODING_RATE,
                                  LORA_SYNC_WORD, 10, LORA_PREAMBLE_LENGTH, LORA_TCXO_VOLTAGE);
     if (state != RADIOLIB_ERR_NONE)
@@ -204,6 +204,72 @@ float RadioSX1262::getSNR()
 float RadioSX1262::getFrequencyError()
 {
     return lastFreqError;
+}
+
+// Header received, RxDone not yet (HEADER_VALID is enabled in the RX IRQ flags)
+bool RadioSX1262::receivingNow()
+{
+    if (!initialized)
+    {
+        return false;
+    }
+    uint32_t flags = radio->getIrqFlags();
+    return (flags & RADIOLIB_SX126X_IRQ_HEADER_VALID) && !(flags & RADIOLIB_SX126X_IRQ_RX_DONE);
+}
+
+int16_t RadioSX1262::prepareTx(const uint8_t *frame, size_t len)
+{
+    if (!initialized)
+    {
+        return RADIOLIB_ERR_CHIP_NOT_FOUND;
+    }
+    rxRunning = false;
+    // XOSC standby: the TCXO keeps running, no 5 ms restart at the launch
+    int16_t state = radio->standby(RADIOLIB_SX126X_STANDBY_XOSC);
+    if (state == RADIOLIB_ERR_NONE)
+        state = radio->setFrequency(LORA_DOWNLINK_MHZ); // 1.5 MHz: no image recalibration
+    if (state == RADIOLIB_ERR_NONE)
+        state = radio->setOutputPower(LORA_DOWNLINK_POWER_DBM);
+    if (state == RADIOLIB_ERR_NONE)
+    {
+        RadioModeConfig_t cfg;
+        cfg.transmit.data = frame;
+        cfg.transmit.len = len;
+        cfg.transmit.addr = 0;
+        state = radio->stageMode(RADIOLIB_RADIO_MODE_TX, &cfg);
+    }
+    if (state != RADIOLIB_ERR_NONE)
+    {
+        recordError("prepareTx", state);
+    }
+    return state;
+}
+
+int16_t RadioSX1262::launchTx()
+{
+    int16_t state = radio->launchMode();
+    if (state != RADIOLIB_ERR_NONE)
+    {
+        recordError("launchTx", state);
+    }
+    return state;
+}
+
+void RadioSX1262::finishTx()
+{
+    radio->finishTransmit();
+    radio->setFrequency(LORA_FREQUENCY_MHZ);
+    int16_t state = radio->startReceive();
+    rxRunning = state == RADIOLIB_ERR_NONE;
+    if (!rxRunning)
+    {
+        recordError("startReceive", state);
+    }
+}
+
+uint32_t RadioSX1262::timeOnAirUs(size_t len)
+{
+    return (uint32_t)radio->getTimeOnAir(len);
 }
 
 // Check if module is connected (LoRa sync word register reads back 0x1424)

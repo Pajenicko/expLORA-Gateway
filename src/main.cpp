@@ -323,6 +323,13 @@ void loop()
         }
     }
 
+    // Outcomes of generation 2 responses (per-sensor downlink counters)
+    TxResult txResult;
+    while (sensorManager && RadioTask::takeResult(txResult))
+    {
+        sensorManager->recordTxResult(txResult);
+    }
+
     // Short delay for stability
     delay(5);
 

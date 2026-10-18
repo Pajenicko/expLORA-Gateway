@@ -221,7 +221,12 @@ void WebPortal::setupRoutes()
     server.on("/sensors/delete", HTTP_GET, std::bind(&WebPortal::handleSensorDelete, this, std::placeholders::_1));
     server.on("/sensors/add2", HTTP_GET, std::bind(&WebPortal::handleGen2Add, this, std::placeholders::_1));
     server.on("/sensors/add2", HTTP_POST, std::bind(&WebPortal::handleGen2AddPost, this, std::placeholders::_1));
-    server.on("/sensors/delete2", HTTP_GET, std::bind(&WebPortal::handleGen2Delete, this, std::placeholders::_1));
+    server.on("/sensors/delete2", HTTP_POST, std::bind(&WebPortal::handleGen2Delete, this, std::placeholders::_1));
+    server.on("/sensors/gen2/config", HTTP_POST, std::bind(&WebPortal::handleGen2Config, this, std::placeholders::_1));
+    server.on("/sensors/gen2/status", HTTP_POST, std::bind(&WebPortal::handleGen2Status, this, std::placeholders::_1));
+    server.on("/sensors/gen2/resetnonce", HTTP_POST,
+              std::bind(&WebPortal::handleGen2ResetNonce, this, std::placeholders::_1));
+    server.on("/sensors/gen2", HTTP_GET, std::bind(&WebPortal::handleGen2Detail, this, std::placeholders::_1));
     server.on("/sensors", HTTP_GET, std::bind(&WebPortal::handleSensors, this, std::placeholders::_1));
 
     // Logs
@@ -1036,12 +1041,19 @@ void WebPortal::handleGen2AddPost(AsyncWebServerRequest *request)
     request->redirect("/sensors");
 }
 
+// DevID from a query (GET) or form (POST) parameter
+static bool gen2DevIdParam(AsyncWebServerRequest *request, bool post, uint32_t &devId)
+{
+    return request->hasParam("devId", post) &&
+           ep::parseDevId(request->getParam("devId", post)->value().c_str(), devId);
+}
+
 void WebPortal::handleGen2Delete(AsyncWebServerRequest *request)
 {
-    logger.debug("HTTP request: GET /sensors/delete2");
+    logger.debug("HTTP request: POST /sensors/delete2");
     if (guardAPOnly(request)) return;
     uint32_t devId = 0;
-    if (request->hasParam("devId") && ep::parseDevId(request->getParam("devId")->value().c_str(), devId))
+    if (gen2DevIdParam(request, true, devId))
     {
         if (!sensorManager.deleteGen2Sensor(devId))
         {
@@ -1049,6 +1061,129 @@ void WebPortal::handleGen2Delete(AsyncWebServerRequest *request)
         }
     }
     request->redirect("/sensors");
+}
+
+void WebPortal::sendGen2Detail(AsyncWebServerRequest *request, uint32_t devId, const String &message, int code)
+{
+    // The page copy lives only for the generation (one sensor, ~600 bytes)
+    std::unique_ptr<Gen2Sensor> g(new (std::nothrow) Gen2Sensor());
+    if (!g || !sensorManager.getGen2Sensor(devId, *g))
+    {
+        request->send(404, "text/plain", "Unknown generation 2 sensor");
+        return;
+    }
+    String html = HTMLGenerator::generateGen2DetailPage(*g, message);
+    g->wipeKeys();
+    sendNoStore(request, code, "text/html", html);
+}
+
+void WebPortal::handleGen2Detail(AsyncWebServerRequest *request)
+{
+    logger.debug("HTTP request: GET /sensors/gen2");
+    if (guardAPOnly(request)) return;
+    uint32_t devId = 0;
+    if (!gen2DevIdParam(request, false, devId))
+    {
+        request->send(400, "text/plain", "DevID missing");
+        return;
+    }
+    sendGen2Detail(request, devId, "");
+}
+
+void WebPortal::handleGen2Config(AsyncWebServerRequest *request)
+{
+    logger.debug("HTTP request: POST /sensors/gen2/config");
+    if (guardAPOnly(request)) return;
+    uint32_t devId = 0;
+    if (!gen2DevIdParam(request, true, devId))
+    {
+        request->send(400, "text/plain", "DevID missing");
+        return;
+    }
+    Gen2Config::Values v;
+    {
+        // Heap copy: Gen2Sensor is too big for the AsyncTCP stack
+        std::unique_ptr<Gen2Sensor> current(new (std::nothrow) Gen2Sensor());
+        if (!current || !sensorManager.getGen2Sensor(devId, *current))
+        {
+            request->send(404, "text/plain", "Unknown generation 2 sensor");
+            return;
+        }
+        v = current->config;
+        current->wipeKeys();
+    }
+    bool ok = true;
+    auto number = [request, &ok](const char *name, long min, long max, long fallback)
+    {
+        if (!request->hasParam(name, true))
+        {
+            return fallback;
+        }
+        String text = request->getParam(name, true)->value();
+        text.trim();
+        char *end = nullptr;
+        long value = strtol(text.c_str(), &end, 10);
+        if (text.length() == 0 || end == nullptr || *end != '\0' || value < min || value > max)
+        {
+            ok = false;
+            return fallback;
+        }
+        return value;
+    };
+    v.intervalS = (uint16_t)number("interval", Gen2Config::MIN_INTERVAL_S, Gen2Config::MAX_INTERVAL_S, v.intervalS);
+    v.slotS = (uint16_t)number("slot", 0, Gen2Config::MAX_INTERVAL_S - 1, v.slotS);
+    v.txPowerDbm = (int8_t)number("txPower", Gen2Config::MIN_TX_POWER_DBM, Gen2Config::MAX_TX_POWER_DBM, v.txPowerDbm);
+    v.ackEvery = (uint8_t)number("ackEvery", 0, 255, v.ackEvery);
+    v.ackRetries = (uint8_t)number("ackRetries", 0, Gen2Config::MAX_RETRIES, v.ackRetries);
+    v.ackBackoffS = (uint8_t)number("ackBackoff", Gen2Config::MIN_BACKOFF_S, Gen2Config::MAX_BACKOFF_S, v.ackBackoffS);
+    if (!ok)
+    {
+        sendGen2Detail(request, devId, "Not saved: a value is out of range", 400);
+        return;
+    }
+    if (v.slotS >= v.intervalS)
+    {
+        sendGen2Detail(request, devId, "Not saved: the slot offset must be smaller than the interval", 400);
+        return;
+    }
+    int result = sensorManager.setGen2Config(devId, v);
+    const char *msg = result == 1   ? "Saved - waiting for the sensor (sent with its next uplink)"
+                      : result == 0 ? "Nothing changed"
+                                    : "Not saved: flash write failed (see Logs)";
+    sendGen2Detail(request, devId, msg, result >= 0 ? 200 : 500);
+}
+
+void WebPortal::handleGen2Status(AsyncWebServerRequest *request)
+{
+    logger.debug("HTTP request: POST /sensors/gen2/status");
+    if (guardAPOnly(request)) return;
+    uint32_t devId = 0;
+    if (!gen2DevIdParam(request, true, devId))
+    {
+        request->send(400, "text/plain", "DevID missing");
+        return;
+    }
+    if (!sensorManager.requestGen2Status(devId))
+    {
+        request->send(404, "text/plain", "Unknown generation 2 sensor");
+        return;
+    }
+    sendGen2Detail(request, devId, "Status requested - the sensor answers after its next uplink");
+}
+
+void WebPortal::handleGen2ResetNonce(AsyncWebServerRequest *request)
+{
+    logger.debug("HTTP request: POST /sensors/gen2/resetnonce");
+    if (guardAPOnly(request)) return;
+    uint32_t devId = 0;
+    if (!gen2DevIdParam(request, true, devId))
+    {
+        request->send(400, "text/plain", "DevID missing");
+        return;
+    }
+    bool ok = sensorManager.resetGen2DevNonce(devId);
+    sendGen2Detail(request, devId, ok ? "devNonce reset - restart the sensor now" : "devNonce reset not saved (see Logs)",
+                   ok ? 200 : 500);
 }
 
 // Logs page
@@ -1456,6 +1591,16 @@ void WebPortal::handleDiagHeap(AsyncWebServerRequest *request)
                 (unsigned long)rs.resetsOk, (unsigned long)rs.resetsFailed, (unsigned long)rs.selfHeals,
                 (unsigned long)rs.unreliableTime, (unsigned long)rs.stackFree,
                 (unsigned long)FlashPermit::writerWaits(), (unsigned long)FlashPermit::writerTimeouts());
+    // Protocol v2 downlink: responses per window, reasons for not sending,
+    // duty cycle used in the last hour (869.525 MHz, 10 % = 360 s)
+    res->printf("\"downlink\":{\"rx1\":%lu,\"rx2\":%lu,\"busy\":%lu,\"budget\":%lu,\"pacing\":%lu,"
+                "\"late\":%lu,\"lateRequest\":%lu,\"noHold\":%lu,\"failed\":%lu,\"txDoneTimeouts\":%lu,"
+                "\"holdFails\":%lu,\"slotsBusy\":%lu,\"dutyUsedMs\":%lu,\"joinUsedMs\":%lu,\"dutyBudgetMs\":%lu},",
+                (unsigned long)rs.txRx1, (unsigned long)rs.txRx2, (unsigned long)rs.txBusy,
+                (unsigned long)rs.txBudget, (unsigned long)rs.txPacing, (unsigned long)rs.txLate,
+                (unsigned long)rs.txLateRequest, (unsigned long)rs.txNoHold, (unsigned long)rs.txFailed,
+                (unsigned long)rs.txDoneTimeouts, (unsigned long)rs.holdFails, (unsigned long)rs.slotsBusy,
+                (unsigned long)rs.dutyUsedMs, (unsigned long)rs.joinUsedMs, 360000UL);
     res->print("\"wifiStatus\":"); res->print((int)WiFi.status()); res->print(",");
     res->print("\"apMode\":"); res->print(isAPMode ? "true" : "false"); res->print(",");
     res->print("\"uplink\":\""); res->print(uplink->getActiveName()); res->print("\",");
