@@ -152,6 +152,11 @@ bool decodeUp(Gen2Sensor &g, const uint8_t *payload, size_t len, unsigned long n
             g.statusMs = nowMs;
             g.statusRequested = false;
             Gen2Config::statusBootInfo(t.value, t.len, g.bootState, g.blVersion);
+            if (t.len >= 16 && Gen2Config::inSync(g.configVersion, g.cfgVersion))
+            {
+                g.reportedTx = (int8_t)t.value[15]; // the power the sensor really uses (spec 4.3)
+                g.reportedTxVersion = g.cfgVersion;
+            }
             continue;
         }
         if (t.channel != 0)
@@ -171,9 +176,15 @@ bool decodeUp(Gen2Sensor &g, const uint8_t *payload, size_t len, unsigned long n
             break;
         case ep::up::kDownlinkRssi:
             g.downlinkRssi = (int8_t)t.value[0];
+            g.upDownlinkRssi = Gen2Link::History::clamp8(g.downlinkRssi);
             break;
         case ep::up::kDownlinkSnr:
             g.downlinkSnr = (int8_t)t.value[0];
+            if (g.downlinkSnr != INT8_MIN) // invalid-value sentinel
+            {
+                int q = g.downlinkSnr;     // 0.25 dB -> whole dB, rounded down
+                g.upDownlinkSnr = (int8_t)(q >= 0 ? q / 4 : -((-q + 3) / 4));
+            }
             break;
         default:
             break;

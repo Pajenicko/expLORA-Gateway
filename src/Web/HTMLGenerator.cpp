@@ -1187,6 +1187,62 @@ static String describeStatus(const uint8_t *v, size_t len)
     return html;
 }
 
+static String txPowerWarning()
+{
+    return "Above the EU limit of " + String(Gen2Config::EU_TX_POWER_DBM) +
+           " dBm ERP for 868.0 MHz (ETSI EN 300 220). The legal maximum depends on the country; the "
+           "operator is responsible.";
+}
+
+// "worst signal -111 dBm, SNR -8 dB, margin 4 dB" (spec 4.3)
+static String linkSummary(const Gen2Link::Margins &m)
+{
+    String t = "worst signal " + String(m.worstUp) + " dBm";
+    // the reported SNR is a lower bound of the true one (spec 4.3)
+    t += m.upSnrSamples > 0 ? ", SNR &ge; " + String(m.worstUpSnr > 0 ? "+" : "") + String(m.worstUpSnr) + " dB"
+                            : String(", SNR unknown at this power");
+    return t + ", margin " + String(m.upMargin()) + " dB" + (m.upSnrLimits() ? " (SNR-limited)" : "");
+}
+
+// TX power hint from the link history (spec 4.3); never applied automatically
+static String txPowerAdvice(const Gen2Link::Margins &m, int txNow)
+{
+    const Gen2Link::Recommendation r = Gen2Link::recommend(m, txNow);
+    const String signal = linkSummary(m);
+    switch (r.advice)
+    {
+    case Gen2Link::Advice::Lower:
+        return "Hint: " + signal + " &ndash; the TX power can be lowered to " + String(r.power) +
+               " dBm (margin then " + String(m.upMargin() - (txNow - r.power)) + " dB), saves battery.";
+    case Gen2Link::Advice::Raise:
+        return "<span style='color:#e67e22;'>Hint: " + signal + " &ndash; consider " + String(r.power) + " dBm" +
+               (r.power > Gen2Config::EU_TX_POWER_DBM
+                    ? " &ndash; above the EU limit of " + String(Gen2Config::EU_TX_POWER_DBM) +
+                          " dBm ERP, see the warning"
+                    : String("; legal limits apply")) +
+               ".</span>";
+    case Gen2Link::Advice::AtMaximum:
+        return "<span style='color:#e67e22;'>Hint: " + signal +
+               " at the maximum power &ndash; improve the antenna or its placement.</span>";
+    default:
+        if (m.lost > 0)
+        {
+            Gen2Link::Margins noLoss = m;
+            noLoss.lost = 0;
+            if (Gen2Link::recommend(noLoss, txNow).advice == Gen2Link::Advice::Lower)
+            {
+                return "No hint to lower the power: " + String(m.lost) + (m.lost == 1 ? " UP was" : " UPs were") +
+                       " lost in the window.";
+            }
+        }
+        if (m.upValid() && m.upSnrSamples == 0)
+        {
+            return "No hint until an UP at this power arrives.";
+        }
+        return "";
+    }
+}
+
 String HTMLGenerator::generateGen2DetailPage(const Gen2Sensor &g, const String &message)
 {
     String html;
@@ -1194,6 +1250,9 @@ String HTMLGenerator::generateGen2DetailPage(const Gen2Sensor &g, const String &
     char id[9];
     snprintf(id, sizeof(id), "%08lX", (unsigned long)g.devId);
     const unsigned long now = millis();
+    const int8_t txNow = g.effectiveTxPower(); // configured, or what the status report says the sensor uses
+    const Gen2Link::Margins link = Gen2Link::margins(g.link, gen2LinkNowS(), txNow);
+    const String recommendation = txPowerAdvice(link, txNow);
     addHtmlHeader(html, "Generation 2 Sensor");
     html += "<div class='card'><h2>" + htmlEscape(g.name) + " <small><code>" + String(id) + "</code></small></h2>";
     if (message.length() > 0)
@@ -1216,6 +1275,40 @@ String HTMLGenerator::generateGen2DetailPage(const Gen2Sensor &g, const String &
         html += "<tr><td>Signal at the gateway</td><td>" + String(g.rssi) + " dBm, SNR " + String(g.snr, 1) +
                 " dB, " + String(g.freqError / 1000.0f, 1) + " kHz</td></tr>";
     }
+    html += "<tr><td>Link margin</td><td>uplink ";
+    html += link.upValid() ? String(link.upMargin()) + " dB <small>(" + linkSummary(link) + "; " +
+                                 String(link.upSamples) + " UPs)</small>"
+                           : String("&ndash; <small>(" + String(link.upSamples) + " of " +
+                                    String(Gen2Link::MIN_UP_SAMPLES) + " UPs needed)</small>");
+    html += ", downlink ";
+    html += link.downValid()
+                ? String(link.downMargin()) + " dB <small>(worst " + String(link.worstDown) + " dBm" +
+                      (link.downSnrSamples > 0 ? ", SNR &ge; " + String(link.worstDownSnr > 0 ? "+" : "") +
+                                                   String(link.worstDownSnr) + " dB"
+                                             : String("")) +
+                      ")</small>"
+                : String("&ndash; <small>(" + String(link.downSamples) + " of " +
+                         String(Gen2Link::MIN_DOWN_SAMPLES) + " reports needed)</small>");
+    html += link.lost > 0 ? "<br><span style='color:#e67e22;'>" + String(link.lost) +
+                                (link.lost == 1 ? " UP" : " UPs") + " lost in the window</span>"
+                          : String("<br><small>no UPs lost in the window</small>");
+    html += "<br><small>over the SF9 limits (" + String(Gen2Link::SENSITIVITY_DBM) + " dBm, SNR " +
+            String(Gen2Link::SNR_LIMIT_DB) + " dB), last 7 days / 20 UPs</small>";
+    if (!recommendation.isEmpty())
+    {
+        html += "<br><small>" + recommendation + "</small>";
+    }
+    html += "</td></tr>";
+    html += "<tr><td>TX power (configured)</td><td>" + String(g.config.txPowerDbm) + " dBm";
+    if (txNow != g.config.txPowerDbm)
+    {
+        html += " <small>(the sensor reports " + String(txNow) + " dBm)</small>";
+    }
+    if (txNow > Gen2Config::EU_TX_POWER_DBM)
+    {
+        html += "<br><span style='color:#c0392b;'>" + txPowerWarning() + "</span>";
+    }
+    html += "</td></tr>";
     html += "<tr><td>Session</td><td>" +
             String(g.sessionUp ? "up, last FCnt " + String(g.lastFcnt) : String("none (the sensor joins or is answered with REJOIN)")) +
             "</td></tr>";
@@ -1262,9 +1355,19 @@ String HTMLGenerator::generateGen2DetailPage(const Gen2Sensor &g, const String &
     html += "<input type='number' id='slot' name='slot' min='0' max='" + String(Gen2Config::MAX_INTERVAL_S - 1) +
             "' value='" + String(c.slotS) + "'>";
     html += "<label for='txPower'>Sensor TX power (dBm, " + String(Gen2Config::MIN_TX_POWER_DBM) + " to " +
-            String(Gen2Config::MAX_TX_POWER_DBM) + "):</label>";
+            String(Gen2Config::MAX_TX_POWER_DBM) + ", default " + String(Gen2Config::DEFAULT_TX_POWER_DBM) +
+            "):</label>";
     html += "<input type='number' id='txPower' name='txPower' min='" + String(Gen2Config::MIN_TX_POWER_DBM) +
-            "' max='" + String(Gen2Config::MAX_TX_POWER_DBM) + "' value='" + String(c.txPowerDbm) + "'>";
+            "' max='" + String(Gen2Config::MAX_TX_POWER_DBM) + "' value='" + String(c.txPowerDbm) +
+            "' oninput=\"document.getElementById('txWarn').style.display=this.value>" +
+            String(Gen2Config::EU_TX_POWER_DBM) + "?'block':'none'\">";
+    html += "<p id='txWarn' style='color:#c0392b;display:" +
+            String(c.txPowerDbm > Gen2Config::EU_TX_POWER_DBM ? "block" : "none") + ";'>" + txPowerWarning() +
+            "</p>";
+    if (!recommendation.isEmpty())
+    {
+        html += "<small>" + recommendation + "</small>";
+    }
     html += "<small>After a power change the sensor asks for an ACK on the next 2 uplinks and goes back to the "
             "previous power if none arrives.</small>";
     html += "<label for='ackEvery'>Request an ACK every N-th uplink (0 = never):</label>";

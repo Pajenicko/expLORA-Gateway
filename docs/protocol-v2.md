@@ -22,7 +22,7 @@ AES-CMAC (NIST SP 800-38B), "CTR" is AES-CTR with a 128-bit big-endian counter
 | Header / CRC | explicit, CRC on | explicit, CRC on |
 | IQ | normal | normal (LoRaWAN downlinks use inverted IQ and sync 0x34) |
 | Duty cycle | 0.1 % assumed (carrier reaches into 863–868 MHz), §9 | 10 % (869.4–869.65 MHz), §9 |
-| Max power | 14 dBm ERP (firmware clamps by antenna gain) | Pro (SX1262) ≤ 22 dBm, Lite (RFM95W PA_BOOST) ≤ 17 dBm with OCP 140 mA; band limit 27 dBm ERP |
+| Max power | default 14 dBm (EU limit 14 dBm ERP, ETSI EN 300 220); configurable −9…22 dBm (STM32WLE5 high-power PA, OCP 140 mA) – above 14 dBm the operator is responsible for the legal limit of the country | Pro (SX1262) ≤ 22 dBm, Lite (RFM95W PA_BOOST) ≤ 17 dBm with OCP 140 mA; band limit 27 dBm ERP |
 
 Generation 1 sensors use the same uplink channel; the gateway receives both
 generations with one radio (§6).
@@ -235,7 +235,7 @@ duty-cycle gap) until a DOWN arrives. The gateway keeps the request queued
 
 | Code | Name | Value |
 |---|---|---|
-| 0x01 | TX power | i8 dBm; the sensor clamps to its band limit |
+| 0x01 | TX power | i8 dBm; the sensor clamps to its hardware range (−9…22 dBm), default 14 dBm; legal limits are the operator's responsibility (§1) |
 | 0x02 | status request | u8 0 (the sensor answers with a status report, §4.1) |
 | 0x03 | reboot | u8 0xB0 |
 | 0x41 | ACK policy | u8 N: request an ACK every N-th UP (0 never) ‖ u8: high nibble retries for confirmed events, low nibble backoff base in s |
@@ -281,14 +281,98 @@ the old radio parameters and old version, and the gateway resends.
   §12a); a DOWN with only the time or commands leaves the version alone.
 - Gateway limits (web form, clamped again on load): interval 60–43200 s
   (below 300 s the sensor stretches it to its duty-cycle limit), slot offset
-  < interval, TX power −9…14 dBm (regulatory clamp, 14 dBm ERP on 868.0 MHz;
-  the sensor clamps again), ACK every 0–255, retries 0–15, backoff 1–15 s.
+  < interval, TX power −9…22 dBm (hardware range, default 14; above
+  14 dBm the form and the sensor page show a red warning: the EU limit of
+  14 dBm ERP on 868.0 MHz is exceeded, the legal maximum depends on the
+  country, the operator is responsible; the sensor clamps again), ACK every
+  0–255, retries 0–15, backoff 1–15 s.
   The gateway does not send the uplink frequency in phase A (it listens on
   one channel); the sensor accepts 863.0–868.6 MHz and applies the
   safeguard.
 - Slot: when the sensor has the time, it sends at unix times t with
   t mod interval = slot offset (never sooner than its duty-cycle gap);
   without the time it simply sleeps one interval.
+
+### 4.3 TX power recommendation (gateway UI)
+
+A hint on the sensor page and next to the TX power field – the gateway never
+changes the power by itself (`src/Protocol/Gen2Link.h`, native tests).
+
+- History (RAM only, per sensor): the last 20 UPs with RSSI and SNR at the
+  gateway, the downlink RSSI / SNR the sensor reported in that UP (TLV 0x01,
+  0x02), the sensor's TX power and the UPs lost before it. Only UPs sent while
+  the sensor runs the desired configuration are recorded (otherwise its power
+  is unknown); their losses carry over to the next recorded sample.
+  Timestamps are seconds of the 64-bit `esp_timer` (no wrap). The evaluation
+  uses the samples of the last **7 days**, so the worst value comes from the
+  last 20 UPs or the last 7 days, whichever holds fewer; a sensor silent for
+  more than 7 days starts a fresh history (with intervals up to 12 h a 24 h
+  window would never collect 5 samples).
+- TX power of a sample: the configured one – unless the last status report
+  sent under the current configuration reports another power (byte 15; e.g.
+  an older sensor firmware that clamps to 14 dBm); then the reported one,
+  and the page shows "the sensor reports N dBm". Every configuration change
+  and every accepted JOIN forgets the reported power; a change of the
+  configured power also requests a status report with the next DOWN.
+- Losses: every transmission has a new FCnt (§3.2), so lost UPs = FCnt32 −
+  previous FCnt32 − 1 within a session (a received retransmission is not a
+  loss, the lost first attempt is); the first UP of a new session counts the
+  FCnts before it. The page shows the losses in the window.
+- Margin = the smaller of the RSSI margin (worst RSSI − (−129 dBm)) and the
+  SNR margin (worst SNR − (−12 dB)), whole dB. −129 dBm and −12.5 dB are the
+  nominal LoRa SF9 / 125 kHz sensitivity and demodulation limit of the
+  Semtech SX1276 datasheet (the SX1262 / STM32WL receivers are specified
+  about the same; one value for both directions; −12 keeps whole dB, 0.5 dB
+  conservative). The SNR margin catches a high noise floor that the fixed
+  sensitivity ignores. The reported SNR is a **lower bound** of the true SNR
+  up to the ±1 dB noise of the reading (covered by the fade margin): the
+  reading saturates at about +10 dB on a strong signal (bench: +10…+12 dB
+  from −41 to −69 dBm). Normalised to the current power with the shift d =
+  power now − power of the sample: for d ≥ 0 every sample counts with SNR + d
+  (still a bound, no cap); for d < 0 only a reading below saturation (SNR <
+  +10 dB) counts for the margin, a saturated one is skipped (its true value
+  at the lower power is unknown). The downlink SNR counts as reported (the
+  gateway's power does not change). Consequences: while the reading
+  saturates, a Lower hint steps at most (worst SNR + 12 − 15) dB at a time
+  (≈ 7–9 dB) and the samples at the new power decide the next step; no Lower
+  is given while no sample gives an SNR bound at the current power (after
+  following a hint when all remaining samples are saturated readings from
+  the higher power – the page then says "no hint until an UP at this power
+  arrives"); a reading below saturation limits the step at any power. A
+  skipped reading still proves "true SNR ≥ reading at its own power": the
+  Lower step is also limited so that the worst SNR + d over **all** samples
+  (skipped ones included) stays ≥ +3 dB at the new power, so an old deep
+  fade is never pushed below the demodulation limit; this costs about one
+  Lower step per window turnover (14 → 6 → −2 → −9 dBm after 5, 25 and 45
+  UPs on the bench-like link). Raise and the shown margin use the counted
+  samples only. The uplink margin uses the gateway's RSSI / SNR, the
+  downlink margin the sensor's reports (RSSI, and the SNR when reported);
+  both are shown, the SNR as "SNR ≥ N dB".
+- Normalisation: uplink samples count at the current power (RSSI − power then
+  + power now; the SNR as above). On the bench 14 → 22 dBm raised the
+  RSSI by 6–7 dB instead of 8 and 14 → −9 dBm lowered it by 20–21 dB instead
+  of 23: samples taken at 22 dBm and normalised down come out 1–2 dB
+  pessimistic, samples taken at −9…14 dBm and normalised up to 20–22 dBm 1–2
+  dB optimistic – the fade margin covers both.
+- Recommendation from the uplink margin M at power P (fade margin 15 dB):
+  - fewer than 5 samples in the window → none (the downlink margin needs 3
+    reports);
+  - M − 15 ≥ 3 → **lower** to max(−9, P − (M − 15)) – and not below the
+    bound of every sample (above) – if that is at least 3 dB lower (e.g.
+    −60 dBm with the SNR reading saturated at +11 dB at 14 dBm: M = min(69,
+    23) = 23 dB → 6 dBm, "saves battery"; the samples at 6 dBm decide the
+    next step); no Lower while any UP was lost in the window or no SNR bound
+    exists at the current power;
+  - M < 10 → **raise** to min(22, P + (15 − M)) (e.g. M = 8 dB at 14 dBm →
+    21 dBm; above 14 dBm the hint points to the EU limit); at 22 dBm already:
+    improve the antenna or its placement;
+  - otherwise none.
+- RAM: 204 B history + 12 B of related fields per sensor (≈ 2.2 kB for 10
+  sensors on the Pro, heap).
+- Known limit: 22 dBm draws ~120 mA peaks from 2 × AA without a regulator; at
+  a low battery a brown-out resets the sensor, which comes back at the
+  persisted 22 dBm (no automatic fallback yet – possible later improvement;
+  the reset cause in the status report shows it).
 
 ## 5. Procedures
 

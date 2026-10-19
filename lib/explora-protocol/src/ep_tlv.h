@@ -82,7 +82,7 @@ constexpr uint8_t kStatus = tlvType(LenClass::Var, 0x02);        // answer to do
 // Downlink TLV types (gateway -> sensor), in DOWN and JOIN_ACC ACCEPT
 namespace down
 {
-constexpr uint8_t kTxPower = tlvType(LenClass::One, 0x01);       // i8 dBm (sensor clamps per band)
+constexpr uint8_t kTxPower = tlvType(LenClass::One, 0x01);       // i8 dBm (sensor clamps to -9...22 dBm)
 constexpr uint8_t kStatusRequest = tlvType(LenClass::One, 0x02); // u8 what (reserved)
 constexpr uint8_t kReboot = tlvType(LenClass::One, 0x03);        // u8 0xB0 = reboot
 constexpr uint8_t kAckPolicy = tlvType(LenClass::Two, 0x01);     // u8 ACK every N-th UP (0 never) | u4 retries | u4 backoff s

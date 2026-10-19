@@ -29,8 +29,10 @@ namespace Gen2Config
 constexpr uint16_t MIN_INTERVAL_S = 60;
 constexpr uint16_t MAX_INTERVAL_S = 43200;          // 12 h
 constexpr uint16_t DUTY_SAFE_INTERVAL_S = 300;     // below: the sensor stretches to its 0.1 % limit
-constexpr int8_t MIN_TX_POWER_DBM = -9;
-constexpr int8_t MAX_TX_POWER_DBM = 14;            // 14 dBm ERP on 868.0 MHz (spec 1)
+constexpr int8_t MIN_TX_POWER_DBM = -9;            // sensor hardware range (STM32WLE5 high-power PA)
+constexpr int8_t MAX_TX_POWER_DBM = 22;
+constexpr int8_t DEFAULT_TX_POWER_DBM = 14;
+constexpr int8_t EU_TX_POWER_DBM = 14;             // EU limit on 868.0 MHz: 14 dBm ERP (spec 1); above: warning
 constexpr uint8_t MAX_RETRIES = 15;
 constexpr uint8_t MIN_BACKOFF_S = 1;
 constexpr uint8_t MAX_BACKOFF_S = 15;
@@ -41,7 +43,7 @@ struct Values
 {
     uint16_t intervalS = 600;
     uint16_t slotS = 0;
-    int8_t txPowerDbm = 14;
+    int8_t txPowerDbm = DEFAULT_TX_POWER_DBM;
     uint8_t ackEvery = 6;
     uint8_t ackRetries = 3;
     uint8_t ackBackoffS = 5;
@@ -54,7 +56,7 @@ struct Values
     bool operator!=(const Values &o) const { return !(*this == o); }
 };
 
-// Bring values into the allowed ranges (regulatory clamp for the power);
+// Bring values into the allowed ranges (hardware range for the power);
 // true when nothing had to change
 inline bool clamp(Values &v)
 {

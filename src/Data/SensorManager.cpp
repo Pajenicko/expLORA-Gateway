@@ -1505,6 +1505,11 @@ bool SensorManager::handleGen2Frame(const RadioPacket &packet, const ep::FrameIn
         g.acceptSent = true;
         g.lastAcceptMs = nowMs;
         g.joinAccepts++;
+        if (g.reportedTx != INT8_MAX)
+        {
+            g.reportedTx = INT8_MAX; // a new session: a fresh status report tells the power again
+            g.statusRequested = true;
+        }
         if (logDue(g.logged, g.lastLogMs, nowMs))
         {
             logger.info("Generation 2 JOIN_REQ from " + g.name + " (" + String(id) + ") accepted, devNonce " +
@@ -1562,10 +1567,22 @@ bool SensorManager::handleGen2Frame(const RadioPacket &packet, const ep::FrameIn
         g.snr = packet.snr;
         g.freqError = packet.freqError;
         g.upFrames++;
+        g.linkLostPending +=
+            Gen2Link::lostBetween(use != SessionUse::Promoted && g.upFrames > 1, g.lastFcnt, fcnt32);
         g.lastFcnt = fcnt32;
         g.configVersion = info.fctrl & ep::kFctrlCfgMask; // version the sensor runs
         const uint8_t bootStateBefore = g.bootState;
+        g.upDownlinkRssi = Gen2Link::NONE;
+        g.upDownlinkSnr = Gen2Link::NONE;
         const bool confirmed = Gen2Response::decodeUp(g, payload, payloadLen, nowMs);
+        // Link history (spec 4.3): only while the sensor runs the desired
+        // configuration, so the TX power of the sample is known
+        if (Gen2Config::inSync(g.configVersion, g.cfgVersion))
+        {
+            g.link.add(gen2LinkNowS(), packet.rssi, (int)floorf(packet.snr), g.upDownlinkRssi, g.upDownlinkSnr,
+                       g.effectiveTxPower(), g.linkLostPending);
+            g.linkLostPending = 0;
+        }
         if (g.bootState != bootStateBefore)
         {
             scheduleGen2SaveLocked(nowMs);
@@ -1627,6 +1644,14 @@ int SensorManager::setGen2Config(uint32_t devId, const Gen2Config::Values &value
     Gen2Config::Values old = g.config;
     g.config = v;
     g.cfgVersion = Gen2Config::nextVersion(g.cfgVersion, g.configVersion);
+    // The reported power belongs to the old configuration (spec 4.3); after a
+    // power change, or when a reported power is forgotten, the next UP brings
+    // a fresh status report
+    if (v.txPowerDbm != old.txPowerDbm || g.reportedTx != INT8_MAX)
+    {
+        g.statusRequested = true;
+    }
+    g.reportedTx = INT8_MAX;
     logger.info("Generation 2 sensor " + g.name + ": configuration v" + String(g.cfgVersion) + " (interval " +
                 String(v.intervalS) + " s, TX " + String(v.txPowerDbm) + " dBm) - sent with the next uplink");
     if (saveAndUnlock(lock))
@@ -1643,6 +1668,11 @@ int SensorManager::setGen2Config(uint32_t devId, const Gen2Config::Values &value
     {
         gen2[i].config = old;
         gen2[i].cfgVersion = Gen2Config::nextVersion(gen2[i].cfgVersion, gen2[i].configVersion);
+        if (gen2[i].reportedTx != INT8_MAX)
+        {
+            gen2[i].statusRequested = true;
+            gen2[i].reportedTx = INT8_MAX;
+        }
     }
     return -2;
 }

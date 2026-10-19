@@ -20,13 +20,21 @@
 #pragma once
 
 #include <Arduino.h>
+#include <esp_timer.h>
 #include "ExploraProtocol.h"
 #include "../Protocol/Gen2Config.h"
+#include "../Protocol/Gen2Link.h"
 #include "../Protocol/Gen2Session.h"
 
 #ifndef MAX_GEN2_SENSORS
 #define MAX_GEN2_SENSORS 10 // RAM budget of the Pro (no PSRAM); separate from MAX_SENSORS
 #endif
+
+// Clock of the link history (spec 4.3): seconds of the 64-bit esp_timer, no 49-day wrap
+inline uint32_t gen2LinkNowS()
+{
+    return (uint32_t)(esp_timer_get_time() / 1000000LL);
+}
 
 struct Gen2Sensor
 {
@@ -86,6 +94,15 @@ struct Gen2Sensor
     uint16_t humidity = 0xFFFF;      // 0.01 %RH
     uint16_t batteryMv = 0xFFFF;
     int8_t downlinkRssi = INT8_MIN;  // dBm of the last downlink the sensor received
+    // Link history (spec 4.3): last 20 UPs - RSSI/SNR, reported downlink RSSI/SNR, TX power, losses
+    Gen2Link::History link;
+    int8_t upDownlinkRssi = Gen2Link::NONE; // downlink RSSI / SNR (whole dB) carried by the last UP
+    int8_t upDownlinkSnr = Gen2Link::NONE;
+    uint32_t linkLostPending = 0;           // UPs lost since the last sample (unsampled UPs carry it on)
+    // TX power from the last status report sent while the sensor ran config
+    // reportedTxVersion (an older firmware clamps to 14 dBm); INT8_MAX unknown
+    int8_t reportedTx = INT8_MAX;
+    uint8_t reportedTxVersion = 0;
     int8_t downlinkSnr = INT8_MIN;   // 0.25 dB
     uint8_t lastUp[48] = {};         // TLVs of the last UP (all channels, shown on the detail page)
     uint8_t lastUpLen = 0;
@@ -97,6 +114,13 @@ struct Gen2Sensor
     unsigned long lastLogMs = 0;   // per-DevID log rate limit (one line per kind per 10 min)
     unsigned long lastWarnMs = 0;
     bool logged = false, warned = false;
+
+    // TX power the sensor uses: the configured one, unless a status report
+    // sent under the current configuration says otherwise (old firmware clamping)
+    int8_t effectiveTxPower() const
+    {
+        return reportedTx != INT8_MAX && reportedTxVersion == cfgVersion ? reportedTx : config.txPowerDbm;
+    }
 
     void wipeKeys()
     {

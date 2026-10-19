@@ -135,12 +135,17 @@ static void test_config_version_and_clamp(void)
     TEST_ASSERT_FALSE(Gen2Config::inSync(0, 3));
     Gen2Config::Values v;
     TEST_ASSERT_TRUE(Gen2Config::clamp(v)); // defaults are valid
-    v.txPowerDbm = 22;                      // regulatory clamp
+    v.txPowerDbm = 22;                      // hardware maximum: kept
+    TEST_ASSERT_TRUE(Gen2Config::clamp(v));
+    v.txPowerDbm = 23;                      // above the hardware range
     v.intervalS = 10;
     v.slotS = 100;
     v.ackBackoffS = 0;
     TEST_ASSERT_FALSE(Gen2Config::clamp(v));
-    TEST_ASSERT_EQUAL_INT8(14, v.txPowerDbm);
+    TEST_ASSERT_EQUAL_INT8(22, v.txPowerDbm);
+    v.txPowerDbm = -10;
+    Gen2Config::clamp(v);
+    TEST_ASSERT_EQUAL_INT8(-9, v.txPowerDbm);
     TEST_ASSERT_EQUAL_UINT16(60, v.intervalS);
     TEST_ASSERT_EQUAL_UINT16(40, v.slotS);
     TEST_ASSERT_EQUAL_UINT8(1, v.ackBackoffS);
