@@ -104,7 +104,7 @@ class Config:
     # [wifi]
     home_ssid: str = ""
     home_password: str = ""
-    timezone: str = "CET-1CEST,M3.5.0,M10.5.0/3"
+    timezone: str = "Europe/Prague"
     # [test_sensor]
     sensor_sn: str = ""
     sensor_key: str = ""

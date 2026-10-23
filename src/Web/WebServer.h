@@ -65,7 +65,6 @@ private:
     String &wifiSSID;
     String &wifiPassword;
     bool &configMode;
-    String &timezone;
 
 
     // Firmware upload state
@@ -90,6 +89,8 @@ private:
     // Deferred restart: handlers set these and handleClient() executes the reboot
     // once the response has had time to flush. Avoids ESP.restart() inside async handlers.
     volatile bool restartRequested = false; // set by handlers (async task), read by the loop
+    // Time zone saved by /timezone, switched (setenv/tzset) by handleClient()
+    volatile bool timezoneApplyRequested = false;
 
     // Firmware download requested by /firmware/update, done by the loop task
     String pendingOtaUrl;
@@ -137,6 +138,7 @@ private:
     void handleRoot(AsyncWebServerRequest *request);
     void handleConfig(AsyncWebServerRequest *request);
     void handleConfigPost(AsyncWebServerRequest *request);
+    void handleTimezonePost(AsyncWebServerRequest *request);
     void handleSensors(AsyncWebServerRequest *request);
     void handleSensorAdd(AsyncWebServerRequest *request);
     void handleSensorAddPost(AsyncWebServerRequest *request);
@@ -191,7 +193,7 @@ private:
 public:
     // Constructor
     WebPortal(SensorManager &sensors, Logger &log, String &ssid, String &password,
-              bool &configMode, ConfigManager &config, String &timezone);
+              bool &configMode, ConfigManager &config);
     // Destructor
     ~WebPortal();
 

@@ -26,7 +26,7 @@
 #include <esp_mac.h>
 
 // Firmware version
-#define FIRMWARE_VERSION "1.1.13"
+#define FIRMWARE_VERSION "2.0.0"
 
 // OTA Configuration: FIRMWARE_UPDATE_URL is per board (board_config.h)
 #include "board_config.h"
@@ -96,15 +96,7 @@ inline String makeApName()
 #define NTP_SERVER_2 "time.cloudflare.com"
 #define NTP_SERVER_3 "time.google.com"
 #define TIME_STALE_AFTER_S (24 * 3600) // no successful sync for this long = stale
-// Timezones offered in the WiFi form (POSIX TZ, label)
-#define TIMEZONE_OPTIONS                                                  \
-    {                                                                     \
-        {"GMT0", "GMT/UTC (00:00)"},                                      \
-        {"WET0WEST,M3.5.0/1,M10.5.0", "Western European (WET/WEST)"},     \
-        {"CET-1CEST,M3.5.0,M10.5.0/3", "Central European (CET/CEST)"},    \
-        {"EET-2EEST,M3.5.0/3,M10.5.0/4", "Eastern European (EET/EEST)"},  \
-        {"MSK-3", "Moscow Time (MSK)"},                                   \
-    }
+// Time zone: the list of names is in Data/TimeZones.h (default Europe/Prague)
 #define DEFAULT_TIMEZONE "CET-1CEST,M3.5.0,M10.5.0/3" // Central European Time with auto DST
 
 // MQTT Configuration

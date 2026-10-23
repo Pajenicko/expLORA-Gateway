@@ -746,6 +746,40 @@ void SensorManager::process(unsigned long now)
     }
 }
 
+static bool sameLocalDay(time_t a, time_t b)
+{
+    struct tm ta, tb;
+    localtime_r(&a, &ta);
+    localtime_r(&b, &tb);
+    return ta.tm_mday == tb.tm_mday && ta.tm_mon == tb.tm_mon && ta.tm_year == tb.tm_year;
+}
+
+void SensorManager::applyTimezone(const String &posix)
+{
+    std::lock_guard<std::mutex> lock(sensorMutex);
+    bool timeValid = Logger::isTimeInitialized();
+    time_t now = time(nullptr);
+    bool startedToday[MAX_SENSORS] = {false};
+    for (size_t i = 0; timeValid && i < sensorCount; i++)
+    {
+        startedToday[i] = sameLocalDay((time_t)sensors[i].lastRainReset, now);
+    }
+    setenv("TZ", posix.c_str(), 1);
+    tzset();
+    for (size_t i = 0; timeValid && i < sensorCount; i++)
+    {
+        // updateSensorData() compares the last reset by its local date, now
+        // in the new zone: keep the old zone's answer
+        if (!sensors[i].configured || !sensors[i].hasRainAmount() || sensors[i].lastRainReset == 0 ||
+            startedToday[i] == sameLocalDay((time_t)sensors[i].lastRainReset, now))
+        {
+            continue;
+        }
+        sensors[i].lastRainReset = startedToday[i] ? (unsigned long)now : 0; // 0 = reset by the next packet
+        rainDirty = true;
+    }
+}
+
 // JSON members per stored sensor (see saveSensorsLocked)
 static constexpr size_t SENSOR_JSON_FIELDS = 20;
 

@@ -111,7 +111,10 @@ log buffer size) and `variants/<env>/platformio.ini`.
 - Packet type must match the configured sensor type; health statistics fixed
   for long silences (unsigned/latched).
 - NTP: three servers + DHCP, no blocking waits, last sync shown, stale after
-  24 h.
+  24 h. Time zone (2.0.0): named zones of `src/Data/TimeZones.h` mapped to
+  POSIX TZ strings (tzdata 2026c, checked against the host's zoneinfo by the
+  native tests), stored by name, applied without a restart; old settings
+  migrate to the matching entry or stay custom.
 
 ### Robustness
 - Blocking network calls (MQTT connect/publish, HTTP forwarding, TLS) run with

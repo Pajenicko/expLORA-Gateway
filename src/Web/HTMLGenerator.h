@@ -80,8 +80,11 @@ public:
     static String generateHomePage(const std::vector<SensorData> &sensors);
 
     // Generate configuration page
-    static void addWiFiForm(String &html, const String &ssid, const String &password, const String &timezone);
-    static String generateConfigPage(const String &ssid, const String &password, bool configMode, const String &ip, const String &timezone);
+    // timeZone: also the time zone select (AP setup page), nullptr = without
+    static void addWiFiForm(String &html, const String &ssid, const String &password, const ConfigManager *timeZone);
+    static void addTimezoneSelect(String &html, const ConfigManager &config);
+    static String generateConfigPage(const String &ssid, const String &password, bool configMode, const String &ip,
+                                     const ConfigManager &config);
 
     // Generate MQTT settings page
     static String generateMqttPage(const String &host, int port, const String &user, const String &password, bool enabled, bool tls,
@@ -93,7 +96,7 @@ public:
 
     // Generating network page (uplink status, WiFi, ethernet and LTE settings)
     static String generateNetworkPage(const ConfigManager &config, const String &ssid, const String &password,
-                                      const String &timezone, bool apMode);
+                                      bool apMode);
 
     // Generate sensor list page
     static String generateSensorsPage(const std::vector<ActiveSensorEntry>& sensors,

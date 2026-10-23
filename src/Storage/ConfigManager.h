@@ -57,6 +57,10 @@ private:
     bool loadFromPreferences();
     bool saveToPreferences();
 
+    // Stored name / POSIX string -> a zone of the list, or a custom string;
+    // true = changed (to be saved)
+    bool resolveTimezone();
+
 public:
     // Device configuration
     String wifiSSID;               // WiFi network SSID
@@ -65,6 +69,8 @@ public:
     unsigned long lastWifiAttempt; // Time of last WiFi connection attempt
     LogLevel logLevel;             // Logging level
     String timezone;               // Timezone in Posix format
+    String timezoneName;           // Its name in Data/TimeZones.h, empty = custom POSIX string
+    String timezoneNamePosix;      // POSIX string written together with the name (an older firmware rewrites only timezone)
 
     // MQTT Configuration
     String mqttHost;     // MQTT broker hostname
@@ -127,6 +133,14 @@ public:
 
     // Set WiFi configuration
     bool setWiFiConfig(const String &ssid, const String &password, bool saveConfig = true);
+
+    // Set the time zone by its index in Data/TimeZones.h; false = not saved
+    // (the previous zone is kept)
+    bool setTimezone(int zoneIndex);
+
+    // Sets timezoneName, timezone and timezoneNamePosix in memory for the
+    // index in Data/TimeZones.h, -1 = custom (keeps timezone); no saving
+    void setTimezoneFields(int zoneIndex);
 
     // Switch to configuration mode (AP)
     void enableConfigMode(bool enable = true, bool saveConfig = true);

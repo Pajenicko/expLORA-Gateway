@@ -25,6 +25,7 @@
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 #include "../Hardware/FlashPermit.h"
+#include "../Data/TimeZones.h"
 
 // Constructor
 ConfigManager::ConfigManager(Logger &log, const char *file)
@@ -72,6 +73,11 @@ bool ConfigManager::load()
     std::lock_guard<std::recursive_mutex> guard(configMutex);
     bool fsSuccess = loadFromFS();
     bool prefSuccess = loadFromPreferences();
+    if (resolveTimezone() && (fsSuccess || prefSuccess))
+    {
+        logger.info("Time zone setting updated to " + (timezoneName.length() ? timezoneName : String("custom")) + ", saving");
+        save();
+    }
 
     if (fsSuccess)
     {
@@ -158,6 +164,8 @@ bool ConfigManager::loadFromFS()
     wifiPassword = doc["password"].as<String>();
     configMode = doc["configMode"] | true;
     timezone = doc["timezone"] | DEFAULT_TIMEZONE;
+    timezoneName = doc["tzName"] | "";
+    timezoneNamePosix = doc["tzNamePosix"] | "";
 
     // MQTT configuration
     mqttHost = doc["mqttHost"] | MQTT_DEFAULT_HOST;
@@ -194,6 +202,8 @@ bool ConfigManager::saveToFS()
     doc["configMode"] = configMode;
     doc["logLevel"] = logger.levelToString(logLevel);
     doc["timezone"] = timezone;
+    doc["tzName"] = timezoneName;
+    doc["tzNamePosix"] = timezoneNamePosix;
     doc["mqttHost"] = mqttHost;
     doc["mqttPort"] = mqttPort;
     doc["mqttUser"] = mqttUser;
@@ -256,6 +266,14 @@ bool ConfigManager::loadFromPreferences()
     if (preferences.isKey("timezone"))
     {
         timezone = preferences.getString("timezone", DEFAULT_TIMEZONE);
+    }
+    if (preferences.isKey("tzName"))
+    {
+        timezoneName = preferences.getString("tzName", "");
+    }
+    if (preferences.isKey("tzNamePosix"))
+    {
+        timezoneNamePosix = preferences.getString("tzNamePosix", "");
     }
 
     // MQTT configuration from preferences
@@ -336,6 +354,8 @@ bool ConfigManager::saveToPreferences()
     String logLevelStr = logger.levelToString(logLevel);
     preferences.putString("logLevel", logLevelStr);
     preferences.putString("timezone", timezone);
+    preferences.putString("tzName", timezoneName);
+    preferences.putString("tzNamePosix", timezoneNamePosix);
 
     // Save MQTT configuration
     preferences.putString("mqttHost", mqttHost);
@@ -629,6 +649,8 @@ void ConfigManager::resetToDefaults()
     lastWifiAttempt = 0;
     logLevel = LogLevel::INFO;
     timezone = DEFAULT_TIMEZONE;
+    timezoneName = TimeZones::DEFAULT_NAME;
+    timezoneNamePosix = DEFAULT_TIMEZONE;
     mqttHost = MQTT_DEFAULT_HOST;
     mqttPort = MQTT_DEFAULT_PORT;
     mqttUser = MQTT_DEFAULT_USER;
@@ -703,6 +725,61 @@ bool ConfigManager::setWiFiConfig(const String &ssid, const String &password, bo
         return save();
     }
 
+    return true;
+}
+
+// Settings from before the time zone list hold only a POSIX string: it maps
+// to the closest entry or stays custom. A known name takes the table's
+// string, so corrected rules reach stored settings, unless an older firmware
+// changed the string after the name (see TimeZones::resolve). true = the
+// setting changed and should be saved.
+bool ConfigManager::resolveTimezone()
+{
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
+    String oldName = timezoneName, oldPosix = timezone, oldNamePosix = timezoneNamePosix;
+    int index = TimeZones::resolve(timezoneName.c_str(), timezone.c_str(), timezoneNamePosix.c_str());
+    setTimezoneFields(index);
+    return timezoneName != oldName || timezone != oldPosix || timezoneNamePosix != oldNamePosix;
+}
+
+// Name, POSIX string and the string written with the name always together;
+// -1 = keep the POSIX string as a custom zone
+void ConfigManager::setTimezoneFields(int zoneIndex)
+{
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
+    if (zoneIndex >= 0)
+    {
+        timezoneName = TimeZones::ZONES[zoneIndex].name;
+        timezone = TimeZones::ZONES[zoneIndex].posix;
+        timezoneNamePosix = timezone;
+    }
+    else
+    {
+        timezoneName = "";
+        timezoneNamePosix = "";
+    }
+}
+
+bool ConfigManager::setTimezone(int zoneIndex)
+{
+    if (zoneIndex < 0 || zoneIndex >= (int)TimeZones::COUNT)
+    {
+        return false;
+    }
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
+    String oldName = timezoneName, oldPosix = timezone, oldNamePosix = timezoneNamePosix;
+    setTimezoneFields(zoneIndex);
+    if (!save())
+    {
+        // One store may hold the new zone: write the old one to both, so
+        // they agree with what the page reports (the previous zone)
+        timezoneName = oldName;
+        timezone = oldPosix;
+        timezoneNamePosix = oldNamePosix;
+        save();
+        return false;
+    }
     return true;
 }
 

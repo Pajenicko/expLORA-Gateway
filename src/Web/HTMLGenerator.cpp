@@ -28,6 +28,7 @@
 #include "../Network/Uplink.h"
 #include "../config.h"
 #include "../Hardware/RadioTask.h"
+#include "../Data/TimeZones.h"
 
 String HTMLGenerator::htmlEscape(const String &text)
 {
@@ -475,7 +476,7 @@ String HTMLGenerator::generateHomePage(const std::vector<SensorData> &sensors)
 
 // Generating configuration page
 // WiFi settings form, used by the AP setup page and the network page
-void HTMLGenerator::addWiFiForm(String &html, const String &ssid, const String &password, const String &timezone)
+void HTMLGenerator::addWiFiForm(String &html, const String &ssid, const String &password, const ConfigManager *timeZone)
 {
     html += "<div class='card'>";
     html += "<h2>WiFi Settings</h2>";
@@ -486,26 +487,67 @@ void HTMLGenerator::addWiFiForm(String &html, const String &ssid, const String &
     html += "<label for='password'>Password:</label>";
     html += "<input type='password' id='password' name='password' autocomplete='new-password' placeholder='" +
             String(password.length() > 0 ? "(unchanged)" : "(open network)") + "'>";
-    html += "<label for='timezone'>Timezone:</label>";
-    html += "<select id='timezone' name='timezone'>";
-
-    static const char *const zones[][2] = TIMEZONE_OPTIONS;
-    for (const auto &zone : zones)
+    if (timeZone)
     {
-        html += "<option value='" + String(zone[0]) + "'" + String(timezone == zone[0] ? " selected" : "") + ">" +
-                zone[1] + "</option>";
+        addTimezoneSelect(html, *timeZone);
     }
-    html += "</select>";
 
     html += "<input type='submit' value='Save and Restart'>";
     html += "</form>";
     html += "</div>";
 }
 
-String HTMLGenerator::generateConfigPage(const String &ssid, const String &password, bool configMode, const String &ip, const String &timezone)
+// Time zone select (field "timezone"): the names of Data/TimeZones.h (an
+// option's value is its text), a custom POSIX string from an old setting
+// as an extra entry with an empty value (= keep it)
+void HTMLGenerator::addTimezoneSelect(String &html, const ConfigManager &config)
+{
+    html += "<label for='timezone'>Time zone:</label>";
+    html += "<select id='timezone' name='timezone'>";
+    if (config.timezoneName.length() == 0)
+    {
+        html += "<option value='' selected>Custom: " + htmlEscape(config.timezone) + "</option>";
+    }
+    for (const TimeZones::Zone &zone : TimeZones::ZONES)
+    {
+        html += config.timezoneName == zone.name ? "<option selected>" : "<option>";
+        html += zone.name;
+        html += "</option>";
+    }
+    html += "</select>";
+}
+
+// Local time with the zone, its UTC offset and whether summer time applies
+static String localTimeText(const String &posix)
+{
+    if (!uplink->isTimeValid())
+    {
+        return "not synchronized yet";
+    }
+    struct tm now;
+    time_t t = time(nullptr);
+    localtime_r(&t, &now);
+    char text[40];
+    strftime(text, sizeof(text), "%Y-%m-%d %H:%M:%S %Z", &now);
+    char offset[8];
+    strftime(offset, sizeof(offset), "%z", &now); // "+0200"
+    String result = String(text) + " (UTC" + String(offset).substring(0, 3) + ":" + String(offset).substring(3) + ", ";
+    if (now.tm_isdst > 0)
+    {
+        result += "summer time)";
+    }
+    else
+    {
+        result += posix.indexOf(',') >= 0 ? "standard time)" : "no summer time)";
+    }
+    return result;
+}
+
+String HTMLGenerator::generateConfigPage(const String &ssid, const String &password, bool configMode, const String &ip,
+                                        const ConfigManager &config)
 {
     String html;
-    html.reserve(4096);
+    html.reserve(8192);
 
     // Add header - pass configMode to suppress navigation in AP mode
     addHtmlHeader(html, "Configuration", configMode);
@@ -531,7 +573,7 @@ String HTMLGenerator::generateConfigPage(const String &ssid, const String &passw
     }
     html += "</div>";
 
-    addWiFiForm(html, ssid, password, timezone);
+    addWiFiForm(html, ssid, password, &config);
 
     // Add footer
     addHtmlFooter(html);
@@ -622,10 +664,18 @@ String HTMLGenerator::generateMqttPage(const String &host, int port, const Strin
 }
 
 String HTMLGenerator::generateNetworkPage(const ConfigManager &config, const String &ssid, const String &password,
-                                         const String &timezone, bool apMode)
+                                         bool apMode)
 {
     String html;
-    html.reserve(6144);
+    // One allocation (String grows to the exact length on every append past
+    // it): measured from the page's literals, about 14 kB with the Ethernet,
+    // LTE and power cards (Pro), 11.4 kB without (Lite); the time zone list is
+    // 3.5 kB of it. Transient: send() copies it, so twice that while sending.
+#if defined(HAS_ETHERNET) || defined(HAS_LTE)
+    html.reserve(15360);
+#else
+    html.reserve(12288);
+#endif
 
     addHtmlHeader(html, "Network", apMode);
 
@@ -694,7 +744,16 @@ String HTMLGenerator::generateNetworkPage(const ConfigManager &config, const Str
 #endif
     html += "</div>";
 
-    addWiFiForm(html, ssid, password, timezone);
+    html += "<div class='card'>";
+    html += "<h2>Time</h2>";
+    html += "<p><strong>Local time:</strong> " + localTimeText(config.timezone) + "</p>";
+    html += "<form method='post' action='/timezone'>";
+    addTimezoneSelect(html, config);
+    html += "<p>Summer time (DST) follows the rules of the selected zone. Takes effect immediately.</p>";
+    html += "<input type='submit' value='Save'>";
+    html += "</form></div>";
+
+    addWiFiForm(html, ssid, password, nullptr);
 
 #if defined(HAS_ETHERNET)
     {

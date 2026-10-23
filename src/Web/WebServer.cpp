@@ -21,6 +21,7 @@
 
 #include "WebServer.h"
 #include "HTMLGenerator.h"
+#include "../Data/TimeZones.h"
 #include <WiFi.h>
 #include "../Network/Uplink.h"
 #include "../Hardware/PowerSource.h"
@@ -130,10 +131,10 @@ static bool firmwareImageMatches(const uint8_t *data, size_t len, String &error)
 
 // Constructor
 WebPortal::WebPortal(SensorManager &sensors, Logger &log, String &ssid, String &password,
-                     bool &config_mode, ConfigManager &config, String &tz)
+                     bool &config_mode, ConfigManager &config)
     : server(HTTP_PORT), sensorManager(sensors), logger(log), isAPMode(false),
       wifiSSID(ssid), wifiPassword(password), configMode(config_mode),
-      timezone(tz), configManager(config), auth(config, log), mqttManager(nullptr)
+      configManager(config), auth(config, log), mqttManager(nullptr)
 {
 }
 
@@ -215,6 +216,7 @@ void WebPortal::setupRoutes()
     server.on("/", HTTP_GET, std::bind(&WebPortal::handleRoot, this, std::placeholders::_1));
     server.on("/config", HTTP_GET, std::bind(&WebPortal::handleConfig, this, std::placeholders::_1));
     server.on("/config", HTTP_POST, std::bind(&WebPortal::handleConfigPost, this, std::placeholders::_1));
+    server.on("/timezone", HTTP_POST, std::bind(&WebPortal::handleTimezonePost, this, std::placeholders::_1));
 
     // Sensor management
     server.on("/sensors/add", HTTP_GET, std::bind(&WebPortal::handleSensorAdd, this, std::placeholders::_1));
@@ -450,6 +452,17 @@ void WebPortal::handleClient()
         urlOtaRunning = false;
     }
 
+    if (timezoneApplyRequested)
+    {
+        timezoneApplyRequested = false; // before reading: a newer change sets it again
+        String tz;
+        {
+            std::lock_guard<std::recursive_mutex> guard(configManager.mutex());
+            tz = configManager.timezone;
+        }
+        sensorManager.applyTimezone(tz); // setenv/tzset, keeps today's rain totals
+    }
+
     if (restartRequested && (long)(millis() - restartAt) >= 0)
     {
         logger.info("Deferred restart firing now");
@@ -581,7 +594,7 @@ void WebPortal::handleConfig(AsyncWebServerRequest *request)
     String currentIP = isAPMode ? uplink->getApIP().toString() : uplink->getLocalIP().toString();
 
     // Generate HTML (use isAPMode to drive UI state)
-    String html = HTMLGenerator::generateConfigPage(wifiSSID, wifiPassword, isAPMode, currentIP, timezone);
+    String html = HTMLGenerator::generateConfigPage(wifiSSID, wifiPassword, isAPMode, currentIP, configManager);
 
     // Send response
     request->send(200, "text/html", html);
@@ -637,28 +650,40 @@ void WebPortal::handleConfigPost(AsyncWebServerRequest *request)
         return;
     }
 
-    String newTimezone = request->hasParam("timezone", true) ? request->getParam("timezone", true)->value() : timezone;
-    static const char *const zones[][2] = TIMEZONE_OPTIONS;
-    bool knownZone = false;
-    for (const auto &zone : zones)
+    // Optional (the AP setup page has it): a zone name, or the POSIX string
+    // older clients send; applied with the restart
+    int zone = TimeZones::KEEP;
+    if (request->hasParam("timezone", true))
     {
-        knownZone = knownZone || newTimezone == zone[0];
+        zone = TimeZones::fromForm(request->getParam("timezone", true)->value().c_str(), configManager.timezone.c_str());
     }
-    if (!knownZone)
+    if (zone == -1)
     {
-        request->send(400, "text/plain", "Unknown timezone");
+        request->send(400, "text/plain", "Unknown time zone");
         return;
     }
 
     // Through ConfigManager: both stores (file and Preferences) and atomic,
     // so nothing (the timezone) is overridden by a stale copy at boot
     logger.info("New WiFi configuration - SSID: " + newSsid);
+    String oldZoneName, oldZonePosix, oldZoneNamePosix;
     {
         std::lock_guard<std::recursive_mutex> guard(configManager.mutex());
-        timezone = newTimezone;
+        oldZoneName = configManager.timezoneName;
+        oldZonePosix = configManager.timezone;
+        oldZoneNamePosix = configManager.timezoneNamePosix;
+        if (zone >= 0)
+        {
+            configManager.setTimezoneFields(zone);
+        }
     }
     if (!configManager.setWiFiConfig(newSsid, newPassword))
     {
+        // Not applied: the running gateway keeps its zone
+        std::lock_guard<std::recursive_mutex> guard(configManager.mutex());
+        configManager.timezoneName = oldZoneName;
+        configManager.timezone = oldZonePosix;
+        configManager.timezoneNamePosix = oldZoneNamePosix;
         request->send(500, "text/plain", "Failed to save configuration");
         return;
     }
@@ -678,6 +703,34 @@ void WebPortal::handleConfigPost(AsyncWebServerRequest *request)
     // once restartAt has been reached.
     restartAt = millis() + 1500;
     restartRequested = true;
+}
+
+// Time zone from the network page: saved here, applied by the loop at once
+// (no restart). setenv() may rewrite the TZ string in place while a
+// localtime_r() reads it, so the switch happens in the loop task, where the
+// clock is read (log stamps, rain reset); a page rendered at that very moment
+// may still show the previous zone.
+void WebPortal::handleTimezonePost(AsyncWebServerRequest *request)
+{
+    logger.debug("HTTP request: POST /timezone");
+    String value = request->hasParam("timezone", true) ? request->getParam("timezone", true)->value() : String();
+    int zone = TimeZones::fromForm(value.c_str(), configManager.timezone.c_str());
+    if (zone == -1)
+    {
+        request->send(400, "text/plain", "Unknown time zone");
+        return;
+    }
+    if (zone >= 0)
+    {
+        if (!configManager.setTimezone(zone))
+        {
+            request->send(500, "text/plain", "Failed to save configuration");
+            return;
+        }
+        timezoneApplyRequested = true;
+        logger.info("Time zone set to " + String(TimeZones::ZONES[zone].name));
+    }
+    request->redirect("/network");
 }
 
 // Response that browsers and proxies must not store (pages with key material)
@@ -1888,7 +1941,7 @@ void WebPortal::handleDiagNetwork(AsyncWebServerRequest *request)
 // access point (e.g. LTE-only installs or a wrong static address)
 void WebPortal::handleNetwork(AsyncWebServerRequest *request)
 {
-    request->send(200, "text/html", HTMLGenerator::generateNetworkPage(configManager, wifiSSID, wifiPassword, timezone, isAPMode));
+    request->send(200, "text/html", HTMLGenerator::generateNetworkPage(configManager, wifiSSID, wifiPassword, isAPMode));
 }
 
 #if defined(HAS_ETHERNET) || defined(HAS_LTE)

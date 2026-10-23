@@ -211,7 +211,7 @@ void setup()
 
     webPortal = new WebPortal(*sensorManager, logger,
                               configManager->wifiSSID, configManager->wifiPassword,
-                              configManager->configMode, *configManager, configManager->timezone);
+                              configManager->configMode, *configManager);
 
     // LoRa module initialization
     // The radio and its SPI bus belong to the radio task from here on

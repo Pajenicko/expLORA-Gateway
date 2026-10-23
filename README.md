@@ -87,7 +87,8 @@ Pin assignments live in `variants/<board>/board_config.h`.
 3. **Firmware updates** can also be installed from the web interface (Firmware page):
    upload a binary, or download one over HTTPS (the server certificate is
    checked against the built-in CA bundle). Images for the other board are
-   refused.
+   refused. "Check for update" offers only a newer version (major, minor and
+   patch compared as numbers), never an older one.
 
 4. **Unit tests** run on the host: `pio test -e native`. An end-to-end test against
    a real device is in `tests/integration`.
@@ -104,7 +105,7 @@ Pin assignments live in `variants/<board>/board_config.h`.
      password (at least 8 characters) before anything else
 
 3. **Configure WiFi**:
-   - Enter your home WiFi credentials
+   - Enter your home WiFi credentials and select your time zone
    - Save and reboot
 
 4. **Access the Web Interface**:
@@ -159,6 +160,30 @@ its Network page.
 
 The Network page and `/diag/network` (JSON) show the state of each interface,
 the LTE operator and signal, and the power source (PoE or USB).
+
+## Time and Time Zone
+
+The clock is set over NTP once the gateway is online. The time zone is selected
+on the Network page (card "Time") from a list of named zones (`Europe/Prague`,
+`Europe/London`, `America/New_York`, ...): one zone for every European country
+(its capital, plus e.g. the Azores, the Canaries and a few Russian zones) and
+common zones worldwide. Summer time follows the rules of the selected zone
+automatically. The default is `Europe/Prague`. A change takes effect
+immediately, without a restart; the card shows the current local time, its UTC
+offset and whether summer time applies.
+
+The rules are frozen at build time: the list was taken from the IANA tz database
+version 2026c (e.g. British Columbia on UTC-7 all year from November 2026,
+Morocco on UTC+0 from September 2026). When a country changes its rules later,
+the gateway follows only after a firmware update.
+
+The zone is stored by name together with its POSIX TZ string. A setting from a
+version before 2.0.0 is mapped to the matching entry of the list; a string that
+matches no entry is kept and shown as "Custom". After a downgrade to 1.2.0 the
+zone keeps working, but 1.2.0 offers only five zones (GMT, WET, CET, EET, MSK)
+in its WiFi form: saving the WiFi settings there switches any other zone to
+GMT. A zone changed by 1.2.0 is taken over when 2.0.0 or newer is installed
+again.
 
 ## Adding Sensors
 
@@ -255,7 +280,7 @@ The gateway provides a read-only REST API for sensor data (no login needed):
 Example API response:
 ```json
 {
-  "version": "1.1.13",
+  "version": "2.0.0",
   "time": "2026-10-17 15:30:45",
   "status": "connected",
   "sensors": [

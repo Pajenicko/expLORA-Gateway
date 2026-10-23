@@ -125,6 +125,13 @@ public:
     // Deferred work (rain total saves), call from loop()
     void process(unsigned long now);
 
+    // Switches the time zone (setenv/tzset, call from loop()). The daily rain
+    // reset keeps the old zone's view of the last reset: a total started
+    // today stays today's (no extra reset when the last reset falls on
+    // yesterday in the new zone), one from an earlier day is still reset by
+    // the next packet (not skipped when the new zone puts it on today).
+    void applyTimezone(const String &posix);
+
     // Find sensor by serial number
     int findSensorBySN(uint32_t serialNumber);
 
