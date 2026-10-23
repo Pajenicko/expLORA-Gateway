@@ -97,7 +97,7 @@ Bytes 1–4 are always the DevID, the last 4 bytes always the MIC.
 | 1 | 4 | DevID |
 | 5 | 2 | FCnt (low 16 bits of the 32-bit counter of this direction) |
 | 7 | 1 | FCtrl |
-| 8 | n | payload: TLVs (§4), CTR-encrypted with Ks_enc, 0 ≤ n ≤ 222 |
+| 8 | n | payload: TLVs (§4), CTR-encrypted with Ks_enc, 0 ≤ n ≤ 222 (an OTA session DOWN: ≤ 243, §14.2) |
 | 8+n | 4 | MIC (Ks_mic) |
 
 FCtrl:
@@ -106,8 +106,8 @@ FCtrl:
 |---|---|---|
 | 7 | ACK request – the gateway must answer in RX1/RX2 | ACK – acknowledges the uplink it answers |
 | 6 | more data pending in the sensor | more downlink pending – the sensor sends an empty UP (POLL) within 2 s |
-| 5 | class C (mains powered, listens continuously; reserved in phase A) | reserved (0) |
-| 4 | reserved (0) | reserved (0) |
+| 5 | class C (mains powered, listens continuously; reserved in phase A) | OTA session frame (M4b, §14.2): bound to the UP that accepted the OTA start |
+| 4 | OTA session active (M4b, §14.2) | reserved (0) |
 | 3–0 | config version the sensor runs | config version the gateway holds |
 
 An UP with an empty payload is a POLL. Every transmission, including
@@ -123,7 +123,7 @@ retransmissions, uses a new FCnt (§7).
 | 7 | 4 | devNonce |
 | 11 | 2 | HW type (as in the image trailer, 0x0003 = lorasen v3 core) |
 | 13 | 3 | firmware version major, minor, patch |
-| 16 | 1 | capabilities: bit 0 class C, bit 1 RX2 |
+| 16 | 1 | capabilities: bit 0 class C, bit 1 RX2, bits 2–3 OTA transfer version received (0 none; M4b, §14.2) |
 | 17 | 1 | config version (low 4 bits) |
 | 18 | 4 | MIC (K_join_mic) |
 
@@ -156,7 +156,7 @@ MIC = CMAC(key_mic, B0 | msg)[0..3]       msg = frame without the MIC
 | JOIN_ACC ACCEPT | 1 | 0x01 | devNonce of the answered JOIN_REQ | 0 | K_join_enc, K_join_mic |
 | REJOIN | 1 | 0x11 | FCnt16 of the triggering UP | MIC of the triggering UP (as u32) | –, K_join_mic |
 | UP | 0 | 0x02 | FCnt32 (up) | 0 | Ks_enc, Ks_mic |
-| DOWN | 1 | 0x03 | FCnt32 (down) | FCnt32 of the uplink it answers (ConfFCnt) | Ks_enc, Ks_mic |
+| DOWN | 1 | 0x03 | FCnt32 (down) | FCnt32 of the uplink it answers (ConfFCnt); an OTA session DOWN (FCtrl bit 5): FCnt32 of the UP that accepted the OTA start (§14.2) | Ks_enc, Ks_mic |
 
 Direction and frame code are in both A_i and B0, so no key stream or MIC can
 be reused across directions or frame types. A DOWN verifies only as the answer
@@ -207,6 +207,7 @@ i16 0x8000, u16 0xFFFF, u32 0xFFFFFFFF.
 | 0xC0 | board data | board specific |
 | 0xC1 | Modbus | u8 slave ‖ u8 function ‖ u16 first register ‖ u16 values… |
 | 0xC2 | status | answer to a status request, format below |
+| 0xC3 | OTA status | progress (12 B: u16 base ‖ u64 window ‖ u16 slot index) or event (2 B: u8 kind ‖ u8 arg), §14.2 |
 
 Event sequence numbers let the gateway drop duplicates of confirmed events
 that were retransmitted (each retransmission has a new FCnt).
@@ -219,7 +220,12 @@ every N ‖ u8 missed ACKs ‖ u8 config version ‖ u8 flags (bit 0: clock set)
 flags bit 1 (M4a): the IWDG was not started by the bootloader; bit 2: the
 RTC is not usable (binary mode on the LSE failed, e.g. a backup domain still
 holding another RTC clock source – only a backup-domain reset or a power
-cycle changes it): no update can be confirmed. A
+cycle changes it; also while the LSE is stopped, and – M4b stage 3 – after
+the RTC time base failed a bounded wait in this boot, §10.3: transient, the
+sensor resets and rejoins by itself): no update can be confirmed; bit 3 (M4b): the bootloader
+wrote a swap record in this boot (TAMP BKP14R bit 9, §10.3) – the boot state
+alone persists until the next update, so the gateway needs this bit to see a
+fresh swap or revert (§14.5). A
 receiver accepts ≥ 22 bytes and ignores what it does not know. The gateway
 keeps the firmware version of the last verified JOIN_REQ and the boot state in
 `sensors.json` and shows both on the sensor pages; the boot state is cleared
@@ -243,6 +249,9 @@ duty-cycle gap) until a DOWN arrives. The gateway keeps the request queued
 | 0x82 | time | u32 unix time (UTC) at the **start** of this transmission |
 | 0x83 | uplink frequency | u32 Hz; radio parameter safeguard below |
 | 0xC0 | board command | board specific (e.g. SCD40 forced recalibration) |
+| 0xC1 | OTA start | 22 bytes, §14.2 |
+| 0xC2 | OTA block | u16 index ‖ data, only in an OTA session DOWN, §14.2 |
+| 0xC3 | OTA end | u8 0 pause, 1 abort; in an OTA session DOWN or a normal DOWN, §14.2 |
 
 Configuration is versioned (4 bits in FCtrl): the gateway holds the desired
 configuration vN; whenever an UP reports a different version, the next DOWN
@@ -505,7 +514,7 @@ duty cycle (§9) and launches it in RX1 or RX2 (`Hardware/RadioTask`).
 | Header valid | ≈ 116 ms after TX start | preamble 16 + 4.25 symbols = 83 ms, symbol 4.096 ms |
 | Accepted response start | ≈ T − 50 … T + 64 ms | outside: miss |
 | RX2 | **T + 2000 ms**, same frequency, same window | only if RX1 got nothing valid |
-| Gateway mid-reception check | before switching to TX | if a header is being received: defer to RX2 / next uplink; only JOIN_ACC ACCEPT, REJOIN and the ACK of a confirmed UP (one carrying a status report or an event; later OTA) pre-empt |
+| Gateway mid-reception check | before switching to TX | if a header is being received: defer to RX2 / next uplink; only JOIN_ACC ACCEPT, REJOIN and the ACK of a confirmed UP (one carrying a status report or an event; later OTA) pre-empt. SX1276 (Lite, since M4b): "being received" starts at the detected preamble (`RegModemStat` bit 0), so a non-priority response also defers for a packet whose header is not decoded yet (Busy rate measured in the M4b hardware test); SX1262: from the valid header |
 | Gateway decision / late check | the radio task decides at launch − 20 ms (`Gen2Downlink::decisionTime`): a response handed over by loop() until then goes out in that window, a later one in RX2, after the RX2 decision it is reported late; a launch more than 40 ms late (flash stall, preemption) is aborted - checked before the radio leaves receive and again right before the launch | answer in RX2 instead |
 | Gateway radio task | core 1, priority 14 | never blocks, never takes `sensorMutex`, never touches LittleFS |
 
@@ -607,7 +616,10 @@ during firmware upload and 19 ms (Lite) during `saveSensors()`. Rules:
   the other downlinks wait, and the sum never exceeds 10 %. A response that
   does not pass the check in RX1 (pacing) may still go out in RX2. Warning in
   the UI and log above 80 % of the 360 s; the used airtime (total and
-  join share) is shown in `/diag/heap`.
+  join share) is shown in `/diag/heap`. **OTA (M4b, §14.5)** is the lowest
+  priority inside the data share: at most 60 % of it (172.8 s per sliding
+  hour), paced evenly (one block per cadence, 26 s at SF9); the 9·t pacing
+  applies OTA → OTA only.
 
 ## 10. Flash layout of the sensor (final, approved 17. 10. 2026)
 
@@ -687,8 +699,17 @@ size, multiple of 8) is stored in the unused vector table entry 8 (offset
 | 8 | 4 | firmware version major << 16 \| minor << 8 \| patch |
 | 12 | 4 | image size |
 | 16 | 4 | load address (slot A) |
-| 20 | 8 | reserved (0) |
+| 20 | 4 | flags (M4b): bit 0 OTA-capable (the image contains the OTA receiver), bits 8–11 OTA transfer version (1); 0 in images built before M4b |
+| 24 | 4 | reserved (0) |
 | 28 | 4 | CRC-32/ISO-HDLC over image ‖ trailer[0..27] |
+
+`scripts/image_trailer.py` (sensor repository) writes the flags from the
+project option `custom_ota_transfer` (the transfer version, set to 1 in the
+`[env]` section once the receiver is in the firmware; 0 = flags 0). The
+flags are inside the CRC. The bootloader ignores them; the gateway accepts
+for OTA only images with bit 0 set and 1 ≤ transfer version ≤ the version it knows (§14.5; the sensor checks the same at completion),
+so every image it installs can be replaced over the air again. Downgrades
+to such an image are allowed (D5), confirmed and logged.
 
 The bootloader starts slot A only if size, trailer, CRC, stack pointer and
 reset vector (past the 0x138-byte vector table) are valid, and jumps with
@@ -706,12 +727,12 @@ bootloader, radio init and the first packet OK. The bootloader hands RCC_CSR
 invalid slot A is reported three times on the console, then the bootloader
 enters Standby with all wake-up sources off (µA; NRST / power cycle / SWD
 under reset recover); bootloader faults (e.g. a flash ECC NMI) also end in
-Standby. PWR_CR3 survives Standby, so the bootloader re-enables the internal
+Standby (M4b changes this to the timed Standby, §10.3). PWR_CR3 survives Standby, so the bootloader re-enables the internal
 wake-up line at every start.
 
 ### 10.2 Deferred
 
-The LoRa transfer itself (§14, M4b), write protection of the identity page,
+Write protection of the identity page,
 the read-out protection (RDP) decision and the ROM/UART service entry.
 
 ### 10.3 Swap-with-confirm (M4a)
@@ -788,8 +809,13 @@ double word:
   reverts a good image (safe, the update is lost). A `REVPLAN` without a
   usable FORWARD `PLAN` (damaged record) is also IDLE-like (accepted).
   Native tests: n = 56 with 0–3 torn `PLAN`s, a pre-filled page, a full page.
-  The application additionally erases page 117 before writing `PENDING`
-  (M4b) when the page is not empty (terminal state only).
+  **Page 117 rule for the application (M4b, §14.4):** it may erase page 117
+  before writing `PENDING` only when the state is idle-like per
+  `sw_idle_like` (no valid record, a terminal record, or no active `PLAN`
+  and the last record is not `PENDING` / `SWAPPED` / `BOOT`) – never with an
+  active `PLAN` and never while the image in A is unconfirmed (`SWAPPED` /
+  `BOOT(k)`); an OTA start is refused otherwise (reason in the OTA status).
+  A stale `PENDING` at an OTA start is superseded by `IDLE` first.
 
 **Page swap.** n = number of pages covering max(size A, size B) including
 the trailer (A invalid: 56). Before the FORWARD `PLAN` the slot B pages
@@ -906,12 +932,72 @@ runs in 25 s LPTIM1 chunks; before each chunk the RTC wake-up timer is armed
 at 30 s. If it fires, the LPTIM wake-up failed and the application resets
 (an unconfirmed image: the bootloader counts the start; three → revert).
 The IWDG is reloaded after every chunk. LPTIM1 and the RTC both run on the
-LSE: Stop2 is never entered without LSERDY (then the wait is awake, at run
-current). The 25 s chunks wake the CPU ~10 × more often than 250 s chunks
-would (estimate < 0.1 µA, to be confirmed by the owner's current
+LSE: the schedule and inter-cycle sleeps (the 25 s chunks above, the OTA
+session waits of §14.3) never enter Stop2 without LSERDY or with LPTIM1 not
+running on the LSE (then the wait is awake, at run current, for the same
+time). Without LSERDY the application runs LPTIM1 on the LSI (32 kHz, ~1–2 %)
+for the receive windows – their Stop2 of ≤ ~2 s is then entered on the LSI
+(since M4b stage 3) – and bounds every wait for the LPTIM counter domain (2 ms
+at 32 kHz, 50 ms at the 256 Hz sleep rate). Found in M4b stage 3: an LSE that
+never started or stopped made every JOIN_REQ / UP cycle spin in the LPTIM
+start until the IWDG reset the unit. Status flags bit 2 is then set and an OTA
+start is refused 7. The 25 s chunks wake the CPU ~10 × more often than 250 s
+chunks would (estimate < 0.1 µA, to be confirmed by the owner's current
 measurement). **Residual risk:** an LSE that dies during one Stop2 stops both
-wake sources (the IWDG is frozen in Stop2, D2) – the LSE clock security
-system is an option for later.
+wake sources (the IWDG is frozen in Stop2, D2) – the LSE clock security system
+is an option for later.
+
+**Schedule sleep bound** (the wait to an RTC time: OTA block windows, status
+slots, the duty-cycle gap before every cycle; M4b stage 3 hardening after a
+sensor stayed silent for ~2 h in a session without a reset): every Stop2
+chunk is at least 8 ticks of 256 Hz – the compare register sync takes ~3
+ticks, a shorter chunk could pass its compare before it takes effect and
+sleep into the 30 s backstop – so the last ≤ 100 ms before the target are
+awake (`millis()`). The caller gives the longest legitimate wait: a block
+window and the wait to a status slot's preparation (150 ms before the slot):
+the slot bound, start delay + C + 40 ms (early opening and a re-anchor step)
++ 2d + 1 s; from the preparation to the status TX and to the slot end:
+150 ms + 1 s; the duty gap: the gap. The wait ends with a fault when the
+target lies further ahead, when the RTC time does not advance (or goes back)
+across two chunks in a row, or when the chunks add up to more than the bound
+plus a margin of 1 s or 2 % of the bound, whichever is more (a chunk that
+cannot be a Stop2 is waited awake on `millis()`, whose clock is only good to
+about 1 %). In a session the sensor then leaves ("left 1", §14.4). When the
+RTC itself failed (no advance, chunks too long), the RTC is not trusted for
+the rest of that boot: every later wait – including the interval sleep – is
+awake on `millis()`, at most its bound (no schedule / inter-cycle wait enters
+Stop2 under distrust; the receive-window Stop2 of an UP, ≤ 2 s, bounded by the
+16-bit LPTIM wrap, remains and is the only time `millis()` does not count),
+status flags bit 2 is set and the next UP that is not an OTA answer carries a
+status report; the unit resets once the "left" UP (or a pending OTA answer) is on the air, or 30
+minutes after the distrust was set (join due, duty budget could not send it),
+whichever comes first – every awake wait under distrust is cut to what is left
+of the 30 minutes, so the reset comes at most 30 minutes (+ the one UP in
+progress) after the fault. A new OTA start is refused (refusal 7) while the
+time base is distrusted, and an acceptance not yet sent goes out as refusal 7
+instead (the gateway never sees "accepted" followed by the reset). A fault
+outside a session resets the unit at once – unless an OTA event ("left") or
+answer is still to be sent: then the RTC is distrusted the same way and it
+goes out first. The duty gap before an UP: an interval sleep (never shorter
+than the gap) covers it; when none ran since the last TX (after a session or a
+completion) the RTC schedules the rest of the gap – or, when the RTC cannot
+(distrusted, not usable, the LSE stopped, or the last TX time taken while it
+was not usable), the whole gap is waited awake on `millis()`. The stage of every long wait, radio listen
+and flash operation is
+kept in a backup register and printed on the console at the next boot; the
+first failed wait of a boot is kept in a second one (diagnosis only; no frame
+carries either). LPTIM1 is disabled by a peripheral reset, never by clearing
+its ENABLE bit (STM32WL errata: cleared near an LPTIM interrupt, the wake-up
+line may stay stuck active).
+
+The RTC is read through `SSR` only, with `RTC_CR.BYPSHAD` set by the
+application at every start (a fresh backup domain has BYPSHAD = 0: `SSR` then
+comes from the shadow register and the time stalls and jumps – found in M4b
+stage 3 after a backup domain reset; earlier units only worked because foreign
+firmware had left the bit set). With the shadow registers bypassed a single
+read may catch the counter mid-update, so `SSR` is read twice until both reads
+agree; `TR` / `DR` (calendar) are not used for the millisecond clock (binary
+mode, `SSR` alone counts).
 
 **Boot state reporting** (status report byte 22, §4.1): 0 none, 1 swapped /
 unconfirmed, 2 confirmed after an update, 3 reverted: boot count, 4 reverted:
@@ -934,6 +1020,24 @@ pages 116–118 and the identity page, waits for a pending NMI before the guard
 drops and flushes the flash caches after an erase and before verify reads).
 Any other ECC NMI: bootloader → Standby, application →
 reset.
+
+**Bootloader faults → timed Standby (decided for M4b, implemented with
+it).** Today a HardFault, MemManage / BusFault / UsageFault or an unguarded
+ECC NMI in the bootloader ends in the plain Standby (only NRST or a power
+cycle recover). With M4b the fault handler prints one line (`BL: FAULT
+<kind> pc <hex>`), counts the fault in its own counter (TAMP BKP9R, magic in
+the high half) and uses the timed Standby (30 × 30 s); after 8 counted faults
+it stays in the plain Standby. The bootloader never clears this counter (a
+normal boot clears BKP10R, the swap retry cap, which would let a
+deterministic late fault loop for ever); the application clears it after
+its first completed cycle (the point where the reset-loop counter of §9 is
+cleared). So a unit recovers by itself from a transient glitch (e.g. a
+bouncing battery contact during a flash operation) and still stops after 8
+faults in a row. Without a running RTC the plain Standby stays. Bootloader
+size: 7,840 B today, 352 B left (`BL_FAULT_TEST` 8,032 B, 160 B left) – the
+handler must fit in every variant and is tested for every fault type with
+`BL_FAULT_TEST`. The bootloader is never updated over the air: units shipped
+before this change keep the plain Standby (ship gate, §14.10).
 
 **Write protection (D3, build option `BL_WRP`).** The bootloader programs
 WRP1AR = pages 0–3 (STRT 0, END 3) together with OPTR in one option byte
@@ -1038,3 +1142,883 @@ that UP. Expected bytes: `test/test_protocol_v2/vectors.h`.
   last page, the DONE records, random others) – the exhaustive run over every
   operation of those pages is the native test; the application's ECC guard
   covers slot B and pages 116–118 but not slot A (it runs from there).
+- M4b (phase B assignment, §14):
+  - the OTA status UP is never confirmed – after the status slot the gateway
+    goes on inside the 64-block window, so a lost status costs repeats
+    instead of a pause; silence limits are 2 rounds (≈ 29 min) on both sides
+    instead of 5 min (an empty window costs ≈ 0.23 s of RX; a resume costs a
+    new start), with an immediate "left" UP from the sensor;
+  - while a sensor is in an OTA session its periodic report rides in the
+    status UP;
+  - signalling the assignment did not list: UP FCtrl bit 4 (OTA session
+    active), JOIN_REQ caps bits 2–3 (OTA transfer version), OTA end code 0
+    "pause" next to "abort", the start-delay field, the accepting UP (accepted
+    + progress) whose FCnt32 is the binding, the status slot index in the
+    progress status (12-byte value, 14-byte TLV instead of ≤ 12 B: it
+    re-anchors the gateway), the status event "verified, battery low";
+  - the start is allowed in any idle-like page 117 state (M4a generalised
+    "terminal"); a `PENDING` as the last record is refused instead of being
+    superseded by `IDLE` (the application only sees its own);
+  - at completion page 117 is erased when it is not empty (one erase per
+    OTA), `PENDING` is written before the "complete" UP, and the battery is
+    checked again before `PENDING`;
+  - blocks are written with "equal: skip" and page 118 records the slot B
+    pages erased within the transfer, so a block straddling an erased page
+    needs no cascade of erases; every slot B page erase is write-ahead;
+  - "battery under load" is read while the radio receives;
+  - gateway states and lifetimes the assignment did not list: Verified
+    (waiting for the battery), 7 days for Paused / Verified, a Swapping
+    deadline, "Clear job", a no-progress limit (4 counted statuses or 3
+    laps), the 6 h retry after a battery refusal or a battery leave
+    ("left 2"; the admin's Resume lifts it), a starved-gateway back-off,
+    persisted `abortPending` and `manualPause`;
+  - the accepting UP is defined as the sensor's next UP after the start
+    (binding known in advance); status flags bit 3 (swap record written in
+    this boot) for fresh swap / revert reports.
+
+## 14. OTA transfer (M4b)
+
+A new application image travels from the gateway to one sensor over LoRa,
+block by block, into slot B; the M4a bootloader then swaps it in and the
+application confirms it (§10.3). This section is normative for M4b; the pure
+parts are code with native tests: TLV values, block math, bitmap, schedule and
+cadence in `lib/explora-protocol/src/ep_ota.h` (both repositories,
+`test_protocol_v2`), the page 118 records, the resume check and the block
+writes in the sensor's `include/ota_state.h` (`test/test_ota_state`, with
+power-loss sweeps). Defaults D5, D6 and D7 of the phase B assignment apply
+unchanged. Deviations from the assignment are listed in §13; an implementation
+checklist closes the section (§14.11).
+
+### 14.1 Overview and numbers
+
+| | Value |
+|---|---|
+| Block | 232 bytes of the image (multiple of 8); block TLV 236 B, frame 248 B, **1.26 s** at SF9 |
+| Image | image + 32-byte trailer, ≤ 114,688 B (slot), multiple of 8; 88 kB = **389 blocks**, 100 kB = 442, a full slot 495 |
+| Round | K = 32 block slots, then one status slot; (K + 1) × C ≥ 12 min, so ≤ 5 statuses per hour (D7) |
+| Cadence | C = 26 s at SF9 (one slot per C; computed, §14.5) |
+| Gateway airtime | ≤ 60 % of the data share: ≤ 172.8 s per sliding hour; at C = 26 s at most 170.4 s in any sliding hour |
+| Sensor listening | scheduled receive windows (D6), ≈ 1.2 mAh per 88 kB OTA |
+| Status | on 868.0 MHz under the sensor's 0.1 % (D7): base + 64-bit window + slot index, 14-byte TLV |
+| Timeouts | sensor: 2 rounds without a valid block (≈ 29 min from the last block: ≈ 28 min after the gateway paused, ≈ 56 min after the last status it received) → leaves, sends "left" at once; gateway: 2 status slots without a status (≈ 29 min) → Paused, no progress over 4 counted statuses or 3 laps → Failed |
+
+**Realistic times** (C = 26 s, K = 32; "repeats" = blocks sent again because a
+block or a status was lost; "skipped" = slots the gateway could not use
+because a reception, a response or another sensor's uplink slot was in the way
+– 5 % corresponds to about 5 other generation 2 sensors at a 10 min interval,
+each blocking ≈ 6 s around its uplink):
+
+| Image | Blocks | No repeats, no skips | 15 % repeats | 15 % repeats + 5 % skipped slots |
+|---|---|---|---|---|
+| 88 kB | 389 | 2.90 h | 3.33 h | 3.51 h |
+| 100 kB | 442 | 3.29 h | 3.79 h | 3.99 h |
+| full slot (112 kB) | 495 | 3.69 h | 4.24 h | 4.46 h |
+
+Add before: the start reaches the sensor with the DOWN to its next UP (≤ one
+interval) and the accepting UP waits the sensor's per-frame off-time (≥ 218 s)
+and the slot B erase (1–2.5 s); after: verification (< 1 s), the swap (7.4 s
+measured, §10.3), the join and the confirmation after a proven sleep (≥ min(¾
+× interval, 250 s)) – about 20–30 min in total at a 10 min interval. The UI
+shows the estimate before the start and a running ETA.
+
+### 14.2 Frames
+
+No new MHDR type (TT has four values, all used): OTA travels in UP and DOWN as
+TLVs under Ks (encrypted, MIC).
+
+- **DOWN FCtrl bit 5 = OTA session frame.** Its binding in B0 (§3.5) is the
+  FCnt32 of the UP that accepted the OTA start in this Ks session (it answers
+  no uplink). All other FCtrl bits are 0 (no ACK, no "more pending", config
+  version nibble 0) and the sensor ignores them. It carries exactly one TLV:
+  one OTA block (0xC2) or one OTA end (0xC3); anything else is dropped.
+  Payload limit **243 bytes** (frame 255) for these frames only
+  (`ep::maxPayload`, used by both decoders, §3.2); every other UP / DOWN keeps
+  222 bytes and normal DOWNs keep the 40-byte rule of §4.2. The sensor picks
+  the binding by FCtrl bit 5 (covered by the MIC). An OTA session DOWN never
+  counts as an ACK, a missed-ACK reset, a confirmation of the radio parameter
+  safeguard (§4.2), a CONFIRMED trigger (§10.3) or a configuration DOWN – it
+  proves nothing about a recent uplink. Outside a session the sensor drops OTA
+  session frames.
+- **UP FCtrl bit 4 = OTA session active**: set on every UP from the accepting
+  UP until the sensor leaves (the "left" UP has bit 4 = 0). The gateway uses
+  it to see that a sensor has left (silence, reset, rejoin) and sends a new
+  start.
+- **JOIN_REQ caps bits 2–3**: the OTA transfer version the firmware receives
+  (0 = no OTA receiver, 1 = this section). The gateway offers an update only
+  to a sensor whose last JOIN_REQ reported ≥ 1.
+- OTA session frames use the gateway's normal DOWN FCnt (one counter per
+  direction). The gateway builds an OTA frame only while no normal DOWN for
+  the same sensor is pending, so FCnts are launched in increasing order; a
+  skipped launch burns its FCnt, which the 16384 window of §5.3 absorbs (a
+  whole OTA is < 700 frames).
+
+TLVs (type byte `LL C TTTTT`, §4):
+
+| Dir | Code | Name | Value |
+|---|---|---|---|
+| DOWN | 0xC1 | OTA start | 22 bytes, below; only in a normal DOWN answering an UP |
+| DOWN | 0xC2 | OTA block | u16 block index ‖ data (232 B; the last block shorter, a multiple of 8); only in an OTA session DOWN |
+| DOWN | 0xC3 | OTA end | u8: 0 pause (leave, keep the progress), 1 abort (leave, discard the progress – END(aborted), or page 118 erased when it ends in END(verified)); in an OTA session DOWN or in a normal DOWN (so it reaches a sensor whose session frames are not received); outside a session a pause is ignored, an abort still discards a stored transfer |
+| UP | 0xC3 | OTA status | 12 bytes progress: u16 base ‖ u64 window ‖ u16 slot index; or 2 bytes event: u8 kind ‖ u8 arg |
+
+**OTA start** (big endian, `ep::ota::Start`): u8 transfer version (1) ‖ u32
+image length (image + trailer) ‖ u32 image CRC (the numeric value of the
+trailer's CRC-32 field, stored little endian in the trailer, big endian here)
+‖ u32 firmware version (trailer) ‖ u16 HW type (trailer) ‖ u8 block size (232)
+‖ u8 K (32…64) ‖ u16 cadence in 0.1 s ‖ u8 spreading factor of the OTA frames
+(9; SF7 later stays possible – a version 1 receiver refuses anything but 9) ‖
+u16 start delay in ms (≥ 3000; slot 0 = the accepting UP's TxDone + this).
+Longer values are accepted (extra bytes ignored, future fields). The gateway
+sends a start only to a sensor in the state SESSION (§5.6, not SESSION_NEW)
+that runs the desired configuration (`inSync`); the DOWN then carries the
+start and at most the time TLV (29 B ≤ 40 B), never configuration TLVs.
+
+**OTA status** (`ep::ota::Status`; the two forms are told apart by the value
+length only – progress is always 12 bytes, an event always 2, other lengths
+are ignored so future forms must use other lengths):
+
+- progress: base = lowest missing block (= the block count when complete), bit
+  i of the window = block base + i received, slot = the index of the status
+  slot it is sent in; 0xFFFF in the accepting UP means "not a status slot" –
+  it is never put into the re-anchor formula (the accepting UP anchors by its
+  own RxDone);
+- events: 1 accepted (arg 0 new, 1 resumed; always followed by a progress TLV
+  in the same UP), 2 refused (arg, checked in this order: 1 transfer version,
+  2 image length / block size / K / cadence / round / SF / start delay out of
+  range, 3 HW type ≠ identity, 5 running image unconfirmed, 4 swap state not
+  idle-like, 7 RTC not usable, 6 battery below 2.4 V, 8 flash erase failed), 3
+  complete (image verified, `PENDING` written, the sensor restarts into the
+  swap), 4 failed (arg: 1 CRC, 2 trailer – including the OTA flags –, 3
+  identity differs from the start, 4 flash; the progress is discarded), 5 left
+  (arg: 1 silence – also the time base failing: LSE stopped or a failed
+  schedule wait, §10.3 –, 2 battery below 2.3 V, 3 OTA end; 4 is reserved –
+  a new session needs no "left", the gateway sees the join; the progress is kept
+  unless the gateway aborted), 6 verified, battery low (arg = battery mV /
+  100; `PENDING` waits until the battery is ≥ 2.4 V again). Unknown kinds are
+  skipped.
+
+### 14.3 Schedule and timing
+
+Slot s of the session starts at **A + start delay + s × C**, where A is the
+accepting UP's TxDone on the sensor and its RxDone on the gateway (the same
+reference as RX1, §7). A round is K block slots followed by one status slot
+(slot s is a status slot when s mod (K + 1) = K).
+
+- **Accepting UP and binding**: the accepting (or refusing) UP is the sensor's
+  **next UP after the DOWN that carried the start** – the sensor sends no
+  POLL, retransmission or event UP in between (it defers them). The gateway
+  therefore knows the binding before it arrives: the FCnt32 of the UP the
+  start answered + 1, stored in the job. If the accepting UP is lost, the
+  first progress status in Waiting is answered with a new start (the sensor
+  ends the session and resumes; one accept lost, nothing else).
+- **Gateway anchor**: the accepting UP's RxDone, used only when its timestamp
+  is reliable (`timeReliable`, §7); otherwise the gateway sends no block and
+  waits for the first status UP. **Every progress status sent in a status slot
+  re-anchors the gateway** with a reliable timestamp: A = (RxDone −
+  airtime(UP)) − (start delay plus s × C), s from the status (the UP starts at
+  its slot time); the accepting UP (slot 0xFFFF) anchors directly: A = its
+  RxDone, always. A status moves an existing reliable anchor of the same
+  binding and session only when the implied shift lies within ±(20 ms +
+  d_gw), d_gw = 20 ppm × the time since the UP that set the anchor + 5 ms.
+  This is deliberately **not** a mirror of the sensor's rule (200 ppm, next
+  bullets): the gateway keeps its anchor tight so that a late status cannot
+  shift it; the sensor compensates the real drift itself – its windows widen
+  by d and every received block re-anchors it – so the gateway need not
+  follow. At low temperature (LSE ≈ −150 ppm) statuses therefore exceed the
+  20 ppm bound now and then: `anchorRejects` > 0 is expected there and costs
+  nothing while blocks arrive. A status outside the bound still counts
+  for the progress, the no-progress rule and a binding take-over, but leaves
+  the anchor (counted, `/diag/heap` → `ota.anchorRejects`). Without such an
+  anchor (none, unreliable, or a binding taken over from a lost accepting UP)
+  the status anchors unconditionally. Reason (stage 3 bench): a status that
+  left 160 ms late (a preparation overrun) dragged the gateway's schedule out
+  of the sensor's windows and cost a whole round until the next status.
+  These anchor rules apply to a received accepting UP (in Transfer, also when
+  its timestamp was unreliable) and in Transfer / Paused. A lost accepting UP
+  is not recovered by anchoring: the first progress status in Waiting gets a
+  new start (§14.5; ≈ one round lost).
+- **Gateway launch**: at the slot time minus C_chip (§7), so the frame starts
+  at the sensor's slot time like an RX1 response. An OTA launch more than **15
+  ms** late is skipped (not the general 40 ms), so consecutive blocks keep ≥
+  35 ms of the sensor's early-side margin. It never transmits in a status
+  slot.
+- **Sensor windows**: in every block slot it wakes from Stop2 and opens the
+  receiver at slot − 20 ms − d, with a header timeout of 200 ms + 2d, where d
+  = 200 ppm × the time since its last anchor (the LSE drifts to about −150 ppm
+  at −40 °C, the ESP32 crystal ±20 ppm). The block window stays open for at
+  least airtime + 2d + 100 ms (≈ 1.6 s; today's `waitIrq(1500)` is too short
+  for it). Every received block re-anchors: the measured offset against the
+  schedule (RxDone − airtime(frame) − slot time) is applied only when it lies
+  within ±(20 ms plus d) (`ep::ota::anchorStep`); a larger offset is a bogus
+  timestamp and is ignored, not clamped (the block still counts and resets the
+  silence timer), so it cannot drag the schedule. RxDone is taken on the RTC
+  clock (no 2 s LPTIM1 wrap in the wide windows near the silence limit). With a block every 26 s d stays ≈ 6 ms; at the 2-round silence
+  limit ≈ 0.35 s (windows then open accordingly wider). No header → back to
+  Stop2 at once (an empty window costs ≈ 0.23 s of RX).
+- **Sensor time base**: the schedule is kept on the RTC binary counter (1/256
+  s, §10.3); the wait to a window is Stop2 in LPTIM1 Slow chunks (256 Hz, ≤ 25
+  s and at least 8 ticks, with the RTC wake-up backstop of §10.3) and the
+  last ≤ 100 ms awake (timed by `millis()`); every such wait is bounded
+  (§10.3 schedule sleep bound: a failed wait leaves the session, "left 1");
+  TxDone and RxDone come from the radio interrupt's LPTIM1 Fast tick (32 kHz,
+  §8), converted to the RTC clock right after the transmission / reception
+  (never more than a few ms on LPTIM1 Fast, so its 2 s wrap cannot occur).
+  The IWDG is reloaded in every slot.
+- **Status slot**: the sensor sends its status UP at the slot time (UP on
+  868.0 MHz, the normal UP class of §9 – not a POLL / retransmission – with an
+  ACK only per the normal ACK policy). While in a session the periodic report
+  rides in the status UP (sensor TLVs + OTA status: the SHT40 frame grows from
+  21 to 35 bytes, 218 → 280 ms): a report due between two status slots is
+  postponed to the next one (at most one round, ≈ 14 min, late); the report
+  interval itself is unchanged outside a session. Phase C events and confirmed
+  UPs are not postponed to the status slot – they are only deferred until the
+  accepting UP is out (§14.3, first bullet). When its duty-cycle off-time (§9)
+  is not over at the status slot, the sensor skips that status (the gateway
+  goes on, §14.5).
+- **Other traffic of the target**: a JOIN_REQ, a POLL, a retransmission or a
+  "left" UP is placed so that its TX + RX1 + RX2 (≈ 2.5 s) does not overlap a
+  block slot ([S − 0.1 s, S + 1.6 s]); with C = 26 s the gaps are ~24 s.
+- **Sensor silence timer**: from A + start delay, reset by every valid block;
+  after 2 rounds ((K + 1) × C × 2 ≈ 29 min) without one the sensor leaves.
+- T_status (gateway) = the status slot + 4 s: the moment a missing status
+  counts as missed. The gateway then simply goes on (§14.5) – a lost status
+  costs repeats, never a stall.
+- Give-up times: the gateway pauses at the second missed status slot (≈ 29 min
+  after the last status it received); the sensor leaves 2 rounds after its
+  last valid block, ≈ 28 min after the gateway paused (≈ 56 min after that
+  last status) when only the uplink failed – a Paused job therefore resumes
+  Transfer as soon as an UP with bit 4 = 1 and a progress status arrives
+  (§14.5). A lost accepting UP costs about one round (no blocks in Waiting;
+  the first status gets a new start).
+
+### 14.4 Sensor
+
+**Accepting an OTA start** (in a normal DOWN answering one of its UPs, while
+the sensor is JOINED – a start received while REJOINING, §5.5, is ignored).
+The conditions are checked on every start, also on a resume; refused, with the
+reason in an OTA status (order as listed in §14.2), unless all hold:
+
+1. `checkStart()`: transfer version 1, image length 512…114,688 and a multiple
+   of 8, block size 232, K 32…64, the cadence fits a block frame (248 B) plus
+   the receive windows, (K + 1) × C ≥ 720 s, SF 9, start delay ≥ 3 s;
+2. HW type = the identity HW revision (a board without identity: 0x0003);
+3. the running image is confirmed: the last page 117 record is not `SWAPPED`
+   or `BOOT(k)`. **The application never writes slot B while the image in A is
+   unconfirmed** – slot B then holds the previous image the revert needs;
+4. **page 117 rule**: the swap state is idle-like per `sw_idle_like` (no valid
+   record, a terminal record, or no active `PLAN` and the last record is not
+   `PENDING` / `SWAPPED` / `BOOT`). A `PENDING` as the last record is refused
+   too: the bootloader always acts on `PENDING`, so the application sees one
+   only when it wrote it itself in this boot (or the bench script did);
+5. the RTC is usable (status flag bit 2 clear): an image that can never be
+   confirmed would be reverted after 3 × T_confirm;
+6. the battery is ≥ 2.4 V under load (VBAT read while the radio receives, ≈ 7
+   mA; bench define to fake a low value).
+
+A start that arrives while the sensor is already in a session ends that
+session first (CHECKPOINT, as a leave without the "left" UP) and is then
+handled like any start.
+
+- **New transfer** (no active START in page 118, or another identity): page
+  118 is erased and a START written, the slot B pages the image needs are
+  erased (≤ 56 × 22 ms typ., 40 ms max ≈ 1.2–2.3 s; the flash erase function
+  reloads the IWDG) and read back clean (a permanently bad cell or a tail that
+  does not erase → refused 8 at the start, not failed after hours), and a
+  CHECKPOINT marks them as erased within this transfer (`eraseSlot`), then the
+  accepting UP is sent. When `begin`, `eraseSlot` or that first CHECKPOINT
+  fails (refusal 8), the START is closed with END(failed) (`startNew`), so the
+  next start is a new transfer again and refuses at once instead of resuming
+  into the bad cell.
+- **Resume** (an active START with the same identity): the resume check below,
+  no slot B erase, accepted with arg 1 and the bitmap after the check. A
+  resume whose bitmap is complete goes straight to the completion.
+- **Already verified** (no active START, the last START has the same identity
+  and ended in END(verified), the last page 117 record is not `REVERTED` or
+  `KEPT`, every image page reads without an ECC error with an erased tail
+  (`unreadablePage`), and slot B still validates with that CRC – a reset or a
+  low battery between the verification and `PENDING`): accepted with arg 1,
+  progress complete, then straight to the completion – no 3.5 h repeat
+  (`verifiedFor`). After `REVERTED` / `KEPT` slot B has been through a swap:
+  the shortcut is refused and a start of that image is a new transfer (slot B
+  erased).
+- **The accepting UP**: the next UP after the start-carrying DOWN (nothing in
+  between, §14.3), a single transmission at the sensor's earliest off-time,
+  FCtrl bit 4 set, no ACK request, never retransmitted; a refusing UP
+  likewise; payload: OTA status "accepted" + progress (slot 0xFFFF), the
+  normal sensor TLVs may ride along (it then counts as a report); 30-byte
+  frame without them, 259 ms. Its FCnt32 binds the session's OTA frames; its
+  TxDone is A. If the gateway misses it, the sensor runs the schedule without
+  blocks and its first status gets a new start (≈ one round lost).
+
+**Receiving a block**: MIC under the binding, index < block count, length =
+the block's length; a block already in the bitmap is ignored (duplicate).
+Otherwise it is written to slot B at index × 232, double word by double word
+(`writeBlock`): equal → skip (half of a block next to a page that was erased),
+erased → program and read back, anything else, an ECC error or a wrong
+read-back → **the page of the failing double word** is dirty (a block
+straddling two pages can be dirty in its second page): `erasePage`,
+write-ahead – clear every block overlapping it from the bitmap, CHECKPOINT,
+then erase; the blocks come again with the next status. **The load-bearing
+invariant: every block is compared double word by double word against the
+received data before its bit is set**; the erased-page marks below only make
+stale data show up early. A page that turns dirty again after 3 dirty erases
+within one session (RAM counter: a pause, rejoin or reset starts it again –
+the final CRC still catches a bad image) ends the session (failed, flash), as does a
+failed CHECKPOINT or page erase. Flash is never written while the radio
+transmits (§8).
+
+**Checkpoint**: before every status UP the bitmap goes to page 118 as a
+CHECKPOINT record (never per block), then the status reports the same bitmap –
+the gateway never believes a block that the flash does not record.
+
+**Erased pages and the resume check** (`resume`, after a reset, a rejoin, a
+pause): a page erased within this transfer (the slot B erase at the start, a
+resume, a dirty page – recorded in every CHECKPOINT) can only hold data that
+`writeBlock` wrote: correct blocks, or torn double words that read with an ECC
+error. A page not yet erased within this transfer (the start erase was
+interrupted) may still hold the old image. Every double word of every image
+page is read: an ECC error makes the page dirty anywhere (recorded or not); in
+the parts of the blocks missing from the recorded bitmap an unmarked page is
+also dirty when the data is not erased, a marked page keeps readable data
+(received after the last checkpoint, or the half of a straddling block whose
+other page was erased; it is compared when the block comes again); the tail of
+the last image page behind the image end must read erased (the bootloader
+reads whole pages before a swap, §10.3). Dirty pages: write-ahead – their
+overlapping blocks are cleared and checkpointed first, then the pages are
+erased and marked (a power loss in between leaves "data present, bit clear",
+which the next check finds again). After a resume every page of the image is
+marked, so a later resume never cascades into neighbouring pages. Recorded
+blocks are only checked for ECC errors here (the final CRC checks their
+content).
+
+**Leaving the session** (OTA end, a new session, 2 rounds without a valid
+block, battery < 2.3 V under load): CHECKPOINT (abort: END(aborted) instead,
+the progress is discarded; an abort that arrives outside a session also writes
+END(aborted) for a stored transfer, and erases page 118 when it ends in
+END(verified) – `revoke`); for silence, battery and end the sensor sends a
+**"left" UP at once** (off-time permitting; bit 4 = 0, status "left" + reason,
+the normal TLVs may ride along), so the gateway can answer with a new start
+(resume) within minutes. An UP with bit 4 = 1 that the gateway answers with an
+OTA end (pause) – it has no job for it – also ends the session (orphan
+session, progress kept). Normal reports continue; the 868.0 MHz duty cycle is
+unchanged throughout.
+
+**Completion** (bitmap complete, or "already verified"), in this order:
+
+1. every image page readable and the tail erased (`unreadablePage`) – else the
+   page is handled as dirty (`erasePage`) and the session goes on (its blocks
+   come again), not END(failed); then verify slot B – `sw_validate` (magic,
+   trailer version, size, load address, CRC read back, stack pointer, reset
+   vector), HW type = identity, image length / CRC / version = the start,
+   trailer flags: bit 0 set and 1 ≤ transfer version ≤ its own
+   (`trailerFlagsOk`) – else END(failed), status "failed", slot B left as it
+   is (the next transfer erases it);
+2. page 117 erased if it is not empty (allowed: the state is idle-like,
+   condition 4 still holds) – before END(verified), so a `REVERTED` / `KEPT`
+   found later was written after this verification (the shortcut refusal of
+   §14.4 then means exactly "this image went through a swap");
+3. END(verified) in page 118;
+4. battery ≥ 2.4 V under load (read during the verification with the radio
+   receiving) – else the **battery wait**: status "verified, battery low" in
+   every report from now on (normal reports at the interval, UP FCtrl bit 4 =
+   1), no block windows, no status slots; the sensor re-checks the battery at
+   every report and continues with step 5 when it recovers. An OTA end during
+   the wait: pause → the sensor leaves the wait (bit 4 = 0 afterwards), keeps
+   END(verified) and installs nothing until a new start; abort → `revoke`
+   (END(aborted), then page 118 erased) and "left 3". The wait also ends on a
+   reset, a rejoin or a battery dip below 2.3 V ("left 2"): bit 4 = 0
+   afterwards, and the gateway's next start finds "already verified";
+5. `PENDING` – from here an abort cannot stop the swap;
+6. the status "complete" in an UP as soon as the off-time allows (bit 4 = 0);
+7. restart → bootloader swap → join → `CONFIRMED` after the proven sleep
+   (§10.3).
+
+**Page 118 records** (`ota_state.h`; framing as page 117 with magic 0xA6: u8
+magic ‖ u8 type ‖ u16 arg LE ‖ u32 CRC-32 over bytes 0–3 and the payload, on
+8-byte boundaries, payload first and header last so a torn record never
+parses; multi-byte fields little endian as stored by the MCU – the layout is
+permanent): START (arg block count; 24 B: u32 image length, u32 image CRC, u32
+firmware version, u16 HW type, u8 block size, u8 transfer version, 8 B zero) =
+32 B; CHECKPOINT (arg blocks set; 72 B: 64 B block bitmap ‖ u64 slot B pages
+erased within this transfer) = 80 B; END (arg 1 verified, 2 aborted, 3 failed)
+= 8 B. The active transfer is the last START without an END after it, its
+state the last CHECKPOINT after it. A CHECKPOINT is appended only when 8 B for
+an END stay free behind it (25 per page); otherwise it compacts the page
+(erase, START, CHECKPOINT). A power loss inside a compaction either loses the
+START (the next start is a new transfer) or leaves the START with an empty
+bitmap and no marks (the resume erases every page with data) – a full
+retransmission either way. A torn page 118 erase may also leave an older
+CHECKPOINT readable whose blocks were erased since (known limit, caught by the
+final CRC at the cost of a retransmission). An END that finds no room (a torn
+record used the space) erases page 118 instead, which loses the "already
+verified" shortcut. A failed compaction ends the session (failed, flash; the
+RAM state is kept until then). An 88 kB OTA writes ~15–20 checkpoints: one
+page erase per OTA (10,000 cycles: not a limit).
+
+### 14.5 Gateway
+
+**Image store.** Upload on the gen2 page (logged in), streamed to LittleFS
+like the gateway's own firmware upload, never buffered in RAM: written to
+`/ota/upload.tmp` under the flash write permit (§7) while the CRC-32 runs over
+the stream (a leftover `upload.tmp` is deleted at boot); at the end validated
+– the file length equals the image size from vector word 0x20 plus the 32-byte
+trailer, trailer magic and version 1, load address 0x08002000, the CRC-32 over
+the image and the first 28 trailer bytes equals the stored one, size ≤
+114,688, **trailer flags bit 0 (OTA-capable) and 1 ≤ transfer version ≤ 1** –
+then stored as `/ota/hw<HHHH>.bin` with `/ota/hw<HHHH>.json` (HW type,
+firmware version, length, CRC, flags, upload time): the description is written
+to `/ota/meta.tmp`, then `upload.tmp` and `meta.tmp` are renamed in this order;
+when the last rename fails the `.json` is written directly, and only when that
+fails too (every description write counts only once it reads back as written)
+the HW type is left without an image. A `meta.tmp` left by a reset
+is dropped at boot without reading the `.bin` when `upload.tmp` was still
+there or `meta.tmp` is unreadable (the first boot after the reset; after a
+second reset during that boot `upload.tmp` is gone and the `.bin` is read once
+or twice, a CRC pass each); otherwise it is finished when the `.bin`
+passes the same verify as at the job start against it (trailer, firmware
+version, HW type, length, CRC), else dropped; a `.bin` matching neither
+description is deleted with its `.json`, as is a `.bin` or `.json` without its
+pair and a `.bin` whose file size differs from the length in its `.json`
+(such a pair is not listed either) – after a reset the store holds the old
+image, the new one or none, never a mismatched pair. A pair of equal length
+but different content (left by a firmware before this commit order) is caught
+only by the CRC check at the job start. One image per HW type (≤ 4
+types); an upload or a delete for a HW type with a job that is not terminal
+(Waiting, Transfer, Paused, Verified, Swapping, Confirming) is refused;
+otherwise it clears the terminal job of that HW type. HW type and version come
+from the trailer only (no file name parsing). An image without the OTA-capable
+flag (every image built before M4b: the field was 0) is refused with "the
+image has no OTA receiver – a sensor running it could not be updated over the
+air again". Block reads from LittleFS in `loop()` follow the flash permit rule
+(§7) like the configuration writes.
+
+**Starting** ("Update to vX" on the gen2 detail page). Refused, with the
+reason shown, when: no image for the sensor's HW type (from its JOIN_REQ);
+JOIN_REQ caps report no OTA receiver; no status report yet (the gateway
+requests one and enables the button when it arrives); status flags bit 2 (RTC
+not usable or time base failed – "the sensor cannot confirm an update. If its
+time base failed, it resets and rejoins by itself: try again after its next
+report. If the flag persists, the RTC is not usable: power-cycle the sensor;
+if that does not help, check the 32.768 kHz crystal");
+boot state 1 (unconfirmed image running – "wait for its confirmation");
+another job that is not terminal on this gateway (one at a time); the image is
+the one that reverted on this sensor (a per-sensor record in `sensors.json`:
+version + CRC of the last reverted image; after `REVERTED` the gateway never
+retries automatically, the admin may start it again explicitly, with a
+warning). Warnings that do not block: flag bit 1 (IWDG off); uplink or
+downlink margin (§4.3) below 10 dB ("expect many repeats"); a report interval
+above 1 h ("the start and every resume wait for the sensor's next report"). A
+downgrade (D5) and a reinstall of the running version need a confirmation and
+are logged. At job start the gateway re-verifies the stored image's CRC. The
+page shows the estimated duration before the start.
+
+**Transfer state machine** (`SensorManager`, RAM + `/ota/job.json`). The job
+record holds: DevID, HW type, image version / CRC, the firmware version and
+boot state of the target when the job started (the baseline, used to recognise
+the swap and to show "reverted before this job"), the binding FCnt32 of the
+expected accepting UP, the state, the counters of the no-progress rule, the
+flags `manualPause` and `abortPending`, and the deadlines – written on every
+state change and counter change, not per block. Deadlines are kept in unix
+time when the gateway has a valid clock, otherwise in uptime; an uptime
+deadline restarts after a gateway reboot. The gateway never builds an OTA
+frame under a session other than the one the accepting UP verified under; a
+new session needs a new start.
+
+**Order of evaluation.** For every UP of the target the gateway first applies
+its TLVs (a JOIN_REQ's version, the status report, OTA status events), then
+the state transitions below, and only then decides the DOWN. An OTA status
+event in an UP (complete, failed, verified-battery-low, refused, accepted –
+not "left") suppresses the start that the "UP with bit 4 = 0" rule would
+otherwise put into that DOWN – a "complete" UP never gets a start.
+
+**Events.**
+
+- *Swap seen*: a JOIN_REQ or status report of the target whose firmware
+  version equals the image's and differs from the baseline version (an upgrade
+  or downgrade has happened; no start is built for that session); for a
+  reinstall of the running version only a status report with the image's
+  version, boot state 1 and status flags bit 3 ("the bootloader wrote a swap
+  record in this boot", §4.1) counts.
+- *Installed*: a status report with the image's version and boot state 2
+  (confirmed) or 6 (KEPT: the new image runs unconfirmed and cannot be
+  reverted), after a swap was seen, with a version different from the
+  baseline, or with status flags bit 3 set (a reinstall whose boot-state-1
+  report was lost) – Done, or Done flagged "installed, unconfirmed, cannot be
+  reverted (KEPT)".
+- *Revert report*: a status report with boot state 3, 4, 5 or 7 **and** status
+  flags bit 3 set (the revert happened in this boot – the boot state alone
+  persists until the next completion and would fire on an old revert). Bit 3
+  stays set for the whole boot, so before "complete" / before a swap was seen
+  a revert report counts only when the job-start baseline was not already a
+  flagged revert (boot state 3/4/5/7 with bit 3); in Swapping and Confirming
+  every flagged revert counts. In every non-terminal state, and for 3 ×
+  T_confirm after a job ended Failed "not confirmed" / "no join after the
+  swap" or after an "installed despite abort", it writes the per-sensor
+  reverted record (version + CRC of the image); a non-terminal job becomes
+  Reverted.
+- *Refusal*: reason 6 (battery) → Paused, the start retried at most every 6 h
+  (origin: the last refusal, persisted – the **battery hold**); every other
+  reason → Failed with the reason – except refusal 5 "unconfirmed" in a
+  non-terminal job of this image's version → Confirming (only this job's
+  image can be the unconfirmed one).
+- *Battery leave*: "left 2" (battery below 2.3 V) in Transfer or Paused →
+  Paused "battery low" with the same battery hold, and **no start in that
+  DOWN** (the sensor would refuse it with 6 anyway); a job paused by the
+  admin keeps "paused by the admin" as its reason and only gets the hold. The admin's Resume lifts
+  a battery hold in Paused (from a refusal 6 or a "left 2"): the start goes
+  with the sensor's next report; a sensor still low refuses 6 again, which
+  arms the hold again. Resume is logged like every admin action.
+- *No progress*: a progress status counts only when the gateway launched at
+  least K/4 blocks since the previous status; progress = a new maximum of
+  confirmed blocks (base + bits in the window) for this job; base = block
+  count is exempt; an "accepted" sets the maximum to what it reports (less:
+  the sensor restarted the transfer, e.g. after a lost compaction); a status
+  whose base is below the previous base (the sensor erased a dirty page below
+  it) is not counted, for at most 4 such statuses per job; the maximum stays
+  the high-water mark, so a page that keeps failing still ends in "no
+  progress". 4 counted statuses without progress → Failed "no progress". Laps: 3
+  consecutive "accepted → left 1 (silence)" laps without progress → Failed "no
+  progress"; a manual Pause / Resume breaks the chain. A starved gateway (the
+  sensor left for silence and the gateway launched fewer than K/4 blocks in
+  the window) is not the sensor's fault: Paused with a back-off before the
+  next start (1 h, doubling up to 6 h), not Failed. The window is the 2
+  rounds before the leave (or before the pause by missed statuses, when the
+  "left 1" arrives in Paused), but it starts no earlier than the moment the
+  job (re)entered Transfer (an accept, a progress status bringing a Paused job
+  back, or the start whose status took over the binding – a start sent before
+  a gateway reboot does not count, the re-entry does): launches before it
+  belong to another schedule, and none go while Paused. When the window
+  clamped this way is shorter than one round it says nothing about the
+  gateway – the leave is a real one ("left", laps counted as usual, no
+  back-off). A pause by missed statuses is classified once: a second "left 1"
+  before the job is back in Transfer is not counted again.
+
+| Event ↓ / State → | Waiting | Transfer | Paused | Verified | Swapping | Confirming |
+|---|---|---|---|---|---|---|
+| accepted (+ progress) | → Transfer (anchor: RxDone if reliable, else the first progress status re-anchors; no blocks until then) | view rebuilt, stays | → Transfer (unless `manualPause`: answered with OTA end pause, a start sent before the Pause was accepted) | progress complete: stays (the "already verified" answer; "complete" or "verified, battery low" follows); progress incomplete: → Transfer (the sensor started a new transfer or a resume, e.g. after an END without room erased page 118) | ignored | ignored |
+| progress status (bit 4 = 1) | accepting UP missed: a new start in this DOWN (stays Waiting, new binding; the "no accept" deadline runs again from this status) | view replaced, re-anchored, no-progress rule | → Transfer, re-anchored (unless `manualPause`: answered with OTA end pause). When a start went out in this status's session and its accepting UP was not seen (lost – a start goes only to a sensor that left its session), the status takes over that start's binding (the UP it answered + 1) and the session, also in the same session; else, from a session no accepting UP of this job verified under, a new start in this DOWN (not while `manualPause`, not during the back-off or the battery hold), stays Paused | not sent in the wait | ignored | ignored |
+| refused | see *Refusal* | – (no start sent) | see *Refusal* | 6 → stays (retry ≤ every 6 h); other → Failed | ignored | ignored |
+| failed | → Failed | → Failed | → Failed | → Failed | ignored | ignored |
+| left 1 (silence) | stays; start in this DOWN | → Paused + start in this DOWN (not during the starved back-off) | stays; start in this DOWN (not while `manualPause`, not during the back-off or the battery hold) | stays; start in this DOWN (after a Transfer from Verified; the sensor answers "already verified", refuses 6, or resumes) | ignored | ignored |
+| left 2 (battery) | stays; start in this DOWN | → Paused "battery low", battery hold (6 h), no start | stays, battery hold (6 h), no start | stays; start in this DOWN (the battery wait ended on a dip below 2.3 V; the sensor answers "already verified" or refuses 6) | ignored | ignored |
+| left 3 (OTA end) | stays | → Paused + start in this DOWN (not while `manualPause`, not during the back-off or the battery hold) | stays; start in this DOWN (not while `manualPause`, e.g. Resume before the "left 3" arrived, not during the back-off or the battery hold) | cannot occur with a job (an OTA end reaches a Verified sensor only after Abort or Clear job, when the job is terminal or gone) | ignored | ignored |
+| complete | → Swapping | → Swapping | → Swapping | → Swapping | stays | ignored |
+| verified, battery low (repeated in every report of the wait) | → Verified | → Verified | → Verified | stays | ignored | ignored |
+| swap seen | → Confirming | → Confirming | → Confirming | → Confirming | → Confirming | stays |
+| installed (boot state 2 / 6) | → Done (flagged for 6) | → Done | → Done | → Done | → Done | → Done |
+| revert report | → Reverted | → Reverted | → Reverted | → Reverted | → Reverted | → Reverted |
+| UP with bit 4 = 0, no event | start in this DOWN (SESSION, `inSync`) | → Paused + start in this DOWN | start in this DOWN (not while `manualPause`, not during the back-off or the battery hold) | start in this DOWN (sensor reset / rejoin ended the wait; it answers "already verified") | ignored | ignored |
+| UP with bit 4 = 1, no event | – (see progress) | stays | see progress | stays (the wait) | – | – |
+| new session (JOIN_REQ, old version) | stays | → Paused (the start goes in the first DOWN of the new session) | stays | stays (start in the first DOWN) | stays | stays |
+| deadline | max(3 intervals, 3 × (K + 1) × C) from queueing, re-armed by the first 4 starts sent and by every progress status in Waiting, without "accepted" → Failed "no accept" (a sensor that never receives a start fails after 4 starts) | 2 status slots without a status → Paused | 7 days from the first entry into Paused (not re-armed; the clock runs only while the job is Paused – a job back in Transfer is not aborted on day 7) → Aborted | 7 days while in Verified → Aborted | 4 h + 2 intervals from "complete" → Failed "no join after the swap" | 3 × T_confirm + 2 intervals from entering Confirming → Failed "not confirmed" |
+| Abort (admin) | → Aborted, `abortPending` | → Aborted, `abortPending`, OTA end abort in the next block slot | → Aborted, `abortPending` | → Aborted, `abortPending` | Clear job only | Clear job only |
+| Pause / Resume (admin) | – | Pause: → Paused, `manualPause`, OTA end pause in the next block slot | Resume (while `manualPause` or a battery hold): `manualPause` and the battery hold cleared, the next UP with bit 4 = 0 gets a start | – | – | – |
+| Clear job (admin) | – | – | – | job removed | job removed | job removed |
+| gateway reboot | stays Waiting (deadline kept) | → Paused | stays Paused | stays Verified | stays Swapping | stays Confirming |
+
+**Abort delivery.** Abort is terminal at the click, but `abortPending` stays
+set (persisted) until the sensor's "left 3" or an UP with bit 4 = 0 arrives,
+or 2 rounds have passed: meanwhile every UP of that sensor with bit 4 = 1 is
+answered with OTA end abort, and the next DOWN to that sensor carries one. An
+UP with bit 4 = 0 clears the flag before its DOWN is chosen (order of
+evaluation), so an out-of-session sensor never gets the abort – harmless, it
+holds no session. It keeps its transfer state (START in page 118, or
+END(verified)), though: a later job with the same image resumes from it
+(accepted, arg 1) or takes the shortcut, which is safe – the image identity
+and the final CRC decide, as for any resume. The gateway therefore marks an
+abort in Transfer, Paused or Verified (or in Waiting after a start went out)
+as unconfirmed until an UP with bit 4 = 1 has been answered with OTA end abort
+or a "left 3" arrives; when the flag ends on an UP with bit 4 = 0 or expires
+while unconfirmed, the job is shown and logged as "the sensor did not confirm
+the abort; its transfer state may stay, and a job with the same image would
+resume it" – the gateway cannot know (a lost "left 3" looks the same). A swap
+seen in that UP or later (Done "installed despite abort") drops the mark. The
+confirmation and the admin message of every Abort say so: a sensor still in
+its session discards the transfer, otherwise its transfer state may stay.
+`abortPending` expires after 2 rounds, which can be before a Verified sensor's
+next report: that UP is then an orphan and gets a pause – the sensor leaves
+the wait, keeps END(verified), and nothing installs (only an explicit new
+start of that image would use the shortcut). A Retry / new job while the flag
+is set overwrites it; the sensor then falls under the new job. An abort that
+reaches the sensor after it wrote `PENDING` cannot stop the swap; a later swap
+of that image is shown as "installed despite abort".
+
+**Clear job** (Verified, Swapping, Confirming) removes the job from the
+gateway. In Verified the sensor's next UP with bit 4 = 1 is then an orphan and
+is answered with OTA end pause: the sensor leaves the battery wait, keeps
+END(verified) and installs nothing until a new start – so Clear job does stop
+an installation in Verified. In Swapping and Confirming the image is already
+installed or installing; a later swap seen / installed / revert report is
+shown as an update without a job (a revert report still writes the reverted
+record).
+
+**Orphan sessions.** An UP with bit 4 = 1 from a sensor without a non-terminal
+job (job cleared, abort lost, `job.json` lost) is answered with an OTA end –
+abort while `abortPending`, otherwise pause. When a job for another sensor
+starts, the finished job's revert watch and `abortPending` move to its sensor's
+record (`sensors.json`), so they keep working; a deleted sensor takes its job
+with it. An OTA end that does not fit a DOWN next to the configuration waits
+for the next DOWN (the conditions that asked for it still hold then).
+
+Every event that arrives after the job's state has moved on is ignored (e.g. a
+late "complete" while Confirming). A sensor restart or rejoin is the same from
+the gateway's view (a new session; see the table).
+
+**Block choice** (per block slot, in `loop()`): the gateway keeps a confirmed
+bitmap and a sent-since-status bitmap. **Every progress status replaces the
+confirmed view** (`Bitmap::applyStatus`; a status with a base past the block
+count is ignored and counted as a missed status): below the base everything is
+confirmed, inside the 64-block window exactly the reported bits, above it
+nothing – the sensor's bitmap can shrink (resume check, dirty page, a lost
+compaction). Every "accepted" rebuilds it (new: empty; resumed: from the
+progress in that UP), and every status clears the sent-since bitmap. The
+gateway sends the lowest block among the 64 from the base of the last status
+that is neither confirmed nor sent since that status; when all are sent, the
+lowest unconfirmed one again (a lost status or block). It never sends beyond
+the window, so the sensor's 64-bit window always covers what is in flight. At
+K = 32 one lost status leaves a full round to send; after two the gateway
+repeats unconfirmed blocks.
+
+**Launch** (radio task, new request type "OTA frame": one 255-byte frame slot
+plus launch time, DevID and kind – not the 2 × 96-byte `TxRequest` frames):
+`loop()` reads the block, builds the frame (CTR + CMAC under the sensor's Ks,
+binding = accept FCnt32) ≥ 300 ms before the slot and hands it over; a frame
+whose session ended meanwhile is cancelled. At launch − 20 ms the radio task
+checks and otherwise skips the slot (outcome reported, the block stays
+unsent):
+
+- no header is being received, and no RX1 / RX2 window of any sensor overlaps
+  [launch − turnaround, launch + airtime + turnaround] – counting every
+  generation 2 UP received in the last ≈ 2.4 s, also when its response has not
+  been handed over yet; OTA is the lowest priority, it never pre-empts a
+  reception or a response;
+- the block ends before the next known uplink slot of any generation 2 sensor
+  (slot offset with a valid clock, ± 2 s) – generation 1 uplinks and
+  generation 2 sensors without a clock are not known;
+- duty cycle: the OTA airtime of the sliding hour stays ≤ 60 % of the data
+  share (172.8 s), inside the data share (288 s), so ACKs and JOIN_ACCs keep
+  their shares; pacing 9 × t applies OTA → OTA only (a timed response may
+  follow a block after the radio turnaround and is not delayed by it);
+- the launch is not more than 15 ms late.
+
+`loop()` stalls (e.g. LTE AT commands on the Pro) skip slots whose frame was
+not handed over in time; the hardware test measures the skip rate with LTE on.
+
+**Cadence**: C = the smallest whole number of seconds with frame airtime ×
+K/(K+1) ≤ 4.8 % of C (`cadenceFor`), and (K + 1) × C ≥ 720 s: 26 s at SF9 / K
+= 32 (at most 170.4 s in any sliding hour; the budget check, not the schedule,
+is the guard – 2.4 s of headroom).
+
+**Progress in the UI** (gen2 detail page and `/diag/heap` → `ota`): state,
+image version, blocks confirmed / missing / sent (repeats), rounds, statuses
+missed, airtime used (session and the sliding hour), ETA = missing blocks × C
+× (K+1)/K / (1 − r) / (1 − s), r = repeats per launched block, s = unused
+block slots per slot (both observed, capped at 80 %; in Done confirmed = the
+block count, missing = 0 – the sensor verified the whole image), the last
+status time and the refusal / failure / leave reason in words; buttons Abort
+(Waiting, Transfer, Paused, Verified; delivered as described above), Pause /
+Resume (Transfer / Paused; OTA end pause, the progress is kept, persisted as
+`manualPause`; Resume also in Paused under a battery hold, which it lifts),
+Clear job (Verified, Swapping, Confirming; gateway only) and, after Reverted /
+Failed / Aborted, Retry. While a job is in Transfer the sensor's "last heard"
+/ Home Assistant availability uses (K + 1) × C instead of its interval
+(reports ride in the statuses).
+
+### 14.6 Failure cases
+
+| Case | Sensor | Gateway | Result |
+|---|---|---|---|
+| Block lost | window stays clear | repeats it after the status | +1 block |
+| Status lost (or skipped by the off-time) | nothing | goes on in the window, repeats after 2 | repeats |
+| Accepting UP lost | runs the schedule | Waiting: the first progress status gets a new start (the deadline of 3 rounds from the start also covers a lost first status); Paused: the first progress status of that session takes over the start's binding | one accept lost, resume |
+| Accepting UP with an unreliable timestamp | runs the schedule | no blocks until the first status | ≤ 1 round lost |
+| 2 statuses lost | still listening; after 2 rounds leaves, sends "left" | Paused; the "left" UP gets a new start | resume |
+| Gateway reboot | silence → leaves after 2 rounds, "left" UP → REJOIN | job restored (Waiting / Verified / Swapping / Confirming stay, Transfer → Paused), start in the first DOWN of the new session where the table says so | resume |
+| Sensor reset mid-transfer | rejoins; resume check | new session → Paused → start | resume, ≤ 1 round lost |
+| Rejoin (missed ACKs) | leaves (new session) | Paused → start | resume |
+| Power loss during a page 118 record | torn record ignored, previous checkpoint used | – | resume |
+| Power loss in a page 118 compaction | START lost, or kept with an empty bitmap | "accepted" rebuilds the view | full retransmission |
+| Torn page 118 erase resurrects an older CHECKPOINT | blocks claimed that were erased since | – | caught by the final CRC: failed, retransmission (known limit) |
+| Torn erase leaves ECC errors behind the image end | resume / completion check finds the tail | – | that page again, then completes |
+| Readable wrong data in a straddling block's second page | that page is dirty (failing double word) | – | the block comes again |
+| Power loss during the slot B erase at start | START without erased-page marks; the resume check erases what is not clean | – | resume |
+| Power loss between a CHECKPOINT and a page erase (write-ahead) | "data present, bit clear", found by the next check | – | resume |
+| Battery < 2.3 V under load | leaves, "left 2" UP | Paused "battery low", no start for 6 h (battery hold; the admin's Resume lifts it) | resume when the battery is ≥ 2.4 V |
+| Battery low at completion | battery wait, the event in every report | Verified | completes when the battery recovers; after a reset or rejoin the next start finds "already verified" |
+| Battery still low on such a start | refused 6 | stays Verified, retry ≤ every 6 h | completes later or Aborted after 7 days |
+| Reset between verification and `PENDING` | "already verified" on the next start | Verified (or Paused) → start on the next UP with bit 4 = 0 | completes, no retransmission |
+| Verification fails | END(failed), status "failed" | Failed, Retry offered (a new transfer) | – |
+| Abort | END(aborted); in the battery wait page 118 erased (`revoke`); out of its session nothing reaches it: transfer state kept | Aborted, `abortPending` until "left 3" / bit 4 = 0 / 2 rounds | – ; after `PENDING` the swap still happens ("installed despite abort"); not confirmed (the flag ended by an UP with bit 4 = 0 without "left 3", or expired): shown as "the sensor did not confirm the abort; its transfer state may stay, and a job with the same image would resume it" |
+| Refusal 6 (battery) at a start | refused 6 | Paused, retry ≤ every 6 h (the admin's Resume lifts the hold) | resume when the battery recovers |
+| No progress | – | Failed after 4 counted statuses or 3 laps | Retry |
+| Swapping never answered (sensor dead, bootloader Standby) | – | Failed "no join after the swap" after 4 h + 2 intervals | – |
+| Orphan session (job cleared / lost) | leaves on OTA end pause (abort while `abortPending`) | – | progress kept |
+| New image verified, swap reverted | `REVERTED` (§10.3) | Reverted, no automatic retry | old image keeps running |
+| "complete" UP lost | swaps and joins | swap seen (version ≠ baseline, or boot state 1 + flag bit 3) → Confirming | – |
+| Gateway cannot transmit (budget, receptions, loop stalls) | empty windows; leaves after 2 rounds, "left 1" UP | starved (window: the 2 rounds before the leave or the pause by missed statuses, not before the job (re)entered Transfer, at least one round): Paused with a back-off of 1 h doubling to 6 h, then a start | slower, no Failed |
+
+### 14.7 Resources
+
+- **Gateway LittleFS**: Lite 1.31 MB (partition `spiffs` 0x150000 in
+  `partitions/huge_app_littlefs.csv`), Pro 8.06 MB (0x7E0000 in
+  `pro_16MB.csv`); today it holds only small files (`config.json`,
+  `sensors.json` / `.bak`, `ncsi.txt`). One image ≤ 112 kB per HW type plus
+  the upload temporary file: ≤ 4 types × 112 kB + 112 kB = 560 kB on the Lite.
+- **Gateway RAM** (measured, M4b stage 2): ≈ 1 kB static (the 280-byte OTA
+  frame slot shared by `loop()` and the radio task, the OTA airtime window of
+  the duty cycle, the result queue, the recent-RxDone ring, upload state); the
+  job ≈ 500 B on the heap only while a job exists (state, counters, deadlines,
+  the confirmed, sent-since and ever-sent bitmaps); block, payload and frame
+  buffers ≈ 0.7 kB on the `loop()` stack while a frame is built. On the Pro
+  (no PSRAM) the free heap drops by ≈ 2 kB.
+- **Sensor RAM**: bitmap 64 B, page 118 state ≈ 110 B, the received frame 255
+  B + its payload 243 B (decrypted in place where possible) – < 700 B of 64 kB
+  (today 8.1 kB used).
+- **Sensor flash**: page 118 (§14.4); slot B erased once per new transfer;
+  each block programmed once (a dirty page is erased again).
+- **Code size**: the receiver must fit the 112 kB slot with margin; `e77` is
+  81.0 kB today (70.7 %).
+
+### 14.8 Sensor energy per OTA (D6)
+
+Assumptions (to be confirmed by the owner's current measurement): RX ≈ 7 mA
+(radio ≈ 5 mA, MCU in Sleep and TCXO ≈ 2 mA; with the MCU busy-waiting in Run
+at 48 MHz ≈ 10 mA → ≈ 1.7 mAh per OTA, still within D6), TX at 14 dBm ≈ 45 mA,
+flash erase / program ≈ 7 mA; a block window = 20 ms lead + 6 ms drift + 1.263
+s frame; an empty window = 20 + 2 × 6 + 200 ms; the status adds 14 bytes to a
+report the sensor sends anyway.
+
+| Image | Received block windows | Empty windows | Erase + swap | Total |
+|---|---|---|---|---|
+| 88 kB, 15 % repeats, 5 % skips | 447 × 1.29 s × 7 mA = 1.12 mAh | 24 × 0.23 s × 7 mA = 0.01 mAh | 1.2 s × 7 mA + 7.4 s × 5 mA = 0.01 mAh | **≈ 1.2 mAh** |
+| 100 kB, same | 508 × … = 1.27 mAh | 28 × … = 0.01 mAh | 0.01 mAh | **≈ 1.3 mAh** |
+
+Continuous RX for the same 3.5–4 h (class C) would cost 20–28 mAh, so the
+scheduled windows stay the design (D6). 2 × AA hold ≈ 2,500 mAh: an OTA costs
+≈ 0.05 % of the cells. Listening through a 2-round silence costs ≈ 0.03 mAh.
+
+### 14.9 Security
+
+- OTA frames are encrypted and authenticated with the session keys Ks_enc /
+  Ks_mic of one sensor (§2, §3.5). A session frame verifies only with the
+  binding (the FCnt32 of the UP that accepted this OTA start in this session),
+  so frames of an earlier transfer or session never verify; replay inside the
+  session is stopped by the DOWN FCnt window (§5.3). A start is never accepted
+  under a dying session (REJOINING, §14.4).
+- An attacker without the label key can jam (slower, then Paused) or replay
+  old frames (rejected); garbage frames cost the sensor at most the scheduled
+  windows and never extend a session (only valid blocks reset the silence
+  timer). A REJOIN (§5.4) can be triggered only for a DevID the gateway has no
+  session for, so not during a transfer. The sensor's slot A image is never
+  touched by the transfer.
+- An attacker **with the label key of one sensor** (printed on it) can derive
+  its keys, run a session and install any image of the right HW type and
+  trailer format on **that sensor only** (keys are per device). The image is
+  **not signed**: the trailer CRC only protects against transfer errors.
+  **Known limit**, consistent with the owner's stance that firmware signing is
+  not wanted (open source, users build their own): the label key is the trust
+  anchor, as for joining; without read-out protection (§10.2) whoever can read
+  the label can also reflash the unit over SWD anyway. D5 allows downgrades,
+  so a signed scheme would also need a rollback rule.
+- If signing is ever wanted it must be in the **first shipped firmware**: a
+  unit can only be moved to an enforcing image by an unsigned OTA – exactly
+  what a key holder can also do (ship-gate decision, §14.10). Bootloader 0.5
+  accepts only trailer version 1 and is never updated over the air, so the
+  signature cannot go into a grown trailer: it would sit in the image body (a
+  signed region before the trailer, found through a vector-table word) or in a
+  second trailing record before the 32-byte trailer, checked by the
+  application before `PENDING`; an optional public key in the identity page
+  (empty = unsigned) keeps self-built firmware working. About 4–6 kB of code.
+- The image store on the gateway is behind the admin login; the upload is
+  validated and the CRC re-verified at every job start (§14.5).
+
+### 14.10 Open questions for the owner
+
+**Decided 2026-10-19: the owner accepted all defaults below (Q1–Q15); they
+apply.** Each with the recommended default:
+
+1. Image signing – **no** (known limit §14.9; the owner's earlier stance).
+   This is a ship-gate decision: it must be in the first shipped firmware to
+   be effective (Q14).
+2. Reports during an OTA ride in the status UP (≈ every 14 min instead of the
+   interval) – **yes** (saves the sensor's duty cycle and avoids skipped
+   statuses; Q13).
+3. Packets lost while the gateway transmits blocks – **accept**: the gateway
+   is deaf on 868.0 MHz ≈ 5.5 % of the time (≤ 170 s of TX per hour + the
+   switching), so ≈ 6–7 % of the generation 1 packets (a packet overlapping a
+   block or starting just before it is lost) and ≈ 6 % of the UPs of
+   generation 2 sensors without a known slot; a later option could limit OTAs
+   to night hours.
+4. One OTA at a time per gateway – **yes**.
+5. Downgrade (D5) and reinstall of the same version – **allowed with a
+   confirmation, logged**.
+6. Battery threshold 2.4 V (start, before `PENDING`) / 2.3 V (leave), measured
+   while the radio receives – **yes** (see Q10).
+7. Bootloader faults → timed Standby with the retry cap (§10.3) – **yes, in
+   M4b**, with the fault counter in TAMP BKP9R cleared only by the application
+   after its first completed cycle, so the cap of 8 holds for a deterministic
+   fault. The bootloader is never updated over the air, so units shipped
+   before it keep the old behaviour (ship gate).
+8. Status UP on 868.0 MHz (D7) – **yes** (869.525 MHz would need a
+   gateway-opened window).
+9. Lifetime of a Paused (or Verified) job – **7 days, then Aborted**; Swapping
+   ends after 4 h + 2 intervals without the new version (Failed); Verified,
+   Swapping and Confirming also offer "Clear job" (gateway only) – otherwise a
+   dead sensor would block every other OTA on the gateway.
+10. Battery chemistry: the 2.4 / 2.3 V thresholds assume alkaline or lithium
+    AA – **keep them**; 2 × NiMH (2.4–2.6 V nominal) would be refused or leave
+    sessions and would need 2.2 / 2.1 V.
+11. The sensor refuses an image without the OTA-capable flag too (at
+    completion, failed: trailer) – **yes** (defence in depth: a gateway bug or
+    a third-party gateway cannot install a firmware that can never be updated
+    again).
+12. Uplink or downlink margin below 10 dB – **warn only**, do not block.
+13. Sensors with a shorter interval report less often during the 3–4 h (every
+    (K + 1) × C ≈ 14 min) – **accept**.
+14. Signing before the first shipment (a user-supplied key in the identity
+    page, Q1) – **no**, decided now as the ship-gate default.
+15. Sensors with a long interval wait up to one interval for the start and for
+    every resume – **warn above 1 h**, no automatic interval change.
+
+### 14.11 Implementation checklist
+
+- Sensor: `image_trailer.h` documents the flags; `image_trailer.py` writes
+  them from `custom_ota_transfer` (set to 1 in `[env]`); `sw_validate`
+  unchanged; the receiver (sessions, windows on the RTC / LPTIM time base,
+  IWDG per slot, block window ≥ 1.6 s), `ota_state.h` as tested (`writeBlock`
+  reports the failing page, `unreadablePage` before verification and for the
+  shortcut, `verifiedFor` with the last page 117 record, `revoke`, `startNew`
+  closing a refused start with END(failed), the one retry of a page 118
+  record), completion order of §14.4 including the battery wait with bit 4 =
+  1, "left" / "accepted" UPs, report riding in the status UP, UP FCtrl bit 4,
+  JOIN_REQ caps bits 2–3, status flags bit 3 (swap record in this boot), the
+  accepting UP as the next UP after the start (POLLs / retransmissions /
+  events deferred), the application clears BKP9R after its first completed
+  cycle.
+- Bootloader (with M4b, every variant ≤ 8,192 B, tested for every fault type
+  with `BL_FAULT_TEST`): faults → timed Standby, fault counter in BKP9R (never
+  cleared by the bootloader; today `main.c` clears only BKP10R on a normal
+  boot and has no BKP9R handling – both are implementation items), one console
+  line per fault.
+- Both: `ep::maxPayload` in the UP / DOWN decoders; OTA session DOWN rules of
+  §14.2.
+- Gateway: image store (`/ota/`, streamed upload, validation, delete,
+  `upload.tmp` cleanup), job state machine and `/ota/job.json`, the per-sensor
+  reverted record in `sensors.json`, radio task OTA frame slot and launch
+  checks (15 ms late limit, pending-response look-back), OTA share and pacing
+  in the duty cycle, anchoring by status slot index, the state matrix of §14.5
+  with its order of evaluation, deadlines (unix time / uptime), baseline,
+  binding FCnt, no-progress counters, back-off, `abortPending`, `manualPause`,
+  orphan sessions, the gen2 page (start checks, warnings, progress, ETA, Abort
+  / Pause / Resume / Clear job / Retry), `/diag/heap` → `ota`, availability
+  during a transfer.
+- Tests: `test_ota_state` already runs an end-to-end power-loss fuzz (torn
+  erases and programs, old data partly equal to the new image, straddling
+  blocks, "flash equals the image" at completion, no cascade); the
+  implementation keeps it and adds its own driver.
+- Hardware verification (assignment list plus): a power cut during a block
+  write, a CHECKPOINT, a compaction, the slot B erase and each completion
+  step; a gateway reboot and a sensor reset in every job state; a rejoin
+  mid-transfer; the low-battery refusal and the battery wait; a revert after
+  an OTA; a reinstall of the running version; Abort / Pause / Clear job in
+  every state; the attack suite; the skip rate with LTE on (Pro).

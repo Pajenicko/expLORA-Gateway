@@ -125,6 +125,11 @@ struct Queue
 {
     bool config = false;        // configuration differs from the reported version
     bool statusRequest = false; // admin asked for a status report
+    // An OTA TLV (spec 14.2): a start goes alone with the time (otaOnly, the
+    // sensor runs the desired configuration then), an OTA end after the rest
+    const uint8_t *ota = nullptr;
+    uint8_t otaLen = 0;
+    bool otaOnly = false;
 };
 
 // DOWN payload: time first (cheap, keeps the clock right), then the complete
@@ -145,6 +150,20 @@ inline size_t buildDown(const Values &v, uint32_t unixTime, Queue &q, uint8_t *o
             len = w.size();
         }
     }
+    if (q.ota != nullptr && q.otaOnly)
+    {
+        if (len + q.otaLen <= cap)
+        {
+            for (size_t i = 0; i < q.otaLen; i++)
+            {
+                out[len + i] = q.ota[i];
+            }
+            len += q.otaLen;
+            q.ota = nullptr;
+        }
+        morePending = false;
+        return len;
+    }
     if (q.config)
     {
         uint8_t tmp[24];
@@ -164,6 +183,15 @@ inline size_t buildDown(const Values &v, uint32_t unixTime, Queue &q, uint8_t *o
         out[len++] = ep::down::kStatusRequest;
         out[len++] = 0;
         q.statusRequest = false;
+    }
+    if (q.ota != nullptr && len + q.otaLen <= cap)
+    {
+        for (size_t i = 0; i < q.otaLen; i++)
+        {
+            out[len + i] = q.ota[i];
+        }
+        len += q.otaLen;
+        q.ota = nullptr;
     }
     morePending = q.config || q.statusRequest;
     return len;

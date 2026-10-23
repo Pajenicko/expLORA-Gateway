@@ -91,7 +91,7 @@ bool needsDown(const Gen2Sensor &g, bool ackRequested)
 }
 
 bool buildDown(Gen2Sensor &g, uint32_t upFcnt32, bool ackRequested, bool confirmed, int64_t rxTimeUs,
-               TxRequest &req)
+               TxRequest &req, const uint8_t *ota, uint8_t otaLen, bool otaOnly, bool *otaPlaced)
 {
     Gen2Session &s = g.sessions.current;
     if (!s.valid)
@@ -106,9 +106,16 @@ bool buildDown(Gen2Sensor &g, uint32_t upFcnt32, bool ackRequested, bool confirm
         Gen2Config::Queue q;
         q.config = !Gen2Config::inSync(g.configVersion, g.cfgVersion);
         q.statusRequest = g.statusRequested;
+        q.ota = ota;
+        q.otaLen = otaLen;
+        q.otaOnly = otaOnly;
         bool more = false;
         uint8_t tlv[Gen2Config::MAX_DOWN_PAYLOAD];
         size_t tlvLen = Gen2Config::buildDown(g.config, unixAtLaunch(rxTimeUs, w == 1), q, tlv, sizeof(tlv), more);
+        if (w == 0 && otaPlaced != nullptr)
+        {
+            *otaPlaced = ota != nullptr && q.ota == nullptr; // an OTA TLV that did not fit waits for the next DOWN
+        }
         configSent = configSent || (!q.config && !Gen2Config::inSync(g.configVersion, g.cfgVersion));
         uint8_t fctrl = (uint8_t)((ackRequested ? ep::kFctrlAck : 0) | (more ? ep::kFctrlPending : 0) |
                                   (g.cfgVersion & ep::kFctrlCfgMask));
@@ -131,7 +138,7 @@ bool buildDown(Gen2Sensor &g, uint32_t upFcnt32, bool ackRequested, bool confirm
     return true;
 }
 
-bool decodeUp(Gen2Sensor &g, const uint8_t *payload, size_t len, unsigned long nowMs)
+bool decodeUp(Gen2Sensor &g, const uint8_t *payload, size_t len, unsigned long nowMs, OtaJob::Up *ota)
 {
     bool confirmed = false;
     g.lastUpLen = (uint8_t)(len < sizeof(g.lastUp) ? len : sizeof(g.lastUp));
@@ -152,6 +159,19 @@ bool decodeUp(Gen2Sensor &g, const uint8_t *payload, size_t len, unsigned long n
             g.statusMs = nowMs;
             g.statusRequested = false;
             Gen2Config::statusBootInfo(t.value, t.len, g.bootState, g.blVersion);
+            if (t.len >= 24 && t.value[0] == 1)
+            {
+                g.statusFlags = t.value[21];
+                g.statusFw = true;
+                if (ota != nullptr)
+                {
+                    ota->hasStatus = true;
+                    ota->hasFw = true;
+                    ota->fw = (uint32_t)t.value[1] << 16 | (uint32_t)t.value[2] << 8 | t.value[3];
+                    ota->boot = t.value[22];
+                    ota->flags = t.value[21];
+                }
+            }
             if (t.len >= 16 && Gen2Config::inSync(g.configVersion, g.cfgVersion))
             {
                 g.reportedTx = (int8_t)t.value[15]; // the power the sensor really uses (spec 4.3)
@@ -162,6 +182,54 @@ bool decodeUp(Gen2Sensor &g, const uint8_t *payload, size_t len, unsigned long n
         if (t.channel != 0)
         {
             continue; // other channels: shown from lastUp on the detail page
+        }
+        if (t.type == ep::up::kOtaStatus)
+        {
+            ep::ota::Status st;
+            if (!ep::ota::decodeStatus(t.value, t.len, st))
+            {
+                continue; // unknown form: ignored
+            }
+            g.otaStatuses++;
+            if (ota == nullptr)
+            {
+                continue;
+            }
+            switch (st.kind)
+            {
+            case ep::ota::StatusKind::Progress:
+                ota->progress = true;
+                ota->base = st.base;
+                ota->window = st.window;
+                ota->slot = st.slot;
+                break;
+            case ep::ota::StatusKind::Accepted:
+                ota->accepted = true;
+                ota->acceptedArg = st.arg;
+                break;
+            case ep::ota::StatusKind::Refused:
+                ota->refused = true;
+                ota->refusedArg = st.arg;
+                break;
+            case ep::ota::StatusKind::Complete:
+                ota->complete = true;
+                break;
+            case ep::ota::StatusKind::Failed:
+                ota->failed = true;
+                ota->failedArg = st.arg;
+                break;
+            case ep::ota::StatusKind::Left:
+                ota->left = true;
+                ota->leftArg = st.arg;
+                break;
+            case ep::ota::StatusKind::BatteryLow:
+                ota->batteryLow = true;
+                ota->batteryArg = st.arg;
+                break;
+            default:
+                break; // unknown kinds are skipped
+            }
+            continue;
         }
         switch (t.type)
         {

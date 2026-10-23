@@ -25,6 +25,7 @@
 #include "../Protocol/Gen2Config.h"
 #include "../Protocol/Gen2Link.h"
 #include "../Protocol/Gen2Session.h"
+#include "../Protocol/OtaJob.h"
 
 #ifndef MAX_GEN2_SENSORS
 #define MAX_GEN2_SENSORS 10 // RAM budget of the Pro (no PSRAM); separate from MAX_SENSORS
@@ -53,6 +54,17 @@ struct Gen2Sensor
     uint8_t fwMajor = 0, fwMinor = 0, fwPatch = 0;
     uint8_t bootState = 0xFF; // 0xFF unknown
     uint8_t blVersion = 0;    // bootloader version (major << 4 | minor), 0 unknown
+    // OTA (spec 14.5): the image that reverted on this sensor - never retried
+    // automatically, the admin may start it again explicitly with a warning
+    bool hasReverted = false;
+    uint32_t revertedFw = 0;
+    uint32_t revertedCrc = 0;
+    // Leftovers of this sensor's finished OTA job, kept here so that a job for
+    // another sensor does not drop them (persisted): the revert watch (3 x
+    // T_confirm, image version + CRC) and a pending abort
+    OtaJob::Deadline otaWatch;
+    uint32_t otaWatchFw = 0, otaWatchCrc = 0;
+    OtaJob::Deadline otaAbort;
 
     // Desired configuration (sent in JOIN_ACC and, on a version mismatch, in a DOWN)
     Gen2Config::Values config;
@@ -107,6 +119,9 @@ struct Gen2Sensor
     uint8_t lastUp[48] = {};         // TLVs of the last UP (all channels, shown on the detail page)
     uint8_t lastUpLen = 0;
     bool statusRequested = false;    // admin asked for a status report: sent in every DOWN until it arrives
+    uint8_t statusFlags = 0;         // flags byte of the last status report (spec 4.1)
+    bool statusFw = false;           // the last status report carried a firmware version
+    uint32_t otaStatuses = 0;        // OTA status TLVs received
     uint8_t status[48] = {};         // last status report (up::kStatus value)
     uint8_t statusLen = 0;
     unsigned long statusMs = 0;
@@ -117,6 +132,8 @@ struct Gen2Sensor
 
     // TX power the sensor uses: the configured one, unless a status report
     // sent under the current configuration says otherwise (old firmware clamping)
+    uint32_t fwVersion() const { return (uint32_t)fwMajor << 16 | (uint32_t)fwMinor << 8 | fwPatch; }
+
     int8_t effectiveTxPower() const
     {
         return reportedTx != INT8_MAX && reportedTxVersion == cfgVersion ? reportedTx : config.txPowerDbm;

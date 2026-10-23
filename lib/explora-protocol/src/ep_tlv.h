@@ -77,6 +77,7 @@ constexpr uint8_t kPulses = tlvType(LenClass::Four, 0x02);       // u32 pulse co
 constexpr uint8_t kBoardData = tlvType(LenClass::Var, 0x00);     // board specific
 constexpr uint8_t kModbus = tlvType(LenClass::Var, 0x01);        // u8 slave | u8 function | u16 start | u16 values...
 constexpr uint8_t kStatus = tlvType(LenClass::Var, 0x02);        // answer to down::kStatusRequest (phase B)
+constexpr uint8_t kOtaStatus = tlvType(LenClass::Var, 0x03);     // OTA status (spec 14, ep_ota.h)
 } // namespace up
 
 // Downlink TLV types (gateway -> sensor), in DOWN and JOIN_ACC ACCEPT
@@ -90,6 +91,9 @@ constexpr uint8_t kInterval = tlvType(LenClass::Four, 0x01);     // u16 interval
 constexpr uint8_t kTime = tlvType(LenClass::Four, 0x02);         // u32 unix time at the start of this transmission
 constexpr uint8_t kUplinkFreq = tlvType(LenClass::Four, 0x03);   // u32 Hz (revert after 2 uplinks without ACK)
 constexpr uint8_t kBoardCommand = tlvType(LenClass::Var, 0x00);  // board specific (e.g. SCD40 recalibration)
+constexpr uint8_t kOtaStart = tlvType(LenClass::Var, 0x01);      // OTA start (spec 14, ep_ota.h)
+constexpr uint8_t kOtaBlock = tlvType(LenClass::Var, 0x02);      // OTA block: u16 index | data
+constexpr uint8_t kOtaEnd = tlvType(LenClass::Var, 0x03);        // OTA end: u8 0 pause, 1 abort
 } // namespace down
 
 struct Tlv

@@ -81,6 +81,12 @@ private:
     uint8_t otaHeader[32];
     size_t otaHeaderLen = 0;
 
+    // Sensor image upload (OTA image store, protocol v2 spec 14.5)
+    AsyncWebServerRequest *imgUploadOwner = nullptr;
+    bool imgUploadSawFile = false;
+    String imgUploadError;
+    String imgUploadMessage;
+
     // Deferred restart: handlers set these and handleClient() executes the reboot
     // once the response has had time to flush. Avoids ESP.restart() inside async handlers.
     volatile bool restartRequested = false; // set by handlers (async task), read by the loop
@@ -145,6 +151,11 @@ private:
     void handleGen2Status(AsyncWebServerRequest *request);
     void handleGen2ResetNonce(AsyncWebServerRequest *request);
     void sendGen2Detail(AsyncWebServerRequest *request, uint32_t devId, const String &message, int code = 200);
+    void handleGen2Ota(AsyncWebServerRequest *request);
+    void handleOtaImageChunk(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data,
+                             size_t len, bool final);
+    void handleOtaImageComplete(AsyncWebServerRequest *request);
+    void handleOtaImageDelete(AsyncWebServerRequest *request);
     void handleLogs(AsyncWebServerRequest *request);
     void handleLogsClear(AsyncWebServerRequest *request);
     void handleLogLevel(AsyncWebServerRequest *request);

@@ -798,7 +798,7 @@ bool SensorManager::snapshotLocked(String &json)
     // Sized for the sensors present (one smaller block on a fragmented heap)
     DynamicJsonDocument doc(JSON_OBJECT_SIZE(2) + JSON_ARRAY_SIZE(sensorCount) +
                             sensorCount * JSON_OBJECT_SIZE(SENSOR_JSON_FIELDS) + JSON_ARRAY_SIZE(gen2Count) +
-                            gen2Count * JSON_OBJECT_SIZE(14) + textSize + 256);
+                            gen2Count * (JSON_OBJECT_SIZE(18) + 2 * JSON_ARRAY_SIZE(5)) + textSize + 256);
     if (doc.capacity() == 0)
     {
         logger.error("Not enough memory to save the sensor configuration");
@@ -876,6 +876,27 @@ bool SensorManager::snapshotLocked(String &json)
             if (g.bootState != 0xFF)
             {
                 obj["bootState"] = g.bootState;
+            }
+            if (g.hasReverted)
+            {
+                obj["revFw"] = g.revertedFw;
+                obj["revCrc"] = g.revertedCrc;
+            }
+            if (g.otaWatch.armed())
+            {
+                JsonArray w = obj.createNestedArray("otaWatch");
+                w.add(g.otaWatchFw);
+                w.add(g.otaWatchCrc);
+                w.add(g.otaWatch.kind);
+                w.add(g.otaWatch.at);
+                w.add(g.otaWatch.durS);
+            }
+            if (g.otaAbort.armed())
+            {
+                JsonArray a = obj.createNestedArray("otaAbort");
+                a.add(g.otaAbort.kind);
+                a.add(g.otaAbort.at);
+                a.add(g.otaAbort.durS);
             }
             ep::wipe(label, sizeof(label));
         }
@@ -1183,9 +1204,33 @@ bool SensorManager::parseSensorsLocked(const String &fileContent)
             g.fwMajor = (uint8_t)maj;
             g.fwMinor = (uint8_t)min;
             g.fwPatch = (uint8_t)pat;
-            g.hwType = obj["hw"] | 0;
+            g.hwType = obj["hw"] | 0u;
         }
         g.bootState = obj["bootState"] | 0xFF;
+        g.hasReverted = obj.containsKey("revFw");
+        g.revertedFw = obj["revFw"] | 0u;
+        g.revertedCrc = obj["revCrc"] | 0u;
+        JsonArray w = obj["otaWatch"];
+        if (!w.isNull() && w.size() == 5)
+        {
+            g.otaWatchFw = w[0] | 0u;
+            g.otaWatchCrc = w[1] | 0u;
+            g.otaWatch.kind = w[2] | 0u;
+            g.otaWatch.at = w[3] | 0u;
+            g.otaWatch.durS = w[4] | 0u;
+        }
+        JsonArray a = obj["otaAbort"];
+        if (!a.isNull() && a.size() == 3)
+        {
+            g.otaAbort.kind = a[0] | 0u;
+            g.otaAbort.at = a[1] | 0u;
+            g.otaAbort.durS = a[2] | 0u;
+        }
+        // uptime deadlines restart after the gateway restart (spec 14.5)
+        OtaJob::Now bootNow;
+        bootNow.uptimeS = (uint32_t)(esp_timer_get_time() / 1000000);
+        g.otaWatch.afterReboot(bootNow);
+        g.otaAbort.afterReboot(bootNow);
         Gen2Crypto::deriveJoinKeys(g); // K and the join keys live in RAM only
         ep::wipe(label, sizeof(label));
     }
@@ -1324,6 +1369,17 @@ void SensorManager::removeGen2Locked(uint32_t devId)
     if (i < 0)
     {
         return;
+    }
+    if (otaJobPtr && otaJobPtr->devId == devId)
+    {
+        // A deleted sensor takes its OTA job with it
+        if (otaFrameOut)
+        {
+            RadioTask::otaCancel(otaFrameSeq);
+        }
+        otaJobPtr.reset();
+        otaFrameOut = false;
+        otaScheduleSaveLocked(millis());
     }
     gen2[i].wipeKeys();
     gen2[i] = gen2[gen2Count - 1];
@@ -1484,6 +1540,15 @@ bool SensorManager::handleGen2Frame(const RadioPacket &packet, const ep::FrameIn
         g.configVersion = jr.configVersion;
         g.lastJoinDevNonce = jr.devNonce;
         g.joinRequests++;
+        {
+            // OTA: a new session (and maybe the new firmware after a swap)
+            OtaJob::Up ou;
+            ou.joinReq = true;
+            ou.hasFw = true;
+            ou.fw = g.fwVersion();
+            ou.rxUs = packet.rxTimeUs;
+            otaOnUpLocked(g, ou, nowMs);
+        }
         if (slot == 0)
         {
             g.noSlot++; // the sensor retries with a new devNonce
@@ -1574,7 +1639,8 @@ bool SensorManager::handleGen2Frame(const RadioPacket &packet, const ep::FrameIn
         const uint8_t bootStateBefore = g.bootState;
         g.upDownlinkRssi = Gen2Link::NONE;
         g.upDownlinkSnr = Gen2Link::NONE;
-        const bool confirmed = Gen2Response::decodeUp(g, payload, payloadLen, nowMs);
+        OtaJob::Up ou;
+        const bool confirmed = Gen2Response::decodeUp(g, payload, payloadLen, nowMs, &ou);
         // Link history (spec 4.3): only while the sensor runs the desired
         // configuration, so the TX power of the sample is known
         if (Gen2Config::inSync(g.configVersion, g.cfgVersion))
@@ -1594,8 +1660,29 @@ bool SensorManager::handleGen2Frame(const RadioPacket &packet, const ep::FrameIn
             g.sessionUp = true;
             logger.info("Generation 2 sensor " + g.name + " (" + String(id) + "): session established");
         }
+        // OTA (spec 14.5): TLVs applied above, then the job's transitions,
+        // then the DOWN (a start, an OTA end, or nothing)
+        ou.bit4 = info.fctrl & ep::kFctrlOtaActive;
+        ou.fcnt32 = fcnt32;
+        ou.rxUs = packet.rxTimeUs;
+        ou.timeReliable = packet.timeReliable;
+        ou.airUs = ep::ota::airtimeUs(len, 9);
+        ou.sessionNonce = g.sessions.current.devNonce;
+        ou.canStart = g.sessions.current.valid && Gen2Config::inSync(g.configVersion, g.cfgVersion);
+#ifdef OTA_TEST_DROP_ACCEPT
+        // Bench build only: the first accepting UP after a boot is treated as
+        // lost (no OTA facts, no DOWN) - the "lost accepting UP" recovery paths
+        // OTA_TEST_DROP_ACCEPT = n: the n-th accepting UP since boot (1 = the first)
+        static int acceptsSeen = 0;
+        if (ou.accepted && ++acceptsSeen == OTA_TEST_DROP_ACCEPT)
+        {
+            logger.warning("TEST: accepting UP of " + g.name + " dropped (OTA_TEST_DROP_ACCEPT)");
+            return false;
+        }
+#endif
+        const OtaJob::Down otaDown = otaOnUpLocked(g, ou, nowMs);
         const bool ackRequested = info.fctrl & ep::kFctrlAck;
-        if (!Gen2Response::needsDown(g, ackRequested))
+        if (!Gen2Response::needsDown(g, ackRequested) && otaDown == OtaJob::Down::None)
         {
             return false;
         }
@@ -1604,7 +1691,48 @@ bool SensorManager::handleGen2Frame(const RadioPacket &packet, const ep::FrameIn
             g.noSlot++;
             return false;
         }
-        return Gen2Response::buildDown(g, fcnt32, ackRequested, confirmed, packet.rxTimeUs, req);
+        uint8_t otaTlv[2 + ep::ota::kStartLen];
+        uint8_t otaLen = 0;
+        if (otaDown == OtaJob::Down::Start)
+        {
+            uint8_t v[ep::ota::kStartLen];
+            ep::ota::encodeStart(otaJobPtr->start(), v);
+            ep::TlvWriter w(otaTlv, sizeof(otaTlv));
+            w.add(ep::down::kOtaStart, 0, v, sizeof(v));
+            otaLen = (uint8_t)w.size();
+        }
+        else if (otaDown != OtaJob::Down::None)
+        {
+            const uint8_t code = otaDown == OtaJob::Down::EndAbort ? (uint8_t)ep::ota::EndCode::Abort
+                                                                   : (uint8_t)ep::ota::EndCode::Pause;
+            ep::TlvWriter w(otaTlv, sizeof(otaTlv));
+            w.add(ep::down::kOtaEnd, 0, &code, 1);
+            otaLen = (uint8_t)w.size();
+        }
+        bool otaPlaced = false;
+        const bool built = Gen2Response::buildDown(g, fcnt32, ackRequested, confirmed, packet.rxTimeUs, req,
+                                                   otaLen ? otaTlv : nullptr, otaLen,
+                                                   otaDown == OtaJob::Down::Start, &otaPlaced);
+        if (built && otaDown != OtaJob::Down::None && !otaPlaced)
+        {
+            // The configuration filled the DOWN: the OTA TLV goes with a later
+            // DOWN (the job asks again: start / abortPending / orphan)
+            logger.info("OTA TLV to " + g.name + " deferred (the DOWN is full with the configuration)");
+        }
+        else if (built && otaDown == OtaJob::Down::Start)
+        {
+            OtaJob::startSent(*otaJobPtr, fcnt32, g.sessions.current.devNonce, otaNow());
+            const uint32_t fw = otaJobPtr->fw;
+            logger.info("OTA start to " + g.name + " (v" + String(fw >> 16) + "." + String((fw >> 8) & 0xFF) + "." +
+                        String(fw & 0xFF) + ") in the DOWN to FCnt " +
+                        String(fcnt32));
+        }
+        else if (built && otaDown != OtaJob::Down::None)
+        {
+            logger.info(String("OTA end ") + (otaDown == OtaJob::Down::EndAbort ? "(abort)" : "(pause)") + " to " +
+                        g.name);
+        }
+        return built;
     }
     default:
         // A downlink frame carrying this DevID (another gateway?) - ignored

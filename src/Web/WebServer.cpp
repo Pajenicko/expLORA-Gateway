@@ -38,6 +38,8 @@
 #include "../Hardware/WatchdogPause.h"
 #include "../Hardware/FlashPermit.h"
 #include "../Hardware/RadioTask.h"
+#include "../Storage/OtaStore.h"
+#include <sys/time.h>
 
 // OTA flash access under the flash write permit (a pending radio response
 // is not delayed by erasing / programming the app partition)
@@ -82,7 +84,8 @@ public:
         {
             return false;
         }
-        bool upload = request->method() == HTTP_POST && request->url() == "/firmware" &&
+        bool upload = request->method() == HTTP_POST &&
+                      (request->url() == "/firmware" || request->url() == "/ota/upload") &&
                       request->contentType().startsWith("multipart/form-data");
         if (upload && auth.hasPassword() && auth.isAuthorized(request))
         {
@@ -226,7 +229,15 @@ void WebPortal::setupRoutes()
     server.on("/sensors/gen2/status", HTTP_POST, std::bind(&WebPortal::handleGen2Status, this, std::placeholders::_1));
     server.on("/sensors/gen2/resetnonce", HTTP_POST,
               std::bind(&WebPortal::handleGen2ResetNonce, this, std::placeholders::_1));
+    server.on("/sensors/gen2/ota", HTTP_POST, std::bind(&WebPortal::handleGen2Ota, this, std::placeholders::_1));
     server.on("/sensors/gen2", HTTP_GET, std::bind(&WebPortal::handleGen2Detail, this, std::placeholders::_1));
+    // OTA image store (sensor images, uploaded streamed to LittleFS)
+    server.on(
+        "/ota/upload", HTTP_POST, [this](AsyncWebServerRequest *request) { this->handleOtaImageComplete(request); },
+        [this](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
+            this->handleOtaImageChunk(request, filename, index, data, len, final);
+        });
+    server.on("/ota/delete", HTTP_POST, std::bind(&WebPortal::handleOtaImageDelete, this, std::placeholders::_1));
     server.on("/sensors", HTTP_GET, std::bind(&WebPortal::handleSensors, this, std::placeholders::_1));
 
     // Logs
@@ -1072,7 +1083,29 @@ void WebPortal::sendGen2Detail(AsyncWebServerRequest *request, uint32_t devId, c
         request->send(404, "text/plain", "Unknown generation 2 sensor");
         return;
     }
-    String html = HTMLGenerator::generateGen2DetailPage(*g, message);
+    // OTA part: the job, the start checks, the image store (spec 14.5)
+    std::unique_ptr<Gen2OtaView> ota(new (std::nothrow) Gen2OtaView());
+    if (ota)
+    {
+        ota->hasJob = sensorManager.otaJobCopy(ota->job);
+        SensorManager::OtaCheck c = sensorManager.otaCheckStart(devId);
+        ota->imageOk = c.imageOk;
+        ota->imageFw = c.imageFw;
+        ota->imageLen = c.imageLen;
+        ota->blockers = c.blockers;
+        ota->warnings = c.warnings;
+        ota->confirm = c.confirm;
+        ota->estimateS = c.estimateS;
+        ota->imageCount = OtaStore::list(ota->images, OtaImage::MAX_HW_TYPES);
+        ota->otaHourMs = RadioTask::stats().otaUsedMs;
+        ota->lastEvent = sensorManager.otaLastEventText();
+        struct timeval tv;
+        gettimeofday(&tv, nullptr);
+        ota->now.unixS = tv.tv_sec > 1700000000 ? (uint32_t)tv.tv_sec : 0;
+        ota->now.us = esp_timer_get_time();
+        ota->now.uptimeS = (uint32_t)(ota->now.us / 1000000); // uptime deadlines (Resume of a battery hold)
+    }
+    String html = HTMLGenerator::generateGen2DetailPage(*g, message, ota.get());
     g->wipeKeys();
     sendNoStore(request, code, "text/html", html);
 }
@@ -1169,6 +1202,201 @@ void WebPortal::handleGen2Status(AsyncWebServerRequest *request)
         return;
     }
     sendGen2Detail(request, devId, "Status requested - the sensor answers after its next uplink");
+}
+
+// OTA actions on the generation 2 page: start / retry, abort, pause, resume, clear
+void WebPortal::handleGen2Ota(AsyncWebServerRequest *request)
+{
+    logger.debug("HTTP request: POST /sensors/gen2/ota");
+    if (guardAPOnly(request)) return;
+    uint32_t devId = 0;
+    if (!gen2DevIdParam(request, true, devId))
+    {
+        request->send(400, "text/plain", "DevID missing");
+        return;
+    }
+    String action = request->hasParam("action", true) ? request->getParam("action", true)->value() : String();
+    String msg;
+    bool ok = false;
+    if (action == "start")
+    {
+        bool confirmed = request->hasParam("confirm", true) && request->getParam("confirm", true)->value() == "1";
+        ok = sensorManager.otaRequestStart(devId, confirmed, msg);
+    }
+    else if (action == "abort" || action == "pause" || action == "resume" || action == "clear")
+    {
+        ok = sensorManager.otaAdmin(devId, action[0] == 'r' ? 'r' : action[0], msg);
+    }
+    else
+    {
+        msg = "Unknown action";
+    }
+    sendGen2Detail(request, devId, msg, ok ? 200 : 409);
+}
+
+// Sensor image upload: streamed into the image store, validated at the end
+void WebPortal::handleOtaImageChunk(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data,
+                                    size_t len, bool final)
+{
+    // Upload data arrives before the middleware runs - check the login here
+    if (!auth.isAuthorized(request) || !auth.hasPassword())
+    {
+        return;
+    }
+    if (imgUploadOwner != nullptr && imgUploadOwner != request)
+    {
+        return; // one upload at a time; the other request gets 409
+    }
+    if (index > 0 && imgUploadOwner == nullptr)
+    {
+        return;
+    }
+    if (index == 0)
+    {
+        if (imgUploadOwner == request && imgUploadSawFile)
+        {
+            if (imgUploadError.length() == 0)
+            {
+                imgUploadError = "Only one image file per upload";
+                OtaStore::uploadAbort();
+            }
+            return;
+        }
+        if (guardAPOnly(request))
+        {
+            return;
+        }
+        imgUploadOwner = request;
+        imgUploadSawFile = true;
+        imgUploadError = "";
+        imgUploadMessage = "";
+        request->onDisconnect([this, request]() {
+            if (imgUploadOwner == request)
+            {
+                if (OtaStore::uploadRunning())
+                {
+                    OtaStore::uploadAbort();
+                }
+                imgUploadOwner = nullptr;
+                imgUploadSawFile = false;
+            }
+        });
+        String error;
+        if (!OtaStore::uploadBegin(error))
+        {
+            imgUploadError = error;
+            return;
+        }
+        logger.info("Sensor image upload started: " + filename);
+    }
+    if (imgUploadError.length() > 0)
+    {
+        return;
+    }
+    String error;
+    if (len > 0 && !OtaStore::uploadWrite(data, len, error))
+    {
+        imgUploadError = error;
+        OtaStore::uploadAbort();
+        return;
+    }
+    esp_task_wdt_reset();
+    if (!final)
+    {
+        return;
+    }
+    OtaStore::Meta meta;
+    if (!OtaStore::uploadValidate(meta, error))
+    {
+        imgUploadError = error;
+        OtaStore::uploadAbort();
+        return;
+    }
+    if (sensorManager.otaImageBusy(meta.hwType))
+    {
+        imgUploadError = "An OTA job that is not finished uses the image of this HW type";
+        OtaStore::uploadAbort();
+        return;
+    }
+    if (!OtaStore::uploadCommit(meta, error))
+    {
+        imgUploadError = error;
+        return;
+    }
+    sensorManager.otaImageChanged(meta.hwType);
+    char v[16];
+    OtaImage::versionText(meta.fw, v, sizeof(v));
+    char hw[8];
+    snprintf(hw, sizeof(hw), "%04X", meta.hwType);
+    imgUploadMessage = String("Image v") + v + " for HW type 0x" + hw + " stored (" + String(meta.len) + " B)";
+    logger.info(imgUploadMessage);
+}
+
+void WebPortal::handleOtaImageComplete(AsyncWebServerRequest *request)
+{
+    logger.debug("HTTP request: POST /ota/upload (complete)");
+    if (guardAPOnly(request)) return;
+    if (imgUploadOwner != request)
+    {
+        request->send(409, "text/plain", "No upload by this request (another one in progress?)");
+        return;
+    }
+    String msg = imgUploadError.length() > 0 ? "Image not stored: " + imgUploadError
+                 : imgUploadMessage.length() > 0 ? imgUploadMessage
+                                                 : String("Image not stored: no file received");
+    bool ok = imgUploadError.length() == 0 && imgUploadMessage.length() > 0;
+    if (!ok)
+    {
+        if (OtaStore::uploadRunning())
+        {
+            OtaStore::uploadAbort();
+        }
+        logger.warning(msg);
+    }
+    imgUploadOwner = nullptr;
+    imgUploadSawFile = false;
+    imgUploadError = "";
+    imgUploadMessage = "";
+    uint32_t devId = 0;
+    if (gen2DevIdParam(request, false, devId))
+    {
+        sendGen2Detail(request, devId, msg, ok ? 200 : 400);
+        return;
+    }
+    request->send(ok ? 200 : 400, "text/plain", msg);
+}
+
+void WebPortal::handleOtaImageDelete(AsyncWebServerRequest *request)
+{
+    logger.debug("HTTP request: POST /ota/delete");
+    if (guardAPOnly(request)) return;
+    long hw = request->hasParam("hw", true) ? request->getParam("hw", true)->value().toInt() : -1;
+    String msg;
+    int code = 200;
+    if (hw < 0 || hw > 0xFFFF)
+    {
+        msg = "HW type missing";
+        code = 400;
+    }
+    else if (sensorManager.otaImageBusy((uint16_t)hw))
+    {
+        msg = "Not deleted: an OTA job that is not finished uses this image";
+        code = 409;
+    }
+    else
+    {
+        bool had = OtaStore::remove((uint16_t)hw);
+        sensorManager.otaImageChanged((uint16_t)hw);
+        msg = had ? "Image deleted" : "No such image";
+        logger.info("Sensor image of HW type " + String(hw) + (had ? " deleted" : " not found"));
+    }
+    uint32_t devId = 0;
+    if (gen2DevIdParam(request, true, devId))
+    {
+        sendGen2Detail(request, devId, msg, code);
+        return;
+    }
+    request->send(code, "text/plain", msg);
 }
 
 void WebPortal::handleGen2ResetNonce(AsyncWebServerRequest *request)
@@ -1601,6 +1829,11 @@ void WebPortal::handleDiagHeap(AsyncWebServerRequest *request)
                 (unsigned long)rs.txLateRequest, (unsigned long)rs.txNoHold, (unsigned long)rs.txFailed,
                 (unsigned long)rs.txDoneTimeouts, (unsigned long)rs.holdFails, (unsigned long)rs.slotsBusy,
                 (unsigned long)rs.dutyUsedMs, (unsigned long)rs.joinUsedMs, 360000UL);
+    // OTA: the job, skipped slots by reason, radio OTA counters (spec 14.5)
+    res->print("\"ota\":");
+    res->print(sensorManager.otaDiagJson());
+    res->printf(",\"otaRadio\":{\"sent\":%lu,\"usedMs\":%lu,\"budgetMs\":%lu,\"maxLateUs\":%ld},",
+                (unsigned long)rs.otaSent, (unsigned long)rs.otaUsedMs, 172800UL, (long)rs.otaMaxLateUs);
     res->print("\"wifiStatus\":"); res->print((int)WiFi.status()); res->print(",");
     res->print("\"apMode\":"); res->print(isAPMode ? "true" : "false"); res->print(",");
     res->print("\"uplink\":\""); res->print(uplink->getActiveName()); res->print("\",");

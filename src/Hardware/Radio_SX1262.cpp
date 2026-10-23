@@ -213,6 +213,11 @@ bool RadioSX1262::receivingNow()
     {
         return false;
     }
+    // From the valid header on (about 70-100 ms into an UP at SF9). The
+    // PREAMBLE_DETECTED IRQ would see the preamble too, but it is latched and
+    // not enabled in the receive IRQ mask: a false preamble would block every
+    // OTA launch until the next packet. Accepted: a packet starting in the
+    // last ~100 ms before an OTA launch can be lost (spec 14.10 Q3)
     uint32_t flags = radio->getIrqFlags();
     return (flags & RADIOLIB_SX126X_IRQ_HEADER_VALID) && !(flags & RADIOLIB_SX126X_IRQ_RX_DONE);
 }

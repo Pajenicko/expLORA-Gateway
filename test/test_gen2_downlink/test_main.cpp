@@ -278,6 +278,73 @@ static void test_session_counters_and_replay(void)
     TEST_ASSERT_EQUAL((int)SessionUse::None, (int)s.openUp(ep::aesSoftEncrypt, d, dn, p, pl, fc));
 }
 
+// OTA frames (spec 14.5): own share inside the data share, pacing OTA -> OTA only
+static void test_budget_ota(void)
+{
+    Budget b;
+    // A response right after a block is not delayed by the block
+    b.recordOta(10000, 1263);
+    TEST_ASSERT_EQUAL((int)Verdict::Ok, (int)b.check(10030, 300, false));
+    // The next block waits 9 x 1263 ms after the previous one
+    TEST_ASSERT_EQUAL((int)Verdict::Pacing, (int)b.checkOta(10000 + 9 * 1263 - 1, 1263));
+    TEST_ASSERT_EQUAL((int)Verdict::Ok, (int)b.checkOta(10000 + 9 * 1263, 1263));
+    // A response does not pace the next block
+    b.record(30000, 300, false);
+    TEST_ASSERT_EQUAL((int)Verdict::Ok, (int)b.checkOta(30100, 1263));
+    // The OTA share: 172.8 s per sliding hour (136 blocks of 1263 ms fit, the 137th not)
+    Budget o;
+    uint32_t t0 = 100000;
+    int sent = 0;
+    for (int i = 0; i < 270; i++) // 13 s apart (>= 10 x 1263 ms), within one hour
+    {
+        uint32_t at = t0 + i * 13000;
+        if (o.checkOta(at, 1263) == Verdict::Ok)
+        {
+            o.recordOta(at + 1263, 1263);
+            sent++;
+        }
+    }
+    TEST_ASSERT_EQUAL(136, sent);
+    TEST_ASSERT_TRUE(o.otaUsedMs(t0 + 270 * 13000) <= OTA_BUDGET_MS_PER_HOUR);
+    // OTA airtime counts in the data share: responses keep only the rest
+    Budget d;
+    for (int i = 0; i < 136; i++)
+    {
+        d.recordOta(1000 + i * 11400, 1263);
+    }
+    uint32_t now = 1000 + 136 * 11400;
+    TEST_ASSERT_EQUAL((int)Verdict::Ok, (int)d.check(now, DATA_BUDGET_MS_PER_HOUR - 136 * 1263, false));
+    TEST_ASSERT_EQUAL((int)Verdict::Budget, (int)d.check(now, DATA_BUDGET_MS_PER_HOUR - 136 * 1263 + 1, false));
+}
+
+static void test_recent_rx_overlap(void)
+{
+    RecentRx r;
+    const int64_t rx = 50000000;
+    r.add(rx);
+    // RX1 window [rx + 1 s - off, + 300 ms]; a block of 1263 ms launched before it overlaps
+    TEST_ASSERT_TRUE(r.overlaps(rx + 1000000 - OFF - 1263000, 1263000, OFF, 300000));
+    // ... ending one turnaround before the window is fine
+    TEST_ASSERT_FALSE(r.overlaps(rx + 1000000 - OFF - 1263000 - OTA_TURNAROUND_US - 1, 1263000, OFF, 300000));
+    // RX2 window too
+    TEST_ASSERT_TRUE(r.overlaps(rx + 2000000 - OFF + 100000, 1263000, OFF, 300000));
+    // after RX2 and its frame: free
+    TEST_ASSERT_FALSE(r.overlaps(rx + 2000000 - OFF + 300000 + OTA_TURNAROUND_US + 1, 1263000, OFF, 300000));
+}
+
+static void test_uplink_slot(void)
+{
+    // interval 600 s, slot 120 s: uplinks at ...:02:00, ...:12:00
+    const uint64_t day = 1800000000ULL * 1000; // multiple of 600 s
+    TEST_ASSERT_FALSE(hitsUplinkSlot(day + 100000, 1263, 600, 120));
+    TEST_ASSERT_TRUE(hitsUplinkSlot(day + 117500, 1263, 600, 120));  // ends 1.24 s before the slot
+    TEST_ASSERT_FALSE(hitsUplinkSlot(day + 116700, 1263, 600, 120)); // ends 2.04 s before
+    TEST_ASSERT_TRUE(hitsUplinkSlot(day + 121999, 1263, 600, 120));
+    TEST_ASSERT_FALSE(hitsUplinkSlot(day + 122000, 1263, 600, 120));
+    TEST_ASSERT_TRUE(hitsUplinkSlot(day + 600000 + 119000, 1263, 600, 120)); // next period
+    TEST_ASSERT_FALSE(hitsUplinkSlot(day + 117500, 1263, 0, 0));
+}
+
 int main(int, char **)
 {
     UNITY_BEGIN();
@@ -288,6 +355,9 @@ int main(int, char **)
     RUN_TEST(test_budget_pacing);
     RUN_TEST(test_budget_hourly_and_join_share);
     RUN_TEST(test_budget_full_hour);
+    RUN_TEST(test_budget_ota);
+    RUN_TEST(test_recent_rx_overlap);
+    RUN_TEST(test_uplink_slot);
     RUN_TEST(test_config_version_and_clamp);
     RUN_TEST(test_down_payload);
     RUN_TEST(test_status_boot_info);

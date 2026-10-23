@@ -27,6 +27,13 @@ constexpr uint32_t BUDGET_MS_PER_HOUR = 360000;     // 10 % of 869.4-869.65 MHz
 constexpr uint32_t JOIN_BUDGET_MS_PER_HOUR = 72000;  // JOIN_ACC + REJOIN: 20 % of it
 constexpr uint32_t DATA_BUDGET_MS_PER_HOUR = BUDGET_MS_PER_HOUR - JOIN_BUDGET_MS_PER_HOUR; // everything else: 80 %
 constexpr uint32_t PACING_FACTOR = 9;               // off-time >= 9 x airtime
+// OTA frames (spec 14.5): at most 60 % of the data share per sliding hour,
+// inside the data share; pacing 9 x t applies OTA -> OTA only, a launch
+// more than 15 ms late is skipped
+constexpr uint32_t OTA_BUDGET_MS_PER_HOUR = DATA_BUDGET_MS_PER_HOUR * 6 / 10; // 172.8 s
+constexpr int64_t OTA_MAX_LATE_US = 15000;
+constexpr int64_t OTA_TURNAROUND_US = 30000; // radio TX <-> RX switch around a response window
+constexpr int64_t RECENT_RX_US = 2400000;    // responses follow an UP within RX2 + its frame
 constexpr uint32_t WARN_PERCENT = 80;
 
 enum class Window : uint8_t
@@ -120,12 +127,15 @@ enum class Verdict : uint8_t
     Budget,     // data share (80 % of the hourly 10 %) exhausted
     JoinBudget, // JOIN_ACC / REJOIN share exhausted
     Pacing,     // off-time after the previous transmission too short
+    OtaBudget,  // OTA share (60 % of the data share) exhausted
 };
 
 // Duty-cycle gate for the gateway's downlink channel
 class Budget
 {
 public:
+    // A response (or JOIN_ACC): pacing after the previous response only -
+    // an OTA block before it does not delay it
     Verdict check(uint32_t launchMs, uint32_t airtimeMs, bool join)
     {
         if (hasLast && (int32_t)(launchMs - (lastEndMs + PACING_FACTOR * lastAirtimeMs)) < 0)
@@ -147,14 +157,114 @@ public:
         lastAirtimeMs = airtimeMs;
     }
 
+    // An OTA frame: pacing after the previous OTA frame only, the OTA share
+    // and the data share it is part of
+    Verdict checkOta(uint32_t launchMs, uint32_t airtimeMs)
+    {
+        if (hasLastOta && (int32_t)(launchMs - (lastOtaEndMs + PACING_FACTOR * lastOtaAirtimeMs)) < 0)
+        {
+            return Verdict::Pacing;
+        }
+        if (ota.usedMs(launchMs) + airtimeMs > OTA_BUDGET_MS_PER_HOUR)
+        {
+            return Verdict::OtaBudget;
+        }
+        return data.usedMs(launchMs) + airtimeMs > DATA_BUDGET_MS_PER_HOUR ? Verdict::Budget : Verdict::Ok;
+    }
+
+    void recordOta(uint32_t endMs, uint32_t airtimeMs)
+    {
+        data.record(endMs, airtimeMs);
+        ota.record(endMs, airtimeMs);
+        hasLastOta = true;
+        lastOtaEndMs = endMs;
+        lastOtaAirtimeMs = airtimeMs;
+    }
+
     uint32_t usedMs(uint32_t nowMs) { return data.usedMs(nowMs) + joins.usedMs(nowMs); }
     uint32_t joinUsedMs(uint32_t nowMs) { return joins.usedMs(nowMs); }
+    uint32_t otaUsedMs(uint32_t nowMs) { return ota.usedMs(nowMs); }
     bool warn(uint32_t nowMs) { return usedMs(nowMs) * 100 >= (uint64_t)BUDGET_MS_PER_HOUR * WARN_PERCENT; }
 
 private:
     AirtimeWindow data, joins; // the two shares never exceed 10 % together
+    AirtimeWindow ota;         // OTA frames, also counted in data
     bool hasLast = false;
     uint32_t lastEndMs = 0;
     uint32_t lastAirtimeMs = 0;
+    bool hasLastOta = false;
+    uint32_t lastOtaEndMs = 0;
+    uint32_t lastOtaAirtimeMs = 0;
 };
+
+// RxDone times of the last generation 2 frames: their RX1 / RX2 windows
+// must stay free of OTA frames, also while the response is still being built
+class RecentRx
+{
+public:
+    static constexpr int N = 8;
+    void add(int64_t rxUs)
+    {
+        rx_[next_] = rxUs;
+        next_ = (next_ + 1) % N;
+    }
+    // [launch - turnaround, launch + air + turnaround] overlaps an RX1 / RX2
+    // response window (launch at RxDone + 1 s / 2 s - chip offset, respAirUs long)
+    bool overlaps(int64_t launchUs, uint32_t airUs, int64_t chipOffsetUs, uint32_t respAirUs) const
+    {
+        const int64_t a = launchUs - OTA_TURNAROUND_US;
+        const int64_t b = launchUs + airUs + OTA_TURNAROUND_US;
+        for (int i = 0; i < N; i++)
+        {
+            if (rx_[i] == 0)
+            {
+                continue;
+            }
+            for (int w = 0; w < 2; w++)
+            {
+                const int64_t ws = rx_[i] + (w == 0 ? RX1_DELAY_US : RX2_DELAY_US) - chipOffsetUs;
+                const int64_t we = ws + respAirUs;
+                if (ws < b && we > a)
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+private:
+    int64_t rx_[N] = {};
+    int next_ = 0;
+};
+
+// The next uplink slot of a generation 2 sensor with a known slot (spec
+// 14.5): reports go at unix times t with t mod interval == slot (the
+// sensor's clock is set by the gateway). An OTA frame [launch, launch + air]
+// must stay out of [slot - 2 s, slot + 2 s]. unixLaunch / unixEnd in ms.
+inline bool hitsUplinkSlot(uint64_t launchUnixMs, uint32_t airMs, uint32_t intervalS, uint32_t slotS)
+{
+    if (intervalS == 0)
+    {
+        return false;
+    }
+    const uint64_t periodMs = (uint64_t)intervalS * 1000;
+    const uint64_t end = launchUnixMs + airMs;
+    // the slot at or before the launch - 2 s and the next one
+    const uint64_t from = launchUnixMs >= 2000 ? launchUnixMs - 2000 : 0;
+    uint64_t base = from - from % periodMs + (uint64_t)slotS * 1000;
+    if (base > from)
+    {
+        base -= periodMs;
+    }
+    for (int i = 0; i < 3; i++)
+    {
+        const uint64_t slot = base + (uint64_t)i * periodMs;
+        if (slot + 2000 > launchUnixMs && slot < end + 2000)
+        {
+            return true;
+        }
+    }
+    return false;
+}
 } // namespace Gen2Downlink

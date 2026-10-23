@@ -20,7 +20,8 @@
  * dir 0 = uplink, 1 = downlink. code = frame type, REJOIN 0x11.
  * counter: FCnt32 for UP/DOWN, devNonce for JOIN_REQ/JOIN_ACC, FCnt16 of the
  * triggering uplink for REJOIN. bind: DOWN = FCnt32 of the uplink it answers
- * (ConfFCnt), REJOIN = MIC of the triggering uplink, otherwise 0.
+ * (ConfFCnt) - for an OTA session DOWN (FCtrl bit 5) the FCnt32 of the UP that
+ * accepted the OTA start -, REJOIN = MIC of the triggering uplink, otherwise 0.
  *
  * Copyright Pajenicko s.r.o., Igor Sverma (C) 2026
  *
@@ -44,7 +45,8 @@ constexpr uint8_t kMarker = 0xA0;
 
 constexpr size_t kMicLen = 4;
 constexpr size_t kMaxFrame = 255;   // LoRa payload limit
-constexpr size_t kMaxPayload = 222; // TLV bytes in UP / DOWN (keeps airtime bounded)
+constexpr size_t kMaxPayload = 222;    // TLV bytes in UP / DOWN (keeps airtime bounded)
+constexpr size_t kMaxPayloadOta = 243; // DOWN with FCtrl kFctrlOtaSession (one OTA block, spec 14)
 constexpr size_t kDataHeaderLen = 8;
 constexpr size_t kDataOverhead = kDataHeaderLen + kMicLen;
 constexpr size_t kJoinReqLen = 22;
@@ -86,6 +88,8 @@ enum class JoinAccKind : uint8_t
 constexpr uint8_t kFctrlAck = 0x80;     // UP: gateway must answer; DOWN: acknowledges the uplink
 constexpr uint8_t kFctrlPending = 0x40; // UP: sensor has more to send; DOWN: gateway has more queued
 constexpr uint8_t kFctrlClassC = 0x20;  // UP: sensor listens continuously (mains powered)
+constexpr uint8_t kFctrlOtaSession = 0x20; // DOWN: OTA session frame, bound to the accepting UP (spec 14)
+constexpr uint8_t kFctrlOtaActive = 0x10;  // UP: the sensor is in an OTA session (listens to the schedule)
 constexpr uint8_t kFctrlCfgMask = 0x0F; // UP: config version applied; DOWN: config version held by the gateway
 
 constexpr uint8_t kJoinReqMagic0 = 'J';
@@ -94,6 +98,14 @@ constexpr uint8_t kJoinReqMagic1 = 'R';
 // JOIN_REQ caps byte
 constexpr uint8_t kCapClassC = 0x01;
 constexpr uint8_t kCapRx2 = 0x02;
+constexpr uint8_t kCapOtaMask = 0x0C; // bits 2-3: OTA transfer version the firmware receives (0 none)
+constexpr uint8_t kCapOtaShift = 2;
+
+// Payload limit of an UP / DOWN: OTA session DOWNs carry one 232-byte block
+inline size_t maxPayload(FrameType type, uint8_t fctrl)
+{
+    return type == FrameType::Down && (fctrl & kFctrlOtaSession) ? kMaxPayloadOta : kMaxPayload;
+}
 
 inline uint8_t makeMhdr(FrameType type)
 {

@@ -19,6 +19,7 @@
 
 #include "../Data/Gen2Sensor.h"
 #include "../Hardware/RadioTask.h"
+#include "OtaJob.h"
 
 namespace Gen2Response
 {
@@ -46,10 +47,14 @@ bool needsDown(const Gen2Sensor &g, bool ackRequested);
 // pending" when not everything fits. Uses the next downlink counter.
 // confirmed: the UP carried a status report or an event - its ACK has
 // priority over a reception in progress (spec 7)
+// ota / otaLen: an OTA TLV (start: alone with the time; end: after the rest)
 bool buildDown(Gen2Sensor &g, uint32_t upFcnt32, bool ackRequested, bool confirmed, int64_t rxTimeUs,
-               TxRequest &req);
+               TxRequest &req, const uint8_t *ota = nullptr, uint8_t otaLen = 0, bool otaOnly = false,
+               bool *otaPlaced = nullptr);
 
 // Store the reported values of a decrypted UP payload in the status; true
 // when it carried a status report or an event (confirmed UP)
-bool decodeUp(Gen2Sensor &g, const uint8_t *payload, size_t len, unsigned long nowMs);
+// ota (optional): the OTA facts of the UP (status report firmware / boot
+// state / flags, OTA status TLVs) for the OTA job
+bool decodeUp(Gen2Sensor &g, const uint8_t *payload, size_t len, unsigned long nowMs, OtaJob::Up *ota = nullptr);
 } // namespace Gen2Response

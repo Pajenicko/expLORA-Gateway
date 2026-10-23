@@ -22,12 +22,14 @@
 #pragma once
 
 #include <Arduino.h>
+#include <memory>
 #include <mutex>
 #include <vector>
 #include "SensorData.h"
 #include "Gen2Sensor.h"
 #include "../Protocol/WaitingList.h"
 #include "../Hardware/RadioTask.h"
+#include "../Protocol/OtaJob.h"
 #include "Logging.h"
 
 /**
@@ -73,6 +75,35 @@ private:
     bool snapshotLocked(String &json);
     bool saveAndUnlock(std::unique_lock<std::mutex> &lock);
     bool writeSnapshot(const String &json, uint32_t seq);
+
+    // OTA (protocol v2, docs/protocol-v2.md 14.5; SensorManagerOta.cpp).
+    // The job lives under sensorMutex; job.json is written from loop().
+    std::unique_ptr<OtaJob::Job> otaJobPtr; // heap, only while a job (or its revert watch) exists
+    OtaJob::Job &otaJobLocked();            // the job, created when there is none
+    void otaDropIfGoneLocked();             // free a job that no longer exists
+    bool otaSaveDue = false;
+    uint32_t otaSaveAtMs = 0;
+    uint32_t otaSeq = 0;            // OTA frame sequence numbers
+    bool otaFrameOut = false;       // a frame is with the radio task
+    uint32_t otaFrameSeq = 0;
+    uint32_t otaFrameSlot = 0;
+    uint16_t otaFrameIndex = 0;
+    bool otaFrameEnd = false;
+    uint32_t otaLastSlot = UINT32_MAX; // the slot a frame was built (or skipped) for
+    int64_t otaLastAnchorUs = 0;       // slot numbers restart with every accepting UP
+    bool otaStartPending = false;   // a start requested by the admin, run by loop()
+    uint32_t otaStartDevId = 0;
+    uint32_t otaSkipUplink = 0, otaSkipLoop = 0, otaSkipSession = 0, otaSkipRead = 0;
+    uint32_t otaSkipRadio[10] = {}; // per OtaOutcome
+    uint32_t otaSaveMaxUs = 0;      // job.json write (diagnostics)
+    String otaLastEvent;            // last state change in words (page / diag)
+    OtaJob::Now otaNow() const;
+    void otaScheduleSaveLocked(unsigned long nowMs);
+    void otaApplyLocked(Gen2Sensor &g, const OtaJob::Result &r, const OtaJob::Up &u, unsigned long nowMs);
+    OtaJob::Down otaOnUpLocked(Gen2Sensor &g, OtaJob::Up &u, unsigned long nowMs);
+    bool otaSaveJob();
+    void otaRunStart();
+    void otaBuildFrame(unsigned long nowMs);
 
 public:
     // Constructor
@@ -159,6 +190,40 @@ public:
     bool resetGen2DevNonce(uint32_t devId);
     // Outcome of a response reported by the radio task
     void recordTxResult(const TxResult &result);
+
+    // --- OTA (SensorManagerOta.cpp) ---
+    // setup(): job.json restored (Transfer -> Paused, uptime deadlines restart)
+    void otaBegin();
+    // loop(): queued start, deadlines, block frames for the radio task, job.json
+    void otaProcess(unsigned long nowMs);
+    // loop(): outcome of an OTA frame
+    void otaResult(const OtaResult &result);
+    // Start checks (gen2 page): blockers stop it, warnings and confirm
+    // (downgrade, reinstall, the reverted image) are shown; estimate in s
+    struct OtaCheck
+    {
+        bool imageOk = false;
+        uint32_t imageFw = 0, imageLen = 0;
+        String blockers, warnings, confirm;
+        uint32_t estimateS = 0;
+    };
+    // requestStatus: ask the sensor for a status report when none is known
+    // (the start path; a page view only shows the blocker)
+    OtaCheck otaCheckStart(uint32_t devId, bool requestStatus = false);
+    // Queue a start (loop() re-verifies the image and creates the job);
+    // false: blocked (msg says why)
+    bool otaRequestStart(uint32_t devId, bool confirmed, String &msg);
+    // Admin actions: 'a' abort, 'p' pause, 'r' resume, 'c' clear
+    bool otaAdmin(uint32_t devId, char action, String &msg);
+    // Copy of the job (page, diag); false when there is none
+    bool otaJobCopy(OtaJob::Job &out) const;
+    String otaLastEventText() const;
+    // A non-terminal job uses an image of this HW type (no upload / delete then)
+    bool otaImageBusy(uint16_t hwType) const;
+    // An image was replaced or deleted: a terminal job of this HW type goes
+    void otaImageChanged(uint16_t hwType);
+    // /diag/heap "ota" object (JSON text)
+    String otaDiagJson() const;
 
     // Forward sensor data to HTTP (blocking - never call with the lock held)
     bool forwardSensorData(const SensorData &sensor);

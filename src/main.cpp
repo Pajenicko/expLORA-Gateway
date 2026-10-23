@@ -203,6 +203,8 @@ void setup()
                     String(sensorManager->getSensorCount()) + " sensors");
     }
 
+    sensorManager->otaBegin(); // OTA image store and job (protocol v2, spec 14.5)
+
     // Network: ethernet, AP and/or WiFi station, time sync once online
     uplink = new Uplink(*configManager, logger);
     uplink->begin();
@@ -328,6 +330,17 @@ void loop()
     while (sensorManager && RadioTask::takeResult(txResult))
     {
         sensorManager->recordTxResult(txResult);
+    }
+
+    // OTA: launch outcomes, then the job (deadlines, the next block frame, job.json)
+    OtaResult otaResult;
+    while (sensorManager && RadioTask::otaTakeResult(otaResult))
+    {
+        sensorManager->otaResult(otaResult);
+    }
+    if (sensorManager)
+    {
+        sensorManager->otaProcess(millis());
     }
 
     // Short delay for stability

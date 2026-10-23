@@ -28,6 +28,24 @@
 #include "../Protocol/WaitingList.h"
 #include "../Data/Logging.h"
 #include "../Storage/ConfigManager.h"
+#include "../Storage/OtaStore.h"
+#include "../Protocol/OtaJob.h"
+
+// OTA part of the generation 2 detail page (protocol v2, spec 14.5)
+struct Gen2OtaView
+{
+    bool hasJob = false;
+    OtaJob::Job job;
+    bool imageOk = false;
+    uint32_t imageFw = 0, imageLen = 0;
+    String blockers, warnings, confirm;
+    uint32_t estimateS = 0;
+    OtaStore::Meta images[OtaImage::MAX_HW_TYPES];
+    size_t imageCount = 0;
+    uint32_t otaHourMs = 0; // OTA airtime of the sliding hour (radio task)
+    String lastEvent;
+    OtaJob::Now now;
+};
 
 /**
  * Class for generating HTML content
@@ -87,7 +105,8 @@ public:
 
     // Generation 2 sensor detail: status, configuration form, status request,
     // downlink counters, devNonce reset
-    static String generateGen2DetailPage(const Gen2Sensor &sensor, const String &message);
+    static String generateGen2DetailPage(const Gen2Sensor &sensor, const String &message,
+                                         const Gen2OtaView *ota = nullptr);
 
     // Generate sensor add page
     static String generateSensorAddPage();

@@ -547,6 +547,350 @@ static void test_tlv_downlink_config(void)
     TEST_ASSERT_EQUAL_HEX8_ARRAY(kVecJoinAccTlv, buf, w.size());
 }
 
+
+// --- OTA transfer (spec 14, ep_ota.h) -------------------------------------------
+
+static void test_ota_down_payload_limit_and_binding(void)
+{
+    const uint32_t acceptFcnt = 41; // FCnt32 of the UP that accepted the OTA start
+    uint8_t data[ota::kBlockSize];
+    for (size_t i = 0; i < sizeof(data); i++)
+    {
+        data[i] = (uint8_t)i;
+    }
+    uint8_t value[2 + ota::kBlockSize];
+    TEST_ASSERT_EQUAL(sizeof(value), ota::encodeBlock(388, data, sizeof(data), value, sizeof(value)));
+    uint8_t tlv[256];
+    TlvWriter w(tlv, sizeof(tlv));
+    TEST_ASSERT_TRUE(w.add(down::kOtaBlock, 0, value, sizeof(value)));
+    TEST_ASSERT_EQUAL(236, w.size()); // type, length, index, 232 bytes
+    uint8_t f[kMaxFrame];
+    size_t n = buildData(aesSoftEncrypt, sessKeys(), FrameType::Down, kVecDevId, 0x10005, acceptFcnt,
+                         kFctrlOtaSession, tlv, w.size(), f, sizeof(f));
+    TEST_ASSERT_EQUAL(248, n);
+    FrameInfo info;
+    TEST_ASSERT_TRUE(peekFrame(f, n, info));
+    uint8_t p[kMaxPayloadOta];
+    size_t pl = 0;
+    TEST_ASSERT_TRUE(openData(aesSoftEncrypt, sessKeys(), FrameType::Down, f, n, 0x10005, acceptFcnt, p, pl));
+    TEST_ASSERT_EQUAL(236, pl);
+    TlvReader r(p, pl);
+    Tlv t;
+    TEST_ASSERT_EQUAL(1, r.next(t));
+    TEST_ASSERT_EQUAL_HEX8(0xC2, t.type);
+    uint16_t idx = 0;
+    const uint8_t *d = nullptr;
+    size_t dl = 0;
+    TEST_ASSERT_TRUE(ota::decodeBlock(t.value, t.len, idx, d, dl));
+    TEST_ASSERT_EQUAL(388, idx);
+    TEST_ASSERT_EQUAL(ota::kBlockSize, dl);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(data, d, dl);
+    // bound to the accepting UP: another binding fails
+    TEST_ASSERT_FALSE(openData(aesSoftEncrypt, sessKeys(), FrameType::Down, f, n, 0x10005, acceptFcnt + 1, p, pl));
+    // the OTA limit only with the OTA bit in a DOWN
+    uint8_t big[kMaxPayloadOta] = {};
+    TEST_ASSERT_EQUAL(kMaxPayloadOta + kDataOverhead,
+                      buildData(aesSoftEncrypt, sessKeys(), FrameType::Down, kVecDevId, 7, acceptFcnt,
+                                kFctrlOtaSession, big, kMaxPayloadOta, f, sizeof(f)));
+    TEST_ASSERT_EQUAL(0, buildData(aesSoftEncrypt, sessKeys(), FrameType::Down, kVecDevId, 7, acceptFcnt,
+                                   kFctrlOtaSession, big, kMaxPayloadOta + 1, f, sizeof(f)));
+    TEST_ASSERT_EQUAL(0, buildData(aesSoftEncrypt, sessKeys(), FrameType::Down, kVecDevId, 7, 3, kFctrlAck, big,
+                                   kMaxPayload + 1, f, sizeof(f)));
+    TEST_ASSERT_EQUAL(0, buildData(aesSoftEncrypt, sessKeys(), FrameType::Up, kVecDevId, 7, 0, kFctrlClassC, big,
+                                   kMaxPayload + 1, f, sizeof(f)));
+    // a received normal DOWN / UP longer than 222 bytes of payload is rejected by peekFrame
+    n = buildData(aesSoftEncrypt, sessKeys(), FrameType::Down, kVecDevId, 7, acceptFcnt, kFctrlOtaSession, big,
+                  kMaxPayload + 1, f, sizeof(f));
+    TEST_ASSERT_TRUE(peekFrame(f, n, info));
+    f[7] &= (uint8_t)~kFctrlOtaSession;
+    TEST_ASSERT_FALSE(peekFrame(f, n, info));
+    f[0] = makeMhdr(FrameType::Up);
+    f[7] = kFctrlClassC;
+    TEST_ASSERT_FALSE(peekFrame(f, n, info));
+    TEST_ASSERT_EQUAL(1, (kCapOtaMask >> kCapOtaShift) & ota::kTransferVersion);
+}
+
+static void test_ota_session_tlv_rules(void)
+{
+    uint8_t buf[32];
+    TlvWriter w(buf, sizeof(buf));
+    const uint8_t blk[2 + 8] = {0, 5, 1, 2, 3, 4, 5, 6, 7, 8};
+    w.add(down::kOtaBlock, 0, blk, sizeof(blk));
+    uint8_t type = 0;
+    const uint8_t *v = nullptr;
+    size_t vl = 0;
+    TEST_ASSERT_TRUE(ota::sessionTlv(buf, w.size(), type, v, vl));
+    TEST_ASSERT_EQUAL_HEX8(0xC2, type);
+    TEST_ASSERT_EQUAL(10, vl);
+    // two TLVs, another type, a channel, empty: dropped
+    w.addU8(down::kReboot, 0xB0);
+    TEST_ASSERT_FALSE(ota::sessionTlv(buf, w.size(), type, v, vl));
+    TlvWriter w2(buf, sizeof(buf));
+    w2.addU32(down::kTime, 1);
+    TEST_ASSERT_FALSE(ota::sessionTlv(buf, w2.size(), type, v, vl));
+    TlvWriter w3(buf, sizeof(buf));
+    const uint8_t end = 1;
+    w3.add(down::kOtaEnd, 1, &end, 1);
+    TEST_ASSERT_FALSE(ota::sessionTlv(buf, w3.size(), type, v, vl));
+    TlvWriter w4(buf, sizeof(buf));
+    w4.add(down::kOtaEnd, 0, &end, 1);
+    TEST_ASSERT_TRUE(ota::sessionTlv(buf, w4.size(), type, v, vl));
+    TEST_ASSERT_EQUAL_HEX8(0xC3, type);
+    TEST_ASSERT_FALSE(ota::sessionTlv(buf, 0, type, v, vl));
+    TEST_ASSERT_FALSE(ota::sessionTlv(buf, 2, type, v, vl)); // truncated
+}
+
+static ota::Start goodStart()
+{
+    ota::Start s;
+    s.imageLen = 90112;
+    s.imageCrc = 0xA1B2C3D4;
+    s.fwVersion = 0x000600;
+    s.hwType = 3;
+    s.k = 32;
+    s.cadence100ms = 260;
+    return s;
+}
+
+static void test_ota_start_codec_and_check(void)
+{
+    ota::Start s = goodStart();
+    uint8_t v[ota::kStartLen + 2] = {};
+    TEST_ASSERT_EQUAL(22, ota::encodeStart(s, v));
+    const uint8_t expected[22] = {0x01, 0x00, 0x01, 0x60, 0x00, 0xA1, 0xB2, 0xC3, 0xD4, 0x00, 0x00, 0x06, 0x00,
+                                  0x00, 0x03, 0xE8, 0x20, 0x01, 0x04, 0x09, 0x0F, 0xA0};
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(expected, v, 22);
+    ota::Start d;
+    TEST_ASSERT_TRUE(ota::decodeStart(v, sizeof(v), d)); // longer values: extra bytes ignored
+    TEST_ASSERT_EQUAL_UINT32(s.imageLen, d.imageLen);
+    TEST_ASSERT_EQUAL_HEX32(s.imageCrc, d.imageCrc);
+    TEST_ASSERT_EQUAL(260, d.cadence100ms);
+    TEST_ASSERT_EQUAL(4000, d.startDelayMs);
+    TEST_ASSERT_FALSE(ota::decodeStart(v, 21, d));
+    TEST_ASSERT_EQUAL(0, ota::checkStart(s));
+    ota::Start b = s;
+    b.version = 2;
+    TEST_ASSERT_EQUAL(ota::kRefuseVersion, ota::checkStart(b));
+    b = s;
+    b.imageLen = 90113; // not a multiple of 8
+    TEST_ASSERT_EQUAL(ota::kRefuseImage, ota::checkStart(b));
+    b.imageLen = ota::kSlotSize + 8;
+    TEST_ASSERT_EQUAL(ota::kRefuseImage, ota::checkStart(b));
+    b = s;
+    b.blockSize = 224;
+    TEST_ASSERT_EQUAL(ota::kRefuseImage, ota::checkStart(b));
+    b = s;
+    b.k = 31;
+    TEST_ASSERT_EQUAL(ota::kRefuseImage, ota::checkStart(b));
+    b.k = 65;
+    TEST_ASSERT_EQUAL(ota::kRefuseImage, ota::checkStart(b));
+    b = s;
+    b.cadence100ms = 15; // 1.5 s: shorter than the block plus the windows
+    TEST_ASSERT_EQUAL(ota::kRefuseImage, ota::checkStart(b));
+    b = s;
+    b.sf = 7; // version 1 receivers: SF9 only
+    TEST_ASSERT_EQUAL(ota::kRefuseImage, ota::checkStart(b));
+    b = s;
+    b.startDelayMs = 2000;
+    TEST_ASSERT_EQUAL(ota::kRefuseImage, ota::checkStart(b));
+    b = s;
+    b.cadence100ms = 210; // 33 x 21 s = 693 s: more than 5 statuses per hour (D7)
+    TEST_ASSERT_EQUAL(ota::kRefuseImage, ota::checkStart(b));
+    b.cadence100ms = 220; // 726 s
+    TEST_ASSERT_EQUAL(0, ota::checkStart(b));
+    b.k = 64;
+    b.cadence100ms = 111; // 65 x 11.1 s = 721.5 s
+    TEST_ASSERT_EQUAL(0, ota::checkStart(b));
+    TEST_ASSERT_EQUAL(2 * 33 * 26000, ota::silenceMs(s)); // 2 rounds, ~29 min
+    // the start fits a normal DOWN together with the time TLV
+    uint8_t tlv[40];
+    TlvWriter w(tlv, sizeof(tlv));
+    TEST_ASSERT_TRUE(w.add(down::kOtaStart, 0, v, ota::kStartLen));
+    TEST_ASSERT_TRUE(w.addU32(down::kTime, 1792265000));
+    TEST_ASSERT_EQUAL(29, w.size());
+}
+
+static void test_ota_status_codec(void)
+{
+    ota::Status s;
+    s.base = 300;
+    s.window = 0x8000000000000005ULL;
+    s.slot = 329;
+    uint8_t v[16];
+    TEST_ASSERT_EQUAL(12, ota::encodeStatus(s, v, sizeof(v)));
+    uint8_t tlv[16];
+    TlvWriter w(tlv, sizeof(tlv));
+    TEST_ASSERT_TRUE(w.add(up::kOtaStatus, 0, v, 12));
+    TEST_ASSERT_EQUAL(14, w.size()); // base, window, slot index (spec 14.2)
+    ota::Status d;
+    TEST_ASSERT_TRUE(ota::decodeStatus(v, 12, d));
+    TEST_ASSERT_EQUAL((int)ota::StatusKind::Progress, (int)d.kind);
+    TEST_ASSERT_EQUAL(300, d.base);
+    TEST_ASSERT_EQUAL_HEX64(0x8000000000000005ULL, d.window);
+    TEST_ASSERT_EQUAL(329, d.slot);
+    // a progress value is never read as an event, other lengths are ignored
+    TEST_ASSERT_FALSE(ota::decodeStatus(v, 10, d));
+    TEST_ASSERT_FALSE(ota::decodeStatus(v, 3, d));
+    ota::Status e;
+    e.kind = ota::StatusKind::Refused;
+    e.arg = ota::kRefuseUnconfirmed;
+    TEST_ASSERT_EQUAL(2, ota::encodeStatus(e, v, sizeof(v)));
+    TEST_ASSERT_TRUE(ota::decodeStatus(v, 2, d));
+    TEST_ASSERT_EQUAL((int)ota::StatusKind::Refused, (int)d.kind);
+    TEST_ASSERT_EQUAL(ota::kRefuseUnconfirmed, d.arg);
+    const uint8_t unknown[2] = {9, 0}, zero[2] = {0, 0};
+    TEST_ASSERT_FALSE(ota::decodeStatus(unknown, 2, d));
+    TEST_ASSERT_FALSE(ota::decodeStatus(zero, 2, d)); // kind 0 is the 12-byte progress form only
+    TEST_ASSERT_FALSE(ota::decodeStatus(v, 1, d));
+    TEST_ASSERT_EQUAL(0, ota::encodeStatus(s, v, 11));
+    const uint8_t battery[2] = {6, 23}; // verified, battery 2.3 V
+    TEST_ASSERT_TRUE(ota::decodeStatus(battery, 2, d));
+    TEST_ASSERT_EQUAL((int)ota::StatusKind::BatteryLow, (int)d.kind);
+    TEST_ASSERT_EQUAL(23, d.arg);
+}
+
+static void test_ota_block_codec_limits(void)
+{
+    uint8_t data[ota::kBlockSize] = {}, v[2 + ota::kBlockSize + 8];
+    TEST_ASSERT_EQUAL(0, ota::encodeBlock(1, data, ota::kBlockSize + 8, v, sizeof(v)));
+    TEST_ASSERT_EQUAL(0, ota::encodeBlock(1, data, ota::kBlockSize, v, ota::kBlockSize + 1));
+    TEST_ASSERT_EQUAL(18, ota::encodeBlock(5, data, 16, v, sizeof(v))); // a short last block
+    uint16_t idx;
+    const uint8_t *d;
+    size_t dl;
+    TEST_ASSERT_TRUE(ota::decodeBlock(v, 18, idx, d, dl));
+    TEST_ASSERT_EQUAL(16, dl);
+    TEST_ASSERT_FALSE(ota::decodeBlock(v, 17, idx, d, dl));                   // not a multiple of 8
+    TEST_ASSERT_FALSE(ota::decodeBlock(v, 2, idx, d, dl));                    // empty
+    TEST_ASSERT_FALSE(ota::decodeBlock(v, 2 + ota::kBlockSize + 8, idx, d, dl)); // too long
+}
+
+static void test_ota_block_math(void)
+{
+    TEST_ASSERT_EQUAL(389, ota::blockCount(90112, 232));  // 88 kB
+    TEST_ASSERT_EQUAL(442, ota::blockCount(102400, 232)); // 100 kB
+    TEST_ASSERT_EQUAL(495, ota::blockCount(ota::kSlotSize, 232));
+    TEST_ASSERT_EQUAL(232, ota::blockLength(0, 90112, 232));
+    TEST_ASSERT_EQUAL(90112 - 388 * 232, ota::blockLength(388, 90112, 232)); // 96
+    TEST_ASSERT_EQUAL(0, ota::blockLength(389, 90112, 232));
+    TEST_ASSERT_EQUAL(0, (90112 - 388 * 232) % 8);
+    TEST_ASSERT_EQUAL(44, ota::pageCount(90112, 2048));
+    TEST_ASSERT_EQUAL(45, ota::pageCount(90120, 2048));
+    uint16_t first, last;
+    TEST_ASSERT_TRUE(ota::blocksInPage(0, 90112, 232, 2048, first, last));
+    TEST_ASSERT_EQUAL(0, first);
+    TEST_ASSERT_EQUAL(8, last); // 2047 / 232 = 8
+    TEST_ASSERT_TRUE(ota::blocksInPage(1, 90112, 232, 2048, first, last));
+    TEST_ASSERT_EQUAL(8, first); // block 8 spans pages 0 and 1
+    TEST_ASSERT_EQUAL(17, last);
+    TEST_ASSERT_TRUE(ota::blocksInPage(43, 90112, 232, 2048, first, last));
+    TEST_ASSERT_EQUAL(379, first); // 43 * 2048 / 232
+    TEST_ASSERT_EQUAL(388, last);
+    TEST_ASSERT_FALSE(ota::blocksInPage(44, 90112, 232, 2048, first, last));
+}
+
+static void test_ota_bitmap_window(void)
+{
+    ota::Bitmap b(389);
+    TEST_ASSERT_EQUAL(0, b.firstMissing());
+    for (uint16_t i = 0; i < 100; i++)
+    {
+        b.set(i);
+    }
+    b.set(101);
+    b.set(163); // base + 63
+    b.set(164); // outside the window of base 100
+    b.set(400); // past the end: ignored
+    TEST_ASSERT_EQUAL(103, b.count());
+    TEST_ASSERT_EQUAL(100, b.firstMissing());
+    const uint64_t w = b.window(100);
+    TEST_ASSERT_EQUAL_HEX64(0x8000000000000002ULL, w);
+    // the gateway applies the status to its view
+    ota::Bitmap g(389);
+    g.applyStatus(100, w);
+    TEST_ASSERT_EQUAL(102, g.count());
+    TEST_ASSERT_TRUE(g.test(99) && g.test(101) && g.test(163) && !g.test(164) && !g.test(100));
+    // the sensor's bitmap shrinks (resume check erased pages): the status
+    // replaces the gateway's view, so blocks 88..99 are sent again
+    for (uint16_t i = 0; i < 200; i++)
+    {
+        g.set(i);
+    }
+    g.applyStatus(88, 0x0ULL);
+    TEST_ASSERT_EQUAL(88, g.count());
+    TEST_ASSERT_EQUAL(88, g.firstMissing());
+    TEST_ASSERT_FALSE(g.test(95) || g.test(160) || g.test(199)); // inside and above the window cleared
+    g.applyStatus(0, 0);
+    TEST_ASSERT_EQUAL(0, g.count()); // a new transfer: nothing confirmed
+    g.set(7);
+    TEST_ASSERT_FALSE(g.applyStatus(400, 0)); // base past the end: ignored, view unchanged
+    TEST_ASSERT_EQUAL(1, g.count());
+    TEST_ASSERT_TRUE(g.applyStatus(389, 0));  // base = block count: complete
+    TEST_ASSERT_TRUE(g.complete());
+    // window near the end
+    ota::Bitmap e(389);
+    for (uint16_t i = 0; i < 389; i++)
+    {
+        if (i != 380)
+        {
+            e.set(i);
+        }
+    }
+    TEST_ASSERT_EQUAL(380, e.firstMissing());
+    TEST_ASSERT_EQUAL_HEX64(0x1FEULL, e.window(380)); // 381..388, nothing past the end
+    e.set(380);
+    TEST_ASSERT_TRUE(e.complete());
+    TEST_ASSERT_EQUAL(389, e.firstMissing());
+    // load from a checkpoint clears bits past n
+    uint8_t raw[ota::Bitmap::kBytes];
+    memset(raw, 0xFF, sizeof(raw));
+    ota::Bitmap l;
+    l.load(10, raw);
+    TEST_ASSERT_EQUAL(10, l.count());
+    TEST_ASSERT_EQUAL(0, l.bytes()[2]);
+    b.clear(5);
+    TEST_ASSERT_EQUAL(5, b.firstMissing());
+}
+
+static void test_ota_schedule_and_airtime(void)
+{
+    // the sensor's formula (spec 7): JOIN_REQ 239 ms, largest normal frame 1.20 s
+    TEST_ASSERT_EQUAL(238592, ota::airtimeUs(22, 9));
+    TEST_ASSERT_EQUAL(177152, ota::airtimeUs(12, 9)); // POLL / REJOIN 177 ms
+    TEST_ASSERT_EQUAL(1201152, ota::airtimeUs(234, 9));
+    TEST_ASSERT_EQUAL(248, ota::kBlockFrameLen);
+    const uint32_t block = ota::airtimeUs(ota::kBlockFrameLen, 9);
+    TEST_ASSERT_EQUAL(1262592, block); // 1.26 s
+    TEST_ASSERT_EQUAL(238592, ota::airtimeUs(24, 9));
+    TEST_ASSERT_EQUAL(0, ota::airtimeUs(20, 6));
+    TEST_ASSERT_EQUAL(9117696, ota::airtimeUs(248, 12)); // low data rate optimisation at SF12
+    // cadence within 60 % of the 80 % data share: 26 s at SF9, K = 32
+    TEST_ASSERT_EQUAL(260, ota::cadenceFor(block, 32));
+    const double perHour = 3600.0 / 26 * 32 / 33 * block / 1e6;
+    TEST_ASSERT_TRUE(perHour <= 0.1 * 0.48 * 3600);
+    TEST_ASSERT_EQUAL(220, ota::cadenceFor(ota::airtimeUs(248, 7), 32)); // SF7: 9 s by airtime, 22 s by the 720 s round
+    TEST_ASSERT_EQUAL(120, ota::cadenceFor(ota::airtimeUs(248, 7), 64)); // 65 x 12 s = 780 s
+    // rounds: 32 block slots, then the status slot
+    TEST_ASSERT_FALSE(ota::isStatusSlot(0, 32));
+    TEST_ASSERT_FALSE(ota::isStatusSlot(31, 32));
+    TEST_ASSERT_TRUE(ota::isStatusSlot(32, 32));
+    TEST_ASSERT_FALSE(ota::isStatusSlot(33, 32));
+    TEST_ASSERT_TRUE(ota::isStatusSlot(65, 32));
+    ota::Start s = goodStart();
+    TEST_ASSERT_EQUAL(4000, ota::slotOffsetMs(0, s));
+    TEST_ASSERT_EQUAL(4000 + 33 * 26000, ota::slotOffsetMs(33, s));
+    TEST_ASSERT_EQUAL(6, ota::driftMs(26000));   // 200 ppm of 26 s, rounded up
+    TEST_ASSERT_EQUAL(60, ota::driftMs(300000));
+    // re-anchoring is limited to +-(20 ms + drift)
+    TEST_ASSERT_EQUAL(7, ota::anchorStep(7, 26000));
+    TEST_ASSERT_EQUAL(26, ota::anchorStep(90, 26000));
+    TEST_ASSERT_EQUAL(-26, ota::anchorStep(-500, 26000));
+    TEST_ASSERT_EQUAL(-80, ota::anchorStep(-500, 300000));
+    TEST_ASSERT_EQUAL(26, ota::anchorStep(26, 26000)); // exactly at the limit
+    TEST_ASSERT_EQUAL(279552, ota::airtimeUs(35, 9)); // SHT40 report (9 B TLVs) + 14-byte status TLV
+    TEST_ASSERT_EQUAL(259072, ota::airtimeUs(30, 9)); // accepting UP: accepted 4 B + progress 14 B
+}
+
 int main(int, char **)
 {
     UNITY_BEGIN();
@@ -580,5 +924,13 @@ int main(int, char **)
     RUN_TEST(test_tlv_unknown_types_are_skipped);
     RUN_TEST(test_tlv_truncated_and_writer_errors);
     RUN_TEST(test_tlv_downlink_config);
+    RUN_TEST(test_ota_down_payload_limit_and_binding);
+    RUN_TEST(test_ota_start_codec_and_check);
+    RUN_TEST(test_ota_session_tlv_rules);
+    RUN_TEST(test_ota_status_codec);
+    RUN_TEST(test_ota_block_codec_limits);
+    RUN_TEST(test_ota_block_math);
+    RUN_TEST(test_ota_bitmap_window);
+    RUN_TEST(test_ota_schedule_and_airtime);
     return UNITY_END();
 }

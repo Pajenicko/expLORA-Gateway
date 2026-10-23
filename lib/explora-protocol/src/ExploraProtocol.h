@@ -20,4 +20,5 @@
 #include "ep_crypto.h"
 #include "ep_frame.h"
 #include "ep_keys.h"
+#include "ep_ota.h"
 #include "ep_tlv.h"

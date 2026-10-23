@@ -63,6 +63,19 @@ static uint32_t nextSlot = 1;
 static Gen2Downlink::Budget budget; // task-private
 static uint32_t lastDutyPublishMs = 0;
 
+// OTA frames: one static slot, filled by loop() while free (state 0),
+// handed over (1), launched by the task (2), free again after the outcome
+static OtaFrame otaFrame;
+static volatile uint8_t otaState = 0;
+static StaticQueue_t otaResultQueueBuffer;
+constexpr UBaseType_t OTA_RESULT_QUEUE_LENGTH = 2; // one frame at a time
+static uint8_t otaResultQueueStorage[OTA_RESULT_QUEUE_LENGTH * sizeof(OtaResult)];
+static QueueHandle_t otaResultQueue = nullptr;
+static bool otaActive = false;     // task-private
+static volatile uint32_t otaCancelSeq = 0;
+static Gen2Downlink::RecentRx recentRx; // task-private
+static uint32_t responseAirUs = 0;      // longest response frame (RX window occupancy)
+
 #define COUNT(field)                    \
     do                                  \
     {                                   \
@@ -196,6 +209,10 @@ static bool readPacket(int64_t rxTimeUs, bool timeKnown, bool writeAtIsr, uint32
         COUNT(unreliableTime); // M3: no timed response to this packet
     }
 
+    if (isGen2Marker(rxPacket.data, length))
+    {
+        recentRx.add(rxTimeUs); // its RX1 / RX2 windows stay free of OTA frames
+    }
     rxPacket.responseSlot = claimSlot(rxPacket);
     bool queued = xQueueSend(queue, &rxPacket, 0) == pdTRUE;
     if (!queued && rxPacket.responseSlot != 0)
@@ -435,6 +452,157 @@ static uint32_t runPending()
     return UINT32_MAX;
 }
 
+static void finishOta(OtaOutcome outcome, uint16_t airtimeMs, int32_t lateUs)
+{
+    OtaResult r = {otaFrame.seq, otaFrame.devId, otaFrame.kind, otaFrame.index, outcome, airtimeMs, lateUs};
+    xQueueSend(otaResultQueue, &r, 0); // loop() stalled: the outcome is only counted
+    portENTER_CRITICAL(&statsLock);
+    if (outcome == OtaOutcome::Sent)
+    {
+        counters.otaSent++;
+        if (lateUs > counters.otaMaxLateUs)
+        {
+            counters.otaMaxLateUs = lateUs;
+        }
+    }
+    else if ((size_t)outcome < sizeof(counters.otaSkipped) / sizeof(counters.otaSkipped[0]))
+    {
+        counters.otaSkipped[(size_t)outcome]++;
+    }
+    portEXIT_CRITICAL(&statsLock);
+    otaActive = false;
+    __atomic_store_n(&otaState, 0, __ATOMIC_RELEASE); // loop() may fill the slot again
+}
+
+// Launch checks and the launch of an OTA frame (spec 14.5)
+static void launchOta(int64_t launchUs)
+{
+    if (radio->irqPinActive())
+    {
+        readNotified(); // a packet that just completed is read first (its windows count)
+    }
+    if (radio->receivingNow())
+    {
+        finishOta(OtaOutcome::Busy, 0, 0); // OTA never pre-empts a reception
+        return;
+    }
+    if (esp_timer_get_time() - launchUs > Gen2Downlink::OTA_MAX_LATE_US)
+    {
+        finishOta(OtaOutcome::Late, 0, 0);
+        return;
+    }
+    const uint32_t airUs = radio->timeOnAirUs(otaFrame.len);
+    if (responseAirUs == 0)
+    {
+        responseAirUs = radio->timeOnAirUs(RADIO_TX_MAX);
+    }
+    if (pending.active || recentRx.overlaps(launchUs, airUs, radio->chipOffsetUs(), responseAirUs))
+    {
+        finishOta(OtaOutcome::Response, 0, 0);
+        return;
+    }
+    const uint16_t airMs = (uint16_t)((airUs + 999) / 1000);
+    const uint32_t launchMs = millis() + (uint32_t)((launchUs - esp_timer_get_time()) / 1000);
+    switch (budget.checkOta(launchMs, airMs))
+    {
+    case Gen2Downlink::Verdict::Ok:
+        break;
+    case Gen2Downlink::Verdict::OtaBudget:
+        finishOta(OtaOutcome::OtaBudget, 0, 0);
+        return;
+    case Gen2Downlink::Verdict::Pacing:
+        finishOta(OtaOutcome::Pacing, 0, 0);
+        return;
+    default:
+        finishOta(OtaOutcome::Budget, 0, 0);
+        return;
+    }
+    if (!FlashPermit::tryHoldForRadio())
+    {
+        finishOta(OtaOutcome::NoHold, 0, 0);
+        return;
+    }
+    if (radio->prepareTx(otaFrame.frame, otaFrame.len) != 0)
+    {
+        FlashPermit::releaseFromRadio();
+        recordError();
+        radio->finishTx();
+        finishOta(OtaOutcome::Failed, 0, 0);
+        return;
+    }
+    int64_t left = launchUs - esp_timer_get_time();
+    if (left > 3000)
+    {
+        vTaskDelay(pdMS_TO_TICKS((left - 2000) / 1000));
+    }
+    while (esp_timer_get_time() < launchUs)
+    {
+    }
+    const int32_t lateUs = (int32_t)(esp_timer_get_time() - launchUs);
+    if (lateUs > Gen2Downlink::OTA_MAX_LATE_US)
+    {
+        FlashPermit::releaseFromRadio();
+        radio->finishTx();
+        finishOta(OtaOutcome::Late, 0, lateUs);
+        return;
+    }
+    ulTaskNotifyTake(pdTRUE, 0); // the TxDone notification must not be an old one
+    if (radio->launchTx() != 0)
+    {
+        FlashPermit::releaseFromRadio();
+        recordError();
+        radio->finishTx();
+        finishOta(OtaOutcome::Failed, 0, 0);
+        return;
+    }
+    const int64_t startUs = esp_timer_get_time();
+    FlashPermit::releaseFromRadio(); // the chip transmits on its own from here
+    if (!waitTxDone(startUs + airUs + 100000))
+    {
+        COUNT(txDoneTimeouts);
+    }
+    radio->finishTx();
+    if (!radio->receiving())
+    {
+        recordError();
+    }
+    budget.recordOta(millis(), airMs);
+    finishOta(OtaOutcome::Sent, airMs, lateUs);
+}
+
+// Drive the OTA frame; returns the ms until it needs the task again
+static uint32_t runOta()
+{
+    if (!otaActive && __atomic_load_n(&otaState, __ATOMIC_ACQUIRE) == 1)
+    {
+        otaState = 2;
+        otaActive = true;
+    }
+    if (!otaActive)
+    {
+        return UINT32_MAX;
+    }
+    if (otaCancelSeq == otaFrame.seq)
+    {
+        finishOta(OtaOutcome::Cancelled, 0, 0);
+        return UINT32_MAX;
+    }
+    const int64_t launchUs = otaFrame.slotUs - radio->chipOffsetUs();
+    const int64_t decideUs = launchUs - Gen2Downlink::PREPARE_LEAD_US;
+    const int64_t now = esp_timer_get_time();
+    if (now < decideUs)
+    {
+        return (uint32_t)((decideUs - now + 999) / 1000);
+    }
+    if (!radioOk)
+    {
+        finishOta(OtaOutcome::Failed, 0, 0);
+        return UINT32_MAX;
+    }
+    launchOta(launchUs);
+    return UINT32_MAX;
+}
+
 static void publishDuty()
 {
     uint32_t nowMs = millis();
@@ -445,9 +613,11 @@ static void publishDuty()
     lastDutyPublishMs = nowMs;
     uint32_t used = budget.usedMs(nowMs);
     uint32_t joins = budget.joinUsedMs(nowMs);
+    uint32_t ota = budget.otaUsedMs(nowMs);
     portENTER_CRITICAL(&statsLock);
     counters.dutyUsedMs = used;
     counters.joinUsedMs = joins;
+    counters.otaUsedMs = ota;
     portEXIT_CRITICAL(&statsLock);
 }
 
@@ -462,6 +632,11 @@ static void taskMain(void *)
         // low and cannot read the same packet twice
         takeRequests();
         uint32_t waitMs = runPending();
+        uint32_t otaWaitMs = runOta();
+        if (otaWaitMs < waitMs)
+        {
+            waitMs = otaWaitMs;
+        }
         if (waitMs > 1000)
         {
             waitMs = 1000;
@@ -537,6 +712,8 @@ bool start(LoRaRadio *r, Logger &logger)
                                       &requestQueueBuffer);
     resultQueue =
         xQueueCreateStatic(TX_RESULT_QUEUE_LENGTH, sizeof(TxResult), resultQueueStorage, &resultQueueBuffer);
+    otaResultQueue =
+        xQueueCreateStatic(OTA_RESULT_QUEUE_LENGTH, sizeof(OtaResult), otaResultQueueStorage, &otaResultQueueBuffer);
     task = xTaskCreateStaticPinnedToCore(taskMain, "radio", RADIO_TASK_STACK, nullptr, RADIO_TASK_PRIORITY, taskStack,
                                          &taskBuffer, RADIO_TASK_CORE);
     // From now on the DIO interrupt wakes the task (a packet that arrived
@@ -589,6 +766,59 @@ void cancel(uint32_t slot)
     c.len2 = 0;
     xQueueSend(requestQueue, &c, 0);
     xTaskNotifyGive(task);
+}
+
+OtaFrame *otaFrameSlot()
+{
+    return task != nullptr && __atomic_load_n(&otaState, __ATOMIC_ACQUIRE) == 0 ? &otaFrame : nullptr;
+}
+
+void otaSubmit()
+{
+    __atomic_store_n(&otaState, 1, __ATOMIC_RELEASE);
+    xTaskNotifyGive(task);
+}
+
+void otaCancel(uint32_t seq)
+{
+    otaCancelSeq = seq;
+    if (task)
+    {
+        xTaskNotifyGive(task);
+    }
+}
+
+bool otaTakeResult(OtaResult &result)
+{
+    return otaResultQueue != nullptr && xQueueReceive(otaResultQueue, &result, 0) == pdTRUE;
+}
+
+const char *otaOutcomeName(OtaOutcome outcome)
+{
+    switch (outcome)
+    {
+    case OtaOutcome::Sent:
+        return "sent";
+    case OtaOutcome::Busy:
+        return "reception in progress";
+    case OtaOutcome::Response:
+        return "response window";
+    case OtaOutcome::Budget:
+        return "duty cycle exhausted";
+    case OtaOutcome::OtaBudget:
+        return "OTA duty share exhausted";
+    case OtaOutcome::Pacing:
+        return "OTA pacing";
+    case OtaOutcome::NoHold:
+        return "flash write in progress";
+    case OtaOutcome::Late:
+        return "launch late";
+    case OtaOutcome::Failed:
+        return "radio error";
+    case OtaOutcome::Cancelled:
+        return "cancelled";
+    }
+    return "?";
 }
 
 bool takeResult(TxResult &result)

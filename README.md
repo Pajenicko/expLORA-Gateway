@@ -179,6 +179,41 @@ the LTE operator and signal, and the power source (PoE or USB).
 The daily rain total of a meteo station restarts at local midnight. That needs
 the clock (NTP): without a synchronized time the total keeps adding up.
 
+### Firmware updates of generation 2 sensors (OTA)
+
+A generation 2 sensor whose firmware contains the OTA receiver can be updated
+over LoRa from its detail page (`/sensors/gen2?devId=…`, docs/protocol-v2.md
+§14):
+
+1. **Upload the image** in the "Images" part of the page: the sensor's
+   `firmware.bin` with the image trailer (built with
+   `custom_ota_transfer = 1`). The gateway streams it to its flash, checks
+   length, trailer, load address, CRC and the OTA flags (an image without the
+   OTA receiver is refused – a sensor running it could never be updated over
+   the air again) and keeps one image per HW type (at most 4). An image that a
+   running job uses cannot be replaced or deleted.
+2. **Start** with "Update to vX". The page lists what blocks a start (no
+   image, no OTA receiver, no status report yet, RTC not usable, an
+   unconfirmed image running, another job – one at a time) and warnings (weak
+   link, long report interval); a downgrade, a reinstall or an image that
+   reverted on this sensor before needs a confirmation. The stored image is
+   re-checked first, then the start goes with the sensor's next report.
+3. **Transfer**: one 232-byte block every 26 s in scheduled windows, a
+   progress status every 32 blocks (about 14 min; the sensor's reports ride in
+   it), so an 88 kB image takes about 3–3.5 h. The page shows the state,
+   blocks confirmed / missing / sent, repeats, missed statuses, airtime and an
+   ETA; Pause / Resume keep the progress, Abort discards it, Clear job removes
+   a finished-looking job from the gateway only.
+4. The sensor verifies the image, swaps it in (bootloader) and confirms it
+   after a proven sleep; the job ends Done, or Reverted when the new image did
+   not confirm (that image is never retried automatically).
+
+OTA frames use at most 60 % of the gateway's downlink data share (172.8 s per
+hour on 869.525 MHz) and never pre-empt a reception or a response; while a
+block is on air (1.26 s) the gateway does not receive. `/diag/heap` shows the
+job under `ota` (state, blocks, skipped slots by reason) and the radio side
+under `otaRadio`.
+
 ## Sensor Calibration
 
 The gateway supports calibration of sensor readings through correction values:

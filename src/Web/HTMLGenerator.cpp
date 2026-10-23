@@ -1243,7 +1243,234 @@ static String txPowerAdvice(const Gen2Link::Margins &m, int txNow)
     }
 }
 
-String HTMLGenerator::generateGen2DetailPage(const Gen2Sensor &g, const String &message)
+static String fwText(uint32_t fw)
+{
+    char v[16];
+    OtaImage::versionText(fw, v, sizeof(v));
+    return v;
+}
+
+static String durationText(uint32_t s)
+{
+    if (s < 120)
+    {
+        return String(s) + " s";
+    }
+    if (s < 2 * 3600)
+    {
+        return String(s / 60) + " min";
+    }
+    return String(s / 3600) + " h " + String((s % 3600) / 60) + " min";
+}
+
+static String otaReason(const OtaJob::Job &j)
+{
+    String r = OtaJob::whyText(j.why);
+    if (j.why == OtaJob::Why::Refused)
+    {
+        r += String(": ") + OtaJob::refusalText(j.whyArg);
+    }
+    else if (j.why == OtaJob::Why::SensorFailed)
+    {
+        r += String(": ") + OtaJob::failureText(j.whyArg);
+    }
+    else if (j.why == OtaJob::Why::Left)
+    {
+        r += String(": ") + OtaJob::leaveText(j.whyArg);
+    }
+    else if (j.why == OtaJob::Why::NoProgress && j.missedTotal * 2 > j.statuses)
+    {
+        r += " - uplink too weak (most statuses were not received)";
+    }
+    else if (j.why == OtaJob::Why::Battery && j.state == OtaJob::State::Verified && j.whyArg)
+    {
+        r = "verified, battery " + String(j.whyArg / 10.0f, 1) + " V - installs when it is >= 2.4 V";
+    }
+    return r;
+}
+
+static String otaButton(const char *id, const char *action, const char *label, const char *cls = "btn",
+                        const char *ask = nullptr)
+{
+    String h = "<form method='post' action='/sensors/gen2/ota' style='display:inline'";
+    if (ask)
+    {
+        h += " onsubmit='return confirm(\"" + String(ask) + "\")'";
+    }
+    h += "><input type='hidden' name='devId' value='" + String(id) + "'><input type='hidden' name='action' value='" +
+         action + "'><button type='submit' class='" + cls + "'>" + label + "</button></form> ";
+    return h;
+}
+
+// OTA card of the generation 2 detail page (spec 14.5)
+static void addGen2OtaCard(String &html, const Gen2Sensor &g, const Gen2OtaView &v, const char *id)
+{
+    html += "<div class='card'><h2>Firmware update over the air</h2>";
+    if (v.lastEvent.length() > 0)
+    {
+        html += "<p><small>Last event: " + HTMLGenerator::htmlEscape(v.lastEvent) + "</small></p>";
+    }
+    const OtaJob::Job &j = v.job;
+    const bool mine = v.hasJob && j.devId == g.devId && (j.state != OtaJob::State::None);
+    if (v.hasJob && j.devId != g.devId && !OtaJob::terminal(j.state))
+    {
+        char other[9];
+        snprintf(other, sizeof(other), "%08lX", (unsigned long)j.devId);
+        html += "<p>Another OTA job is running (sensor <a href='/sensors/gen2?devId=" + String(other) + "'><code>" +
+                String(other) + "</code></a>) - one at a time.</p>";
+    }
+    if (mine)
+    {
+        const uint16_t n = j.blocks();
+        const uint16_t done = j.maxConfirmed < n ? j.maxConfirmed : n;
+        html += "<table>";
+        html += "<tr><td>State</td><td><strong>" + String(OtaJob::stateName(j.state)) + "</strong>";
+        const String reason = otaReason(j);
+        if (reason.length() > 0)
+        {
+            html += " <small>(" + HTMLGenerator::htmlEscape(reason) + ")</small>";
+        }
+        if (j.state == OtaJob::State::Done && j.kept)
+        {
+            html += " <small>installed, unconfirmed, cannot be reverted (KEPT)</small>";
+        }
+        if (j.state == OtaJob::State::Done && j.despiteAbort)
+        {
+            html += " <small>installed despite abort</small>";
+        }
+        if (j.manualPause)
+        {
+            html += " <small>paused by the admin</small>";
+        }
+        if (j.state == OtaJob::State::Aborted && j.abortKept)
+        {
+            html += " <small>the sensor did not confirm the abort - its transfer state may stay, and a job with the "
+                    "same image would resume it</small>";
+        }
+        if (j.abortPending)
+        {
+            html += " <small>abort not delivered yet</small>";
+        }
+        html += "</td></tr>";
+        html += "<tr><td>Image</td><td>v" + fwText(j.fw) + " <small>(" + String(j.len) + " B, from v" +
+                fwText(j.baseFw) + ")</small></td></tr>";
+        html += "<tr><td>Blocks confirmed / missing / sent</td><td>" + String(done) + " / " + String(n - done) +
+                " / " + String(j.blocksSent) + " <small>(" + String(j.repeats) + " repeats)</small></td></tr>";
+        html += "<tr><td>Rounds / statuses / missed</td><td>" + String(j.rounds) + " / " + String(j.statuses) + " / " +
+                String(j.missedTotal) + "</td></tr>";
+        html += "<tr><td>Airtime</td><td>" + String(j.airMs / 1000) + " s this job, " + String(v.otaHourMs / 1000) +
+                " s of 172 s in the last hour</td></tr>";
+        if (j.state == OtaJob::State::Transfer || j.state == OtaJob::State::Paused ||
+            j.state == OtaJob::State::Waiting)
+        {
+            html += "<tr><td>ETA</td><td>" + durationText(OtaJob::etaS(j)) + " of transfer" +
+                    (j.state == OtaJob::State::Transfer && !j.anchorReliable
+                         ? String(" <small>(waiting for the first status to anchor the schedule)</small>")
+                         : String("")) +
+                    "</td></tr>";
+        }
+        if (j.lastStatusUnix != 0 && v.now.unixS != 0)
+        {
+            html += "<tr><td>Last status</td><td>" + durationText(v.now.unixS - j.lastStatusUnix) + " ago</td></tr>";
+        }
+        html += "</table><p>";
+        if (OtaJob::canPause(j))
+        {
+            html += otaButton(id, "pause", "Pause");
+        }
+        if (OtaJob::canResume(j, v.now))
+        {
+            html += otaButton(id, "resume", "Resume");
+        }
+        if (OtaJob::canAbort(j))
+        {
+            // Out of its session no abort reaches the sensor (spec 14.5)
+            html += otaButton(id, "abort", "Abort", "btn-delete",
+                              "Abort the update? A sensor still in its OTA session discards the transfer; otherwise "
+                              "its transfer state may stay and a job with the same image would resume it.");
+        }
+        if (OtaJob::canClear(j))
+        {
+            html += otaButton(id, "clear", "Clear job", "btn-delete",
+                              "Remove the job from the gateway? In Verified this stops the installation.");
+        }
+        html += "</p>";
+        if (OtaJob::canRetry(j))
+        {
+            // Retry = a new start of the stored image: with the same confirmation
+            // as a start (downgrade, reinstall, the image that reverted here)
+            if (v.blockers.length() == 0) // blockers are listed below
+            {
+                html += "<form method='post' action='/sensors/gen2/ota'><input type='hidden' name='devId' value='" +
+                        String(id) + "'><input type='hidden' name='action' value='start'>";
+                if (v.confirm.length() > 0)
+                {
+                    html += "<p style='color:#c0392b;'>" + HTMLGenerator::htmlEscape(v.confirm) +
+                            "</p><label><input type='checkbox' name='confirm' value='1'> I confirm</label> ";
+                }
+                html += "<button type='submit' class='btn'>Retry" +
+                        (v.imageOk ? String(" with v") + fwText(v.imageFw) : String("")) + "</button></form>";
+            }
+        }
+        if (j.state == OtaJob::State::Transfer && v.now.unixS == 0)
+        {
+            html += "<p><small>The gateway has no valid clock: other sensors' report slots are not known, blocks "
+                    "may collide with their uplinks.</small></p>";
+        }
+    }
+    // Start
+    if (!mine || OtaJob::terminal(j.state))
+    {
+        if (v.imageOk)
+        {
+            html += "<p>Image for this sensor: <strong>v" + fwText(v.imageFw) + "</strong> (" + String(v.imageLen) +
+                    " B), estimated " + durationText(v.estimateS) + " incl. the swap and confirmation.</p>";
+        }
+        if (v.blockers.length() > 0)
+        {
+            html += "<p style='color:#c0392b;'>" + HTMLGenerator::htmlEscape(v.blockers) + "</p>";
+        }
+        if (v.warnings.length() > 0)
+        {
+            html += "<p style='color:#e67e22;'>Note: " + HTMLGenerator::htmlEscape(v.warnings) + "</p>";
+        }
+        if (v.imageOk && v.blockers.length() == 0 && !(mine && OtaJob::canRetry(j)))
+        {
+            html += "<form method='post' action='/sensors/gen2/ota'><input type='hidden' name='devId' value='" +
+                    String(id) + "'><input type='hidden' name='action' value='start'>";
+            if (v.confirm.length() > 0)
+            {
+                html += "<p style='color:#c0392b;'>" + HTMLGenerator::htmlEscape(v.confirm) +
+                        "</p><label><input type='checkbox' name='confirm' value='1'> I confirm</label> ";
+            }
+            html += "<button type='submit' class='btn'>Update to v" + fwText(v.imageFw) + "</button></form>";
+        }
+    }
+    // Image store
+    html += "<h3>Images</h3><table><tr><th>HW type</th><th>Version</th><th>Size</th><th></th></tr>";
+    for (size_t i = 0; i < v.imageCount; i++)
+    {
+        const OtaStore::Meta &m = v.images[i];
+        char hw[8];
+        snprintf(hw, sizeof(hw), "%04X", m.hwType);
+        html += "<tr><td>0x" + String(hw) + "</td><td>v" + fwText(m.fw) + "</td><td>" + String(m.len) +
+                " B</td><td><form method='post' action='/ota/delete' onsubmit='return confirm(\"Delete this image?\")'>"
+                "<input type='hidden' name='hw' value='" +
+                String(m.hwType) + "'><input type='hidden' name='devId' value='" + String(id) +
+                "'><button type='submit' class='btn-delete'>Delete</button></form></td></tr>";
+    }
+    if (v.imageCount == 0)
+    {
+        html += "<tr><td colspan='4'>none</td></tr>";
+    }
+    html += "</table>";
+    html += "<form method='post' action='/ota/upload?devId=" + String(id) +
+            "' enctype='multipart/form-data'><p>Upload a sensor image (<code>firmware.bin</code> with the trailer, "
+            "built with the OTA receiver): <input type='file' name='image' accept='.bin' required> "
+            "<button type='submit' class='btn'>Upload</button></p></form></div>";
+}
+
+String HTMLGenerator::generateGen2DetailPage(const Gen2Sensor &g, const String &message, const Gen2OtaView *ota)
 {
     String html;
     html.reserve(9000);
@@ -1260,7 +1487,13 @@ String HTMLGenerator::generateGen2DetailPage(const Gen2Sensor &g, const String &
         html += "<p><strong>" + htmlEscape(message) + "</strong></p>";
     }
     html += "<table>";
-    html += "<tr><td>Last heard</td><td>" + formatRelativeMillis(now, g.lastSeenMs, g.seen) + "</td></tr>";
+    html += "<tr><td>Last heard</td><td>" + formatRelativeMillis(now, g.lastSeenMs, g.seen);
+    if (ota && ota->hasJob && ota->job.devId == g.devId && ota->job.state == OtaJob::State::Transfer)
+    {
+        // During a transfer the reports ride in the OTA statuses (spec 14.5)
+        html += " <small>(OTA transfer: reports every " + String(ota->job.roundS() / 60) + " min)</small>";
+    }
+    html += "</td></tr>";
     if (g.hasFw)
     {
         html += "<tr><td>Hardware / firmware</td><td>HW " + String(g.hwType) + ", FW " + String(g.fwMajor) + "." +
@@ -1436,6 +1669,10 @@ String HTMLGenerator::generateGen2DetailPage(const Gen2Sensor &g, const String &
     html += "<form method='post' action='/sensors/gen2/resetnonce' onsubmit='return confirm(\"Accept the next join "
             "of this sensor with any devNonce?\")'><input type='hidden' name='devId' value='" +
             String(id) + "'><button type='submit' class='btn-delete'>Reset devNonce</button></form></div>";
+    if (ota)
+    {
+        addGen2OtaCard(html, g, *ota, id);
+    }
     html += "<p><a class='btn' href='/sensors'>Back to Sensors</a></p>";
     addHtmlFooter(html);
     return html;

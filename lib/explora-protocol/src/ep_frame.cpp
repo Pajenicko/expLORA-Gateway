@@ -75,7 +75,7 @@ bool peekFrame(const uint8_t *frame, size_t len, FrameInfo &info)
     {
     case FrameType::Up:
     case FrameType::Down:
-        if (len < kDataOverhead || len - kDataOverhead > kMaxPayload)
+        if (len < kDataOverhead || len - kDataOverhead > maxPayload(info.type, frame[7]))
         {
             return false;
         }
@@ -110,7 +110,7 @@ size_t buildData(AesEncryptFn aes, const KeyPair &keys, FrameType type, uint32_t
                  uint32_t confFcnt, uint8_t fctrl, const uint8_t *payload, size_t payloadLen, uint8_t *out,
                  size_t outCap)
 {
-    if ((type != FrameType::Up && type != FrameType::Down) || payloadLen > kMaxPayload ||
+    if ((type != FrameType::Up && type != FrameType::Down) || payloadLen > maxPayload(type, fctrl) ||
         outCap < payloadLen + kDataOverhead || (payloadLen > 0 && payload == nullptr))
     {
         return 0;

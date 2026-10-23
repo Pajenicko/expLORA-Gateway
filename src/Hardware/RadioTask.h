@@ -20,6 +20,14 @@
  * task only checks the duty cycle, stages and launches the frame on the
  * downlink channel and reports the outcome through takeResult().
  *
+ * OTA frames (protocol v2, docs/protocol-v2.md 14.5): one 255-byte frame
+ * slot with its slot time, built by loop() >= 300 ms before the slot. At
+ * launch - 20 ms the task checks that no header is being received, that no
+ * RX1 / RX2 window of a generation 2 UP of the last ~2.4 s overlaps the
+ * frame, the OTA share of the duty cycle and its OTA -> OTA pacing, holds
+ * the flash permit to the launch and skips a launch more than 15 ms late.
+ * OTA is the lowest priority: it never pre-empts a reception or a response.
+ *
  * Copyright Pajenicko s.r.o., Igor Sverma (C) 2026
  *
  * This program is free software: you can redistribute it and/or modify
@@ -41,6 +49,7 @@ constexpr UBaseType_t RADIO_QUEUE_LENGTH = 8;   // packets
 constexpr uint32_t RADIO_HEALTH_CHECK_MS = 600000; // radio working
 constexpr uint32_t RADIO_RETRY_MS = 30000;         // radio not initialized / not answering
 constexpr size_t RADIO_TX_MAX = 96;                // longest downlink frame staged by the task
+constexpr size_t RADIO_OTA_MAX = 255;              // OTA session frame (one block)
 
 // One received packet with its reception metadata
 struct RadioPacket
@@ -82,6 +91,49 @@ enum class TxOutcome : uint8_t
     Failed,      // driver error
 };
 
+enum class OtaKind : uint8_t
+{
+    Block,
+    End, // OTA end (pause / abort of the admin) in a block slot
+};
+
+// One OTA session frame for the radio task
+struct OtaFrame
+{
+    uint32_t seq;      // != 0, chosen by loop()
+    uint32_t devId;
+    int64_t slotUs;    // esp_timer time of the sensor's slot (the task subtracts its chip offset)
+    OtaKind kind;
+    uint16_t index;    // block index
+    uint8_t len;
+    uint8_t frame[RADIO_OTA_MAX];
+};
+
+enum class OtaOutcome : uint8_t
+{
+    Sent,
+    Busy,        // a header was being received
+    Response,    // an RX1 / RX2 window of a recent UP overlaps
+    Budget,      // data share exhausted
+    OtaBudget,   // OTA share (60 % of the data share) exhausted
+    Pacing,      // 9 x t after the previous OTA frame not over
+    NoHold,      // a flash write was running at launch - 20 ms
+    Late,        // more than 15 ms late
+    Failed,      // driver error
+    Cancelled,   // loop() withdrew it (session ended)
+};
+
+struct OtaResult
+{
+    uint32_t seq;
+    uint32_t devId;
+    OtaKind kind;
+    uint16_t index;
+    OtaOutcome outcome;
+    uint16_t airtimeMs;
+    int32_t lateUs; // launch vs plan (sent frames)
+};
+
 struct TxResult
 {
     uint32_t slot;
@@ -113,6 +165,10 @@ struct Stats
     uint32_t txDoneTimeouts; // no TxDone within airtime + 100 ms
     uint32_t dutyUsedMs;    // downlink airtime in the last hour (all)
     uint32_t joinUsedMs;    // ... JOIN_ACC / REJOIN share
+    uint32_t otaUsedMs;     // ... OTA frames
+    uint32_t otaSent;       // OTA frames launched
+    uint32_t otaSkipped[10]; // per OtaOutcome (index 0 unused)
+    int32_t otaMaxLateUs;   // latest launch of a sent OTA frame
     RadioError lastError;   // last driver error (read or reset)
     uint32_t stackFree;     // task stack high-water mark, bytes
 };
@@ -134,6 +190,17 @@ void cancel(uint32_t slot);
 // loop(): outcome of a respond(), false when none is waiting
 bool takeResult(TxResult &result);
 const char *txOutcomeName(TxOutcome outcome);
+
+// loop(): the one OTA frame slot to fill (static, shared with the task),
+// nullptr while the previous frame is still with the task
+OtaFrame *otaFrameSlot();
+// loop(): hand the filled slot over
+void otaSubmit();
+// loop(): withdraw the frame with this seq if it has not been launched
+void otaCancel(uint32_t seq);
+// loop(): outcome of an OTA frame, false when none is waiting
+bool otaTakeResult(OtaResult &result);
+const char *otaOutcomeName(OtaOutcome outcome);
 
 // loop(): log what the radio task counted since the last call (the task
 // itself never logs - Logger formats Strings and takes the UART lock)

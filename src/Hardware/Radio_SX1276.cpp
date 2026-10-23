@@ -213,7 +213,9 @@ bool RadioSX1276::receivingNow()
     {
         return false;
     }
-    return (module->SPIreadRegister(RADIOLIB_SX127X_REG_MODEM_STAT) & 0x0A) != 0;
+    // RegModemStat: bit 0 signal detected (from the preamble on), bit 1
+    // signal synchronized, bit 3 header info valid - live, not latched
+    return (module->SPIreadRegister(RADIOLIB_SX127X_REG_MODEM_STAT) & 0x0B) != 0;
 }
 
 int16_t RadioSX1276::prepareTx(const uint8_t *frame, size_t len)
