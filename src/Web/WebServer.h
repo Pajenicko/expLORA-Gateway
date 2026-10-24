@@ -31,6 +31,8 @@
 #include "../Storage/ConfigManager.h"
 #include "../Protocol/MQTTManager.h"
 #include "WebAuth.h"
+#include "../Update/GatewayOta.h"
+#include <memory>
 
 /**
  * Class for web portal management
@@ -67,22 +69,25 @@ private:
     bool &configMode;
 
 
-    // Firmware upload state
-    bool otaUploadActive = false; // Update.begin() succeeded, not finished/aborted yet
+    // Firmware upload state (Update/GatewayOta.h)
+    bool otaUploadActive = false; // the writer holds the slot (not concluded / aborted yet)
+    std::unique_ptr<GatewayOta::Writer> otaWriter;
+    bool otaUploadFinished = false; // the file ended and was classified (otaUploadOutcome)
+    GatewayImage::Outcome otaUploadOutcome;
+    uint64_t otaUploadSession = 0;  // login session of the upload (binds a confirmation)
     AsyncWebServerRequest *otaUploadOwner = nullptr; // request that runs the upload
     bool otaUploadSawFile = false;                   // the owner already sent one file part
     bool otaUploadHasError = false;
     String otaUploadErrorMsg = "";
     size_t otaUploadExpected = 0;
     size_t otaUploadWritten  = 0;
-    // Image header collected across chunks for the chip check (a TCP
-    // segment boundary can split it)
-    uint8_t otaHeader[32];
-    size_t otaHeaderLen = 0;
+    // The finished upload: activate / wait for a confirmation / refuse
+    GatewayOta::Result concludeUpload();
 
     // Sensor image upload (OTA image store, protocol v2 spec 14.5)
     AsyncWebServerRequest *imgUploadOwner = nullptr;
     bool imgUploadSawFile = false;
+    bool imgUploadLogged = false; // the refusal at the end of the file was logged already (not again at completion)
     String imgUploadError;
     String imgUploadMessage;
 
@@ -94,9 +99,10 @@ private:
 
     // Firmware download requested by /firmware/update, done by the loop task
     String pendingOtaUrl;
+    uint64_t pendingOtaSession = 0; // login session that asked for it (binds a confirmation)
     volatile bool urlOtaRunning = false; // loop task is downloading firmware
     std::mutex otaUrlMutex;
-    void runUrlOta(const String &url);
+    void runUrlOta(const String &url, uint64_t session);
 
     // Update check, also done by the loop task; the page polls for the result
     bool updateCheckRequested = false;
@@ -106,7 +112,7 @@ private:
     String updateCheckResult;
     unsigned long updateCheckAt = 0;
     void runUpdateCheck();
-    void abortUpload(const String &reason);
+    void abortUpload(const String &reason, bool log = true);
     volatile unsigned long restartAt = 0; // always written before restartRequested
 
     ConfigManager &configManager; // Reference to configuration
@@ -178,6 +184,8 @@ private:
 
     // Firmware update handling
     void handleFirmwarePage(AsyncWebServerRequest *request);
+    void handleFirmwareConfirm(AsyncWebServerRequest *request);
+    void handleSignedOnlyPost(AsyncWebServerRequest *request);
     void handleFirmwareUploadComplete(AsyncWebServerRequest *request);
     void handleFirmwareUploadChunk(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final);
 
@@ -211,6 +219,7 @@ public:
 
     // Get current mode
     bool isInAPMode() const;
+    bool started() const { return serverStarted; }
 
     // Restart web server
     void restart();

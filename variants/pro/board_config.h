@@ -6,6 +6,8 @@
 
 // OTA auto-update manifest
 #define FIRMWARE_UPDATE_URL "https://pajenicko.cz/webflash/explora-gw-pro-autoupdate.json"
+// Board id in a gateway signature block (Security/SigBlock.h: 1 Pro, 2 Lite)
+#define BOARD_SIGN_TARGET 1
 
 // Radio chip: E22-900M22S = SX1262, TCXO on DIO3, RF switch RXEN + DIO2 (TXEN)
 #define RADIO_SX1262

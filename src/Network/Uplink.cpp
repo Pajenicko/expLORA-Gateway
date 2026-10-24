@@ -21,6 +21,7 @@
 
 #include "Uplink.h"
 #include "WifiPolicy.h"
+#include "../Update/UpdateModePolicy.h"
 #include <esp_sntp.h>
 #include <esp_wifi.h>
 #if defined(HAS_LTE)
@@ -85,12 +86,12 @@ bool Uplink::wifiDriverRunning() const
 // off (the loop task may be deinitialising the driver meanwhile)
 bool Uplink::stationHasIP() const
 {
-    return !switchedOffAtBoot && WiFi.STA.hasIP();
+    return !switchedOffAtBoot && !(suspendedMask.load() & UpdateModePolicy::IF_WIFI_STA) && WiFi.STA.hasIP();
 }
 
 bool Uplink::stationConnected() const
 {
-    return !switchedOffAtBoot && WiFi.STA.connected();
+    return !switchedOffAtBoot && !(suspendedMask.load() & UpdateModePolicy::IF_WIFI_STA) && WiFi.STA.connected();
 }
 
 IPAddress Uplink::getStationIP() const
@@ -330,7 +331,7 @@ void Uplink::process()
 // Station: detect transitions, retry while down
 void Uplink::processStation(unsigned long now)
 {
-    if (!stationEnabled())
+    if (!stationEnabled() || (suspendedMask.load() & UpdateModePolicy::IF_WIFI_STA))
     {
         return;
     }
@@ -428,8 +429,15 @@ void Uplink::processAp(unsigned long now)
     in.apTimeout = AP_TIMEOUT;
     in.restoreDelay = AP_RESTORE_DELAY;
     bool wantAp = WifiPolicy::apWanted(in);
+    apWantedLast = wantAp;
+    // Update mode: the AP (or the whole driver) stays off until resumed
+    const bool wifiHeld = (suspendedMask.load() & (UpdateModePolicy::IF_WIFI_STA | UpdateModePolicy::IF_WIFI_AP)) != 0;
 
-    if (wantAp && !apActive && now - lastApAttempt > AP_RETRY_INTERVAL)
+    if (wifiHeld)
+    {
+        // nothing to start or stop
+    }
+    else if (wantAp && !apActive && now - lastApAttempt > AP_RETRY_INTERVAL)
     {
         lastApAttempt = now;
         if (switchedOff && !in.bootGrace && apStartFailures == 0)
@@ -467,8 +475,8 @@ void Uplink::processAp(unsigned long now)
     // driver (softAPdisconnect(true) does it already when the AP ran alone;
     // this also covers a failed AP start that left the driver initialised).
     // A failed stop is retried every AP_RETRY_INTERVAL and logged once
-    if (switchedOff && !WifiPolicy::driverWanted(stationEnabled(), wantAp) && !apActive && wifiDriverRunning() &&
-        now - lastDriverStop > AP_RETRY_INTERVAL)
+    if (!wifiHeld && switchedOff && !WifiPolicy::driverWanted(stationEnabled(), wantAp) && !apActive &&
+        wifiDriverRunning() && now - lastDriverStop > AP_RETRY_INTERVAL)
     {
         lastDriverStop = now;
         if (stopDriver())
@@ -494,6 +502,182 @@ void Uplink::processAp(unsigned long now)
             captiveCallback(captive);
         }
     }
+}
+
+uint8_t Uplink::updateModeRunning() const
+{
+    uint8_t running = 0;
+    if (wifiDriverRunning() && (stationEnabled() || !apActive))
+    {
+        running |= UpdateModePolicy::IF_WIFI_STA;
+    }
+    if (apActive)
+    {
+        running |= UpdateModePolicy::IF_WIFI_AP;
+    }
+#if defined(HAS_LTE)
+    if (lte->getState() != LteModem::State::Disabled && !lte->suspended())
+    {
+        running |= UpdateModePolicy::IF_LTE;
+    }
+#endif
+    return running;
+}
+
+uint8_t Uplink::updateModeSuspend(uint8_t mask)
+{
+    uint8_t off = 0;
+    if (mask & UpdateModePolicy::IF_WIFI_STA)
+    {
+        // Flag first: web handlers (another task) stop asking the station
+        // before the driver goes away
+        bool hadAp = apActive;
+        suspendedMask |= UpdateModePolicy::IF_WIFI_STA | (hadAp ? UpdateModePolicy::IF_WIFI_AP : 0);
+        if (hadAp)
+        {
+            stopAp();
+        }
+        reconnecting = false;
+        stationWasConnected = false;
+        if (stopDriver())
+        {
+            logger.info("Update mode: WiFi switched off" + String(hadAp ? " (station and access point)" : ""));
+        }
+        else
+        {
+            logger.warning("Update mode: the WiFi driver could not be stopped");
+        }
+        off |= UpdateModePolicy::IF_WIFI_STA | (hadAp ? UpdateModePolicy::IF_WIFI_AP : 0);
+    }
+    else if ((mask & UpdateModePolicy::IF_WIFI_AP) && apActive)
+    {
+        suspendedMask |= UpdateModePolicy::IF_WIFI_AP;
+        stopAp();
+        if (!stationEnabled())
+        {
+            stopDriver(); // the driver ran for the AP alone
+        }
+        logger.info("Update mode: access point switched off");
+        off |= UpdateModePolicy::IF_WIFI_AP;
+    }
+#if defined(HAS_LTE)
+    if ((mask & UpdateModePolicy::IF_LTE) && lte->suspend())
+    {
+        suspendedMask |= UpdateModePolicy::IF_LTE;
+        off |= UpdateModePolicy::IF_LTE;
+    }
+#endif
+    selectActive();
+    return off;
+}
+
+void Uplink::updateModeResume()
+{
+    uint8_t m = suspendedMask.load();
+    if (m == 0)
+    {
+        return;
+    }
+    unsigned long now = millis();
+#if defined(HAS_LTE)
+    if (m & UpdateModePolicy::IF_LTE)
+    {
+        lte->resume();
+    }
+#endif
+    if (m & UpdateModePolicy::IF_WIFI_STA)
+    {
+        if (stationEnabled())
+        {
+            String ssid, password; // copies: the web task may save new ones
+            {
+                std::lock_guard<std::recursive_mutex> guard(config.mutex());
+                ssid = config.wifiSSID;
+                password = config.wifiPassword;
+            }
+            WiFi.mode(WIFI_STA);
+            WiFi.begin(ssid.c_str(), password.c_str());
+            config.lastWifiAttempt = now;
+            reconnecting = true;
+            reconnectStartedAt = now;
+            logger.info("Update mode: WiFi station back on, connecting");
+        }
+    }
+    suspendedMask = 0;
+    // An AP that ran before comes back at once: the WiFi policy only keeps a
+    // running AP for its timeout after local access came up and would not
+    // start it again; processAp() stops it when that timeout is over. One
+    // that did not run comes back through processAp() if the policy wants it
+    if (m & UpdateModePolicy::IF_WIFI_AP)
+    {
+        startAp();
+        lastApAttempt = now;
+    }
+    else
+    {
+        lastApAttempt = now - AP_RETRY_INTERVAL - 1;
+    }
+    logger.info("Update mode: interfaces restored");
+}
+
+bool Uplink::updateModeWanted(uint8_t bit) const
+{
+    if (bit & UpdateModePolicy::IF_WIFI_STA)
+    {
+        return stationEnabled();
+    }
+#if defined(HAS_LTE)
+    if (bit & UpdateModePolicy::IF_LTE)
+    {
+        std::lock_guard<std::recursive_mutex> guard(config.mutex());
+        return config.lteEnabled && lte->getState() != LteModem::State::Disabled;
+    }
+#endif
+    return false;
+}
+
+uint32_t Uplink::updateModeConfigKey(uint8_t bit) const
+{
+    // FNV-1a over the settings that decide how the interface comes back
+    uint32_t h = 2166136261u;
+    auto mix = [&h](const String &s)
+    {
+        for (size_t i = 0; i < s.length(); i++)
+        {
+            h = (h ^ (uint8_t)s[i]) * 16777619u;
+        }
+        h = (h ^ 0xFFu) * 16777619u; // separator
+    };
+    std::lock_guard<std::recursive_mutex> guard(config.mutex());
+    if (bit & UpdateModePolicy::IF_WIFI_STA)
+    {
+        mix(config.wifiSSID);
+        mix(config.wifiPassword);
+        mix(String(config.wifiEnabled ? 1 : 0) + String(config.configMode ? 1 : 0));
+    }
+    if (bit & UpdateModePolicy::IF_LTE)
+    {
+        mix(String(config.lteEnabled ? 1 : 0));
+        mix(config.lteApn);
+        mix(config.ltePin);
+    }
+    return h;
+}
+
+void Uplink::refreshRoutes()
+{
+    selectActive();
+    applyDns(false);
+    applyDefaultRoute();
+}
+
+bool Uplink::lteOnline() const
+{
+#if defined(HAS_LTE)
+    return lte->hasIP();
+#else
+    return false;
+#endif
 }
 
 // Bring the AP up without touching the station

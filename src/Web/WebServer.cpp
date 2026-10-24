@@ -33,54 +33,18 @@
 #include <esp_heap_caps.h>
 #include <LittleFS.h>
 #include <HTTPClient.h>
-#include <Update.h>
 #include <esp_app_format.h>
 #include <NetworkClientSecure.h>
 #include "../config.h"
 #include "../Hardware/WatchdogPause.h"
+#include "../Update/UpdateMode.h"
 #include "../Hardware/HeapGuard.h"
 #include "../Hardware/FlashPermit.h"
 #include "../Hardware/RadioTask.h"
 #include "../Storage/OtaStore.h"
+#include "../Protocol/OtaImageSigned.h"
 #include <sys/time.h>
 #include <atomic>
-
-// OTA flash access under the flash write permit (a pending radio response
-// is not delayed by erasing / programming the app partition)
-static bool otaBegin(size_t size)
-{
-    FlashWriteGuard guard;
-    return Update.begin(size);
-}
-
-// Why Update.begin() failed. Error 0 has two causes in the library: an
-// update already running, or its 4 kB sector buffer not allocated (short
-// heap; _size stays 0 then)
-static String otaBeginError()
-{
-    if (Update.getError())
-    {
-        return "Update.begin failed: " + String(Update.getError());
-    }
-    if (Update.isRunning())
-    {
-        return "Update.begin failed: another update is in progress";
-    }
-    return String("Update.begin failed: not enough memory, try again (") +
-           heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) + " B largest free block)";
-}
-
-static size_t otaWrite(uint8_t *data, size_t len)
-{
-    FlashWriteGuard guard;
-    return Update.write(data, len);
-}
-
-static bool otaEnd(bool evenIfRemaining = false)
-{
-    FlashWriteGuard guard;
-    return Update.end(evenIfRemaining);
-}
 
 // Request attribute set on a request the patched parser must drop. The
 // library keys attributes by pointer, so both sides use this one symbol
@@ -162,29 +126,6 @@ private:
     WebAuth &auth;
 };
 
-// Reject images built for another chip (Lite = ESP32-S3, Pro = ESP32) before
-// anything is written; the image header starts every application binary
-static bool firmwareImageMatches(const uint8_t *data, size_t len, String &error)
-{
-    if (len < sizeof(esp_image_header_t))
-    {
-        error = "Firmware image too short";
-        return false;
-    }
-    const esp_image_header_t *header = (const esp_image_header_t *)data;
-    if (header->magic != ESP_IMAGE_HEADER_MAGIC)
-    {
-        error = "Not an ESP32 firmware image";
-        return false;
-    }
-    if (header->chip_id != CONFIG_IDF_FIRMWARE_CHIP_ID)
-    {
-        error = "Firmware is for a different board (" BOARD_NAME " expected)";
-        return false;
-    }
-    return true;
-}
-
 // Constructor
 WebPortal::WebPortal(SensorManager &sensors, Logger &log, String &ssid, String &password,
                      bool &config_mode, ConfigManager &config)
@@ -210,6 +151,8 @@ WebPortal::WebPortal(SensorManager &sensors, Logger &log, String &ssid, String &
 // }
 
 // Modify the init function to create the task
+static unsigned heavyResponsesRunning(); // the heavy response slots, below
+
 bool WebPortal::init()
 {
     logger.info("Initializing web portal");
@@ -222,6 +165,15 @@ bool WebPortal::init()
 
     // Setup routes (idempotent)
     setupRoutes();
+
+    // Update mode: no session while an upload runs, running heavy pages
+    // finish before its memory check (Update/UpdateMode.h)
+    UpdateMode::setUploadBusy([this]()
+                              { return otaUploadOwner != nullptr || otaUploadActive || imgUploadOwner != nullptr ||
+                                       OtaStore::uploadRunning(); });
+    UpdateMode::setHeavyActive(heavyResponsesRunning);
+    UpdateMode::setRestartPending([this]()
+                                  { return (bool)restartRequested; });
 
     // Start server once
     if (!serverStarted)
@@ -325,6 +277,9 @@ void WebPortal::setupRoutes()
     server.on("/firmware/check", HTTP_GET, std::bind(&WebPortal::handleFirmwareCheck, this, std::placeholders::_1));
     server.on("/firmware/update", HTTP_POST, std::bind(&WebPortal::handleFirmwareUpdate, this, std::placeholders::_1));
     server.on("/firmware", HTTP_GET, std::bind(&WebPortal::handleFirmwarePage, this, std::placeholders::_1));
+    server.on("/firmware/signed", HTTP_POST, std::bind(&WebPortal::handleSignedOnlyPost, this, std::placeholders::_1));
+    // Before POST /firmware (that handler also matches "/firmware/...")
+    server.on("/firmware/confirm", HTTP_POST, std::bind(&WebPortal::handleFirmwareConfirm, this, std::placeholders::_1));
     server.on("/firmware", HTTP_POST,
         [this](AsyncWebServerRequest *request) { this->handleFirmwareUploadComplete(request); },
         [this](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
@@ -356,11 +311,60 @@ static bool isPublicPath(AsyncWebServerRequest *request)
     return request->method() == HTTP_GET && (url == "/api" || url == "/firmware/version");
 }
 
+// Light pages that stay available during an update-mode session: the
+// login, the firmware page (a small status page then) and its status polls,
+// the diagnostics. Everything else is answered 503 then: heavy pages would
+// compete with the TLS session for the heap, and actions (sensor changes,
+// OTA jobs, settings, uploads) wait for the session to end. /reboot too: the
+// loop task that would restart is busy with the session, a restart after it
+// would only discard its result, and the session ends by itself (hard cap)
+static bool availableInUpdateMode(AsyncWebServerRequest *request)
+{
+    const String &url = request->url();
+    if (request->method() == HTTP_POST)
+    {
+        return url == "/login" || url == "/password";
+    }
+    return request->method() == HTTP_GET &&
+           (url == "/login" || url == "/logout" || url == "/password" || url == "/firmware" ||
+            url == "/firmware/check" || url == "/firmware/version" || url == "/diag/heap" ||
+            url == "/diag/network");
+}
+
+// 503 during an update-mode session. Logged-in clients learn why; the
+// public paths (/api) get a generic text
+static void sendUpdateInProgress(AsyncWebServerRequest *request, bool authorized)
+{
+    String text;
+    if (!authorized)
+    {
+        text = "Update in progress - try again in a few minutes.";
+    }
+    else if (request->url() == "/reboot")
+    {
+        text = UpdateMode::refusalText() + " A restart now would only interrupt the update; the session ends by "
+                                           "itself within " + String(UpdateMode::HARD_CAP_MS / 60000) + " minutes.";
+    }
+    else
+    {
+        text = UpdateMode::refusalText();
+    }
+    AsyncWebServerResponse *response = request->beginResponse(503, "text/plain", text);
+    response->addHeader("Retry-After", "60");
+    request->send(response);
+}
+
 void WebPortal::requireLogin(AsyncWebServerRequest *request, ArMiddlewareNext next)
 {
     const String &url = request->url();
+    const bool updateBlocked = UpdateMode::active() && !availableInUpdateMode(request);
     if (isPublicPath(request))
     {
+        if (updateBlocked)
+        {
+            sendUpdateInProgress(request, false);
+            return;
+        }
         next();
         return;
     }
@@ -399,6 +403,12 @@ void WebPortal::requireLogin(AsyncWebServerRequest *request, ArMiddlewareNext ne
     if (!auth.hasPassword() && url != "/password" && url != "/logout")
     {
         request->redirect("/password");
+        return;
+    }
+    // Update mode: only after the login check (the reason is not for anyone)
+    if (updateBlocked)
+    {
+        sendUpdateInProgress(request, true);
         return;
     }
     next();
@@ -486,10 +496,12 @@ void WebPortal::handlePasswordPost(AsyncWebServerRequest *request)
 void WebPortal::handleClient()
 {
     String otaUrl;
+    uint64_t otaSession = 0;
     bool checkUpdate;
     {
         std::lock_guard<std::mutex> lock(otaUrlMutex);
         otaUrl = pendingOtaUrl;
+        otaSession = pendingOtaSession;
         pendingOtaUrl = "";
         if (otaUrl.length() > 0)
         {
@@ -504,7 +516,7 @@ void WebPortal::handleClient()
     }
     if (otaUrl.length() > 0)
     {
-        runUrlOta(otaUrl);
+        runUrlOta(otaUrl, otaSession);
         urlOtaRunning = false;
     }
 
@@ -522,6 +534,10 @@ void WebPortal::handleClient()
     if (restartRequested && (long)(millis() - restartAt) >= 0)
     {
         logger.info("Deferred restart firing now");
+        // A new firmware still waiting for its validation is marked valid
+        // first: the restart was asked for in its web UI (an unwanted
+        // rollback otherwise; Update/GatewayOta.h)
+        GatewayOta::beforeRestart("web UI");
         delay(50); // tiny window for any in-flight TCP to drain
         ESP.restart();
     }
@@ -632,6 +648,10 @@ struct HeavySlot
 };
 static HeavySlot heavySlots[WEB_HEAVY_RESPONSES_MAX];
 static std::atomic<unsigned> heavyActive{0};
+static unsigned heavyResponsesRunning()
+{
+    return heavyActive.load();
+}
 static std::atomic<uint32_t> heavyRefusedBusy{0};
 static std::atomic<uint32_t> heavyRefusedLow{0};
 static std::atomic<uint32_t> heavyExpired{0};
@@ -713,6 +733,11 @@ static size_t stringPagePeak(size_t pageSize)
 {
     return HeapGuard::stringPagePeak(pageSize);
 }
+
+// /firmware (HTMLGenerator::generateFirmwarePage): 12.9 kB measured on the
+// Pro with the card of an image waiting for its confirmation, ~0.5 kB more
+// with the update-mode card; rounded up
+static constexpr size_t FIRMWARE_PAGE_SIZE = 14000;
 
 // Page streamed piece by piece (chunked): only the piece being sent is in
 // RAM, never the whole page nor send()'s copy of it. piece(i) for i in
@@ -1430,8 +1455,13 @@ void WebPortal::sendGen2Detail(AsyncWebServerRequest *request, uint32_t devId, c
         ota->blockers = c.blockers;
         ota->warnings = c.warnings;
         ota->confirm = c.confirm;
+        ota->confirmToken = c.confirmToken;
         ota->estimateS = c.estimateS;
         ota->imageCount = OtaStore::list(ota->images, OtaImage::MAX_HW_TYPES);
+        {
+            std::lock_guard<std::recursive_mutex> guard(configManager.mutex());
+            ota->signedOnly = configManager.signedOnly;
+        }
         ota->otaHourMs = RadioTask::stats().otaUsedMs;
         ota->lastEvent = sensorManager.otaLastEventText();
         struct timeval tv;
@@ -1559,8 +1589,13 @@ void WebPortal::handleGen2Ota(AsyncWebServerRequest *request)
     bool ok = false;
     if (action == "start")
     {
-        bool confirmed = request->hasParam("confirm", true) && request->getParam("confirm", true)->value() == "1";
-        ok = sensorManager.otaRequestStart(devId, confirmed, msg);
+        // The "I confirm" box carries the token of the reasons it was shown with
+        uint32_t token = 0;
+        if (request->hasParam("confirm", true))
+        {
+            token = (uint32_t)strtoul(request->getParam("confirm", true)->value().c_str(), nullptr, 10);
+        }
+        ok = sensorManager.otaRequestStart(devId, token, msg);
     }
     else if (action == "abort" || action == "pause" || action == "resume" || action == "clear")
     {
@@ -1608,8 +1643,19 @@ void WebPortal::handleOtaImageChunk(AsyncWebServerRequest *request, String filen
         {
             return;
         }
-        imgUploadOwner = request;
+        // Not during an update-mode session (the completion is answered 503
+        // by the middleware); claimed under the gate the update mode checks
+        // uploads under
+        {
+            std::lock_guard<std::mutex> gate(UpdateMode::uploadGate());
+            if (UpdateMode::active())
+            {
+                return;
+            }
+            imgUploadOwner = request;
+        }
         imgUploadSawFile = true;
+        imgUploadLogged = false;
         imgUploadError = "";
         imgUploadMessage = "";
         // Own disconnect callback: this request must never pass through
@@ -1651,21 +1697,52 @@ void WebPortal::handleOtaImageChunk(AsyncWebServerRequest *request, String filen
         return;
     }
     OtaStore::Meta meta;
-    if (!OtaStore::uploadValidate(meta, error))
+    bool severe = false;
+    String sigState;
+    // Refusals at the end of the file are logged here, when they are known:
+    // a client that disconnects before the completion must not hide them. A
+    // signature block that is there but wrong (tampered file, another HW
+    // type or version, a bad signature) is an error, not a mistake
+    auto refuse = [this](const String &why, bool asError) {
+        imgUploadError = why;
+        imgUploadLogged = true;
+        if (asError)
+        {
+            logger.error("Image not stored: " + why);
+        }
+        else
+        {
+            logger.warning("Image not stored: " + why);
+        }
+    };
+    if (!OtaStore::uploadValidate(meta, error, severe, sigState))
     {
-        imgUploadError = error;
+        refuse(error, severe);
+        OtaStore::uploadAbort();
+        return;
+    }
+    // "Signed images only" (Firmware page): an unsigned image (incl. one
+    // signed with an unknown key) is refused here, the store stays as it was
+    bool signedOnly;
+    {
+        std::lock_guard<std::recursive_mutex> guard(configManager.mutex());
+        signedOnly = configManager.signedOnly;
+    }
+    if (!OtaImageSigned::storable(OtaImageSigned::classOf(meta.signedKey, meta.unknownKey), signedOnly))
+    {
+        refuse("the image is " + sigState + " and \"Signed images only\" is on (Firmware page)", false);
         OtaStore::uploadAbort();
         return;
     }
     if (sensorManager.otaImageBusy(meta.hwType))
     {
-        imgUploadError = "An OTA job that is not finished uses the image of this HW type";
+        refuse("An OTA job that is not finished uses the image of this HW type", false);
         OtaStore::uploadAbort();
         return;
     }
     if (!OtaStore::uploadCommit(meta, error))
     {
-        imgUploadError = error;
+        refuse(error, true);
         return;
     }
     sensorManager.otaImageChanged(meta.hwType);
@@ -1673,8 +1750,16 @@ void WebPortal::handleOtaImageChunk(AsyncWebServerRequest *request, String filen
     OtaImage::versionText(meta.fw, v, sizeof(v));
     char hw[8];
     snprintf(hw, sizeof(hw), "%04X", meta.hwType);
-    imgUploadMessage = String("Image v") + v + " for HW type 0x" + hw + " stored (" + String(meta.len) + " B)";
-    logger.info(imgUploadMessage);
+    imgUploadMessage = String("Image v") + v + " for HW type 0x" + hw + " stored (" + String(meta.len) + " B), " +
+                       sigState + (meta.isSigned() ? "" : " - starting an update with it needs a confirmation");
+    if (meta.isSigned())
+    {
+        logger.info(imgUploadMessage);
+    }
+    else
+    {
+        logger.warning(imgUploadMessage);
+    }
 }
 
 void WebPortal::handleOtaImageComplete(AsyncWebServerRequest *request)
@@ -1696,10 +1781,14 @@ void WebPortal::handleOtaImageComplete(AsyncWebServerRequest *request)
         {
             OtaStore::uploadAbort();
         }
-        logger.warning(msg);
+        if (!imgUploadLogged) // refusals at the end of the file were logged then
+        {
+            logger.warning(msg);
+        }
     }
     imgUploadOwner = nullptr;
     imgUploadSawFile = false;
+    imgUploadLogged = false;
     imgUploadError = "";
     imgUploadMessage = "";
     uint32_t devId = 0;
@@ -2181,6 +2270,17 @@ void WebPortal::handleDiagHeap(AsyncWebServerRequest *request)
         res->printf("\"mqtt\":{\"status\":\"%s\",\"tls\":%s},",
                     MQTTManager::statusName(mqttManager->status()), mqttManager->usesTls() ? "true" : "false");
     }
+    // Update mode: the session now (reason, what is switched off, lowest
+    // free heap since it started) and the last one
+    res->print("\"updateMode\":");
+    UpdateMode::printDiagJson(*res);
+    // Gateway firmware: how the running image was installed, validation
+    // (rollback) and an image waiting for a confirmation
+    res->print(",\"update\":");
+    GatewayOta::printDiagJson(*res);
+    res->print(",\"radioPaused\":");
+    res->print(RadioTask::paused() ? "true" : "false");
+    res->print(",");
     // Restarts in a row because the heap stayed fragmented (main.cpp)
     extern uint32_t heapFragRestarts;
     res->print("\"fragRestarts\":"); res->print((unsigned long)heapFragRestarts); res->print(",");
@@ -2462,22 +2562,18 @@ private:
     size_t limit;
 };
 
-// Why an HTTPS request cannot start, empty if it can. TLS needs
-// HeapGuard::TLS_MIN_FREE / TLS_MIN_BLOCK of the internal heap (see there)
-static String httpsBlocker()
+// A URL as it may be logged: without "user[:pass]@", query and fragment
+static String urlForLog(const String &url)
 {
-    if (time(nullptr) < 1700000000)
+    // The host as HTTPClient connects to it, no user info, no query
+    // (UpdateModePolicy::urlForLog)
+    std::unique_ptr<char[]> buf(new (std::nothrow) char[url.length() + 16]);
+    if (!buf)
     {
-        return "The clock is not synchronized yet (needed to check certificates)";
+        return String("(URL)");
     }
-    HeapGuard::Heap heap = HeapGuard::tlsHeap();
-    if (!HeapGuard::tlsFits(heap))
-    {
-        return "Not enough free memory for HTTPS: needs " + String(HeapGuard::TLS_MIN_FREE) +
-               " B free with a block of " + String(HeapGuard::TLS_MIN_BLOCK) + " B, has " + String(heap.free) +
-               " B free, largest block " + String(heap.largest) + " B";
-    }
-    return "";
+    UpdateModePolicy::urlForLog(url.c_str(), buf.get(), url.length() + 16);
+    return String(buf.get());
 }
 
 // HTTPS only, server certificate checked against the built-in CA bundle
@@ -2486,6 +2582,33 @@ static bool beginHttps(HTTPClient &http, NetworkClientSecure &client, const Stri
     if (!url.startsWith("https://"))
     {
         return false;
+    }
+    // Update mode (loop task): interfaces may just have been switched off,
+    // which can clear lwIP's DNS list (a DHCP client torn down) while the
+    // session blocks Uplink::process(). DNS servers and default route of the
+    // uplink again, and the host resolved now: a failed lookup gets the
+    // servers re-applied and one more try (the result is cached for GET)
+    if (uplink)
+    {
+        extern Logger logger;
+        uplink->refreshRoutes();
+        // Host without "user[:pass]@" (never logged); IP literals need no lookup
+        char host[128];
+        bool literal = false;
+        IPAddress ip;
+        // hostByName() returns 1 on success and an lwIP error (negative) on a
+        // failure - never 0
+        if (UpdateModePolicy::urlHost(url.c_str(), host, sizeof(host), literal) && !literal &&
+            Network.hostByName(host, ip) != 1)
+        {
+            logger.warning(String("DNS lookup of ") + host + " failed - DNS servers of the uplink re-applied, trying again");
+            delay(1000);
+            uplink->refreshRoutes();
+            if (Network.hostByName(host, ip) != 1)
+            {
+                logger.error(String("DNS lookup of ") + host + " failed again");
+            }
+        }
     }
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     client.useBuiltinCACertBundle();
@@ -2515,9 +2638,25 @@ void WebPortal::handleFirmwareCheck(AsyncWebServerRequest *request)
         }
         else if (!updateCheckRunning)
         {
-            // Polls while the check runs must not queue another one
-            updateCheckRequested = true;
-            updateCheckRunning = true;
+            // Fail now rather than queue a check the update mode refuses. Not
+            // while a new firmware waits for its validation either (as
+            // installs): a session's restore restart would roll it back
+            String refusal = GatewayOta::validationRefusal();
+            if (refusal.length() == 0)
+            {
+                refusal = UpdateMode::wouldRefuse();
+            }
+            if (refusal.length() > 0)
+            {
+                status = 503;
+                body = "{\"error\":\"Update check not started: " + refusal + "\"}";
+            }
+            else
+            {
+                // Polls while the check runs must not queue another one
+                updateCheckRequested = true;
+                updateCheckRunning = true;
+            }
         }
     }
     request->send(status, "application/json", body);
@@ -2527,19 +2666,12 @@ void WebPortal::runUpdateCheck()
 {
     int status = 500;
     String result;
-    String blocker = httpsBlocker();
-    bool clockSet = time(nullptr) >= 1700000000;
-    if (blocker.length() > 0 && clockSet && mqttManager && mqttManager->isConnected() && mqttManager->usesTls())
+    // Update mode: MQTT and the radio stop, interfaces go off only if TLS
+    // does not fit otherwise (Update/UpdateMode.h)
+    UpdateMode::Session session(UpdateMode::Reason::UpdateCheck, UpdateMode::EXTRA_CHECK);
+    if (!session.ok())
     {
-        // Short of memory with an MQTT TLS session up: free it for the check
-        // (MQTT reconnects by itself)
-        mqttManager->disconnect();
-        blocker = httpsBlocker();
-    }
-    if (blocker.length() > 0)
-    {
-        logger.warning("Update check not started: " + blocker);
-        result = "{\"error\":\"" + blocker + "\"}";
+        result = "{\"error\":\"" + session.error() + "\"}";
     }
     else
     {
@@ -2549,6 +2681,7 @@ void WebPortal::runUpdateCheck()
         if (!beginHttps(http, client, FIRMWARE_UPDATE_URL))
         {
             result = "{\"error\":\"HTTP begin failed\"}";
+            session.setResult("check failed: HTTP begin failed");
         }
         else
         {
@@ -2563,6 +2696,7 @@ void WebPortal::runUpdateCheck()
                 if (http.writeToStream(&text) < 0)
                 {
                     status = 500;
+                    session.setResult("check failed: manifest too large or unreadable");
                     result = "{\"error\":\"Update manifest too large or unreadable\"}";
                 }
                 else
@@ -2574,6 +2708,7 @@ void WebPortal::runUpdateCheck()
             else
             {
                 logger.error("Firmware check failed: HTTP " + String(httpCode));
+                session.setResult("check failed: HTTP " + String(httpCode));
                 result = "{\"error\":\"Failed to check remote version\",\"code\":" + String(httpCode) + "}";
             }
             http.end();
@@ -2602,40 +2737,54 @@ void WebPortal::handleFirmwareUpdate(AsyncWebServerRequest *request)
         return;
     }
     // Fail now rather than answer "started" and give up in the loop task
-    String blocker = httpsBlocker();
-    if (blocker.length() > 0 && !(mqttManager && mqttManager->tlsSessionUp()))
+    // (the memory check follows in the update mode, after MQTT and the radio
+    // stopped and possibly interfaces went off)
+    String refusal = UpdateMode::wouldRefuse();
+    if (refusal.length() == 0)
     {
-        logger.warning("Firmware download not started: " + blocker);
-        request->send(503, "application/json", "{\"error\":\"" + blocker + "\"}");
+        refusal = GatewayOta::installRefusal();
+    }
+    if (refusal.length() > 0)
+    {
+        logger.warning("Firmware download not started: " + refusal);
+        request->send(503, "application/json", "{\"error\":\"Firmware download not started: " + refusal + "\"}");
         return;
     }
     {
         std::lock_guard<std::mutex> lock(otaUrlMutex);
-        if (otaUploadActive || urlOtaRunning || pendingOtaUrl.length() > 0 || restartRequested)
+        if (restartRequested)
+        {
+            request->send(409, "application/json",
+                          "{\"error\":\"The gateway is about to restart - install again after the restart\"}");
+            return;
+        }
+        if (otaUploadActive || otaUploadOwner != nullptr || urlOtaRunning || pendingOtaUrl.length() > 0)
         {
             request->send(409, "application/json", "{\"error\":\"A firmware update is already running\"}");
             return;
         }
         pendingOtaUrl = url;
+        pendingOtaSession = auth.sessionTag(request);
     }
-    logger.info("Firmware update requested from: " + (url.indexOf('?') >= 0 ? url.substring(0, url.indexOf('?')) : url));
+    logger.info("Firmware update requested from: " + urlForLog(url));
     request->send(202, "application/json",
-                  "{\"status\":\"update-started\",\"message\":\"Downloading firmware. The device restarts when done.\"}");
+                  "{\"status\":\"update-started\",\"message\":\"Downloading firmware in update mode. A verified image is "
+                  "installed and the device restarts; an unsigned image waits for your confirmation on the Firmware page "
+                  "(10 minutes). If the page stops answering (the connection may go over an interface that is switched off "
+                  "for the download), reload it in a few minutes.\"}");
 }
 
-// Loop task: download into the OTA slot and restart. Blocks the loop for the
-// download; the device restarts afterwards either way.
-void WebPortal::runUrlOta(const String &url)
+// Loop task: download into the OTA slot; a verified image is activated and
+// the device restarts, an unsigned one waits for the admin's confirmation
+// (GatewayOta::conclude). Blocks the loop for the download.
+void WebPortal::runUrlOta(const String &url, uint64_t requester)
 {
-    // Free the heap of an MQTT TLS session for this one
-    if (mqttManager)
+    // Update mode for the download (Update/UpdateMode.h); left again when
+    // this returns (an activated install restarts instead)
+    UpdateMode::Session session(UpdateMode::Reason::GatewayUrl, UpdateMode::EXTRA_GATEWAY_DOWNLOAD);
+    if (!session.ok())
     {
-        mqttManager->disconnect();
-    }
-    String blocker = httpsBlocker();
-    if (blocker.length() > 0)
-    {
-        logger.error("Firmware download: " + blocker);
+        logger.error("Firmware download: " + session.error());
         return;
     }
     WatchdogPause pause;
@@ -2644,6 +2793,7 @@ void WebPortal::runUrlOta(const String &url)
     if (!beginHttps(http, client, url))
     {
         logger.error("Firmware download: HTTP begin failed");
+        session.setResult("download failed: HTTP begin failed");
         return;
     }
     http.addHeader("User-Agent", "expLORA-Gateway/" + String(FIRMWARE_VERSION));
@@ -2651,17 +2801,21 @@ void WebPortal::runUrlOta(const String &url)
     if (httpCode != HTTP_CODE_OK)
     {
         logger.error("Firmware download failed: HTTP " + String(httpCode));
+        session.setResult("download failed: HTTP " + String(httpCode));
         http.end();
         return;
     }
 
-    // A known size keeps the slot check exact and avoids chunked framing in
-    // the image (the raw stream is read below)
+    // A known size keeps the slot check exact, avoids chunked framing in the
+    // image (the raw stream is read below) and lets a cut download be
+    // refused before its tail is classified (a cut signed file is no
+    // unsigned file)
     const int contentLength = http.getSize();
     const esp_partition_t *ota = esp_ota_get_next_update_partition(nullptr);
-    if (!ota || contentLength <= (int)sizeof(esp_image_header_t) || (size_t)contentLength > ota->size)
+    if (!ota || contentLength <= (int)GatewayImage::HEADER_SIZE || (size_t)contentLength > ota->size)
     {
         logger.error("Firmware download: bad size " + String(contentLength) + " (server must send Content-Length)");
+        session.setResult("download failed: bad size " + String(contentLength));
         http.end();
         return;
     }
@@ -2672,15 +2826,19 @@ void WebPortal::runUrlOta(const String &url)
     if (!buf)
     {
         logger.error("Firmware download: not enough memory for the download buffer");
+        session.setResult("download failed: no memory for the download buffer");
         http.end();
         return;
     }
 
     // The filesystem stays mounted: OTA writes only the other app slot, and
     // unmounting would race with the other task's file writes
-    if (!otaBegin((size_t)contentLength))
+    GatewayOta::Writer writer;
+    String error = writer.begin();
+    if (error.length() > 0)
     {
-        logger.error(otaBeginError());
+        logger.error("Firmware download: " + error);
+        session.setResult("download failed: " + error);
         http.end();
         return;
     }
@@ -2690,7 +2848,6 @@ void WebPortal::runUrlOta(const String &url)
     int lastPct = -1;
     unsigned long started = millis();
     unsigned long lastData = started;
-    String error;
     while (written < (size_t)contentLength)
     {
         // Generous: PPP over the modem UART manages ~10 kB/s
@@ -2699,9 +2856,13 @@ void WebPortal::runUrlOta(const String &url)
             error = "download took over 15 minutes";
             break;
         }
+        if (session.expired())
+        {
+            error = "the update session reached its " + String(UpdateMode::HARD_CAP_MS / 60000) + " minute limit";
+            break;
+        }
         size_t avail = stream->available();
-        // The image header must arrive in one piece for the chip check
-        if (avail == 0 || (written == 0 && avail < sizeof(esp_image_header_t)))
+        if (avail == 0)
         {
             if (!http.connected() && stream->available() == 0)
             {
@@ -2722,13 +2883,9 @@ void WebPortal::runUrlOta(const String &url)
         {
             continue;
         }
-        if (written == 0 && !firmwareImageMatches(buf.get(), r, error))
+        error = writer.write(buf.get(), r);
+        if (error.length() > 0)
         {
-            break;
-        }
-        if (otaWrite(buf.get(), r) != (size_t)r)
-        {
-            error = "flash write failed";
             break;
         }
         written += r;
@@ -2742,14 +2899,31 @@ void WebPortal::runUrlOta(const String &url)
     }
     http.end();
 
-    if (error.length() == 0 && !otaEnd())
-    {
-        error = "Update.end error " + String(Update.getError());
-    }
     if (error.length() > 0)
     {
+        // A cut download is never classified (and never activated)
         logger.error("Firmware update aborted: " + error);
-        Update.abort();
+        writer.abort();
+        session.setResult("download failed: " + error);
+        return;
+    }
+    const GatewayImage::Outcome outcome = writer.finish((uint64_t)contentLength);
+    bool signedOnly;
+    {
+        std::lock_guard<std::recursive_mutex> guard(configManager.mutex());
+        signedOnly = configManager.signedOnly;
+    }
+    GatewayOta::Result result = GatewayOta::conclude(writer, outcome, requester, signedOnly, "URL download");
+    if (!result.activated)
+    {
+        // Confirm: unsigned / unknown key, or a verified older version
+        session.setResult(result.action == GatewayImage::Activation::Confirm
+                              ? String("downloaded, waiting for the admin's confirmation (") +
+                                    (outcome.cls == GatewayImage::Class::Verified ? "older version, " : "") +
+                                    outcome.text + ")"
+                              : "download refused: " + (outcome.cls == GatewayImage::Class::Refused
+                                                            ? String(outcome.text)
+                                                            : result.message));
         return;
     }
     logger.info("OTA complete, restarting");
@@ -2761,24 +2935,119 @@ void WebPortal::handleFirmwarePage(AsyncWebServerRequest *request)
 {
     logger.debug("HTTP request: GET /firmware");
     if (guardAPOnly(request)) return;
-    String html = HTMLGenerator::generateFirmwarePage();
+    // During an update-mode session a small status page (no upload form,
+    // ~1 kB; reloads itself until the session ends). The full page (a ~13 kB
+    // String plus send()'s copy) would take its memory from the session's
+    // TLS reserve
+    if (UpdateMode::active())
+    {
+        request->send(200, "text/html", HTMLGenerator::generateUpdateProgressPage(UpdateMode::statusText()));
+        return;
+    }
+    if (rejectLowMemory(request, stringPagePeak(FIRMWARE_PAGE_SIZE), FIRMWARE_PAGE_SIZE)) return;
+    bool signedOnly;
+    {
+        std::lock_guard<std::recursive_mutex> guard(configManager.mutex());
+        signedOnly = configManager.signedOnly;
+    }
+    String html = HTMLGenerator::generateFirmwarePage(UpdateMode::statusText(), signedOnly,
+                                                      GatewayOta::view(auth.sessionTag(request)));
     request->send(200, "text/html", html);
 }
 
-// Upload failed or was interrupted: release the OTA slot
-void WebPortal::abortUpload(const String &reason)
+// "Signed images only" (shared by sensor images and the gateway firmware)
+void WebPortal::handleSignedOnlyPost(AsyncWebServerRequest *request)
 {
-    if (otaUploadActive)
+    logger.debug("HTTP request: POST /firmware/signed");
+    if (guardAPOnly(request)) return;
+    const bool on = request->hasParam("signedOnly", true) && request->getParam("signedOnly", true)->value() == "1";
+    if (!configManager.setSignedOnly(on))
     {
-        Update.abort();
-        otaUploadActive = false;
+        request->send(500, "text/plain", "Failed to save configuration");
+        return;
     }
+    logger.warning(on ? "Signed images only: on - unsigned images are refused"
+                      : "Signed images only: off - unsigned images are accepted with a confirmation");
+    if (on)
+    {
+        // A queued start or an unfinished job with an unsigned image stops now
+        sensorManager.otaEnforceSignedOnly("as \"Signed images only\" was switched on");
+        // An unsigned gateway image waiting for its confirmation is dropped
+        // and erased
+        GatewayOta::signedOnlyOn();
+    }
+    request->redirect("/firmware");
+}
+
+// A text as a JSON string body (quotes, backslashes; control characters
+// become spaces)
+static String jsonText(const String &in)
+{
+    String out;
+    out.reserve(in.length() + 8);
+    for (size_t i = 0; i < in.length(); i++)
+    {
+        const char c = in[i];
+        if (c == '"' || c == '\\')
+        {
+            out += '\\';
+            out += c;
+        }
+        else
+        {
+            out += (uint8_t)c < 0x20 ? ' ' : c;
+        }
+    }
+    return out;
+}
+
+// Upload failed or was interrupted: release the OTA slot (nothing activated)
+void WebPortal::abortUpload(const String &reason, bool log)
+{
+    if (otaWriter)
+    {
+        otaWriter->abort();
+        otaWriter.reset();
+    }
+    otaUploadActive = false;
+    otaUploadFinished = false;
     if (!otaUploadHasError)
     {
         otaUploadHasError = true;
         otaUploadErrorMsg = reason;
     }
-    logger.error("Firmware upload failed: " + reason);
+    if (log)
+    {
+        logger.error("Firmware upload failed: " + reason);
+    }
+}
+
+// The upload's file ended and was classified: activate a verified image,
+// keep an unsigned one waiting for the confirmation, or refuse it
+GatewayOta::Result WebPortal::concludeUpload()
+{
+    GatewayOta::Result result;
+    if (!otaWriter || !otaUploadFinished)
+    {
+        result.message = "No firmware received";
+        return result;
+    }
+    bool signedOnly;
+    {
+        std::lock_guard<std::recursive_mutex> guard(configManager.mutex());
+        signedOnly = configManager.signedOnly;
+    }
+    result = GatewayOta::conclude(*otaWriter, otaUploadOutcome, otaUploadSession, signedOnly, "upload");
+    otaWriter.reset();
+    otaUploadActive = false;
+    otaUploadFinished = false;
+    if (result.activated)
+    {
+        // Deferred, see handleClient()
+        restartAt = millis() + 1500;
+        restartRequested = true;
+    }
+    return result;
 }
 
 // POST /firmware - completion callback (sending response)
@@ -2790,28 +3059,87 @@ void WebPortal::handleFirmwareUploadComplete(AsyncWebServerRequest *request)
     // POST whose data was ignored must not report success)
     if (otaUploadOwner != request)
     {
-        request->send(409, "application/json", "{\"error\":\"No upload by this request (another one in progress?)\"}");
+        request->send(409, "application/json",
+                      "{\"error\":\"No upload by this request (another update in progress?)\"}");
         return;
     }
+    // The upload is over either way: a stale owner would keep refusing
+    // update sessions and URL updates until the client disconnects. Cleared
+    // only after the image is concluded or aborted (the owner is one of the
+    // gates a URL install checks)
+    auto releaseOwner = [this]()
+    {
+        std::lock_guard<std::mutex> gate(UpdateMode::uploadGate());
+        otaUploadOwner = nullptr;
+        otaUploadSawFile = false;
+    };
 
-    bool ok = !otaUploadHasError && otaUploadWritten > 0 && Update.isFinished();
-    if (!ok)
+    if (otaUploadHasError || !otaUploadFinished)
     {
         bool failed = otaUploadHasError;
         String reason = failed ? otaUploadErrorMsg : String("No firmware received");
-        abortUpload(reason);
-        request->send(failed ? 500 : 400, "application/json",
-                      "{\"error\":\"" + HTMLGenerator::htmlEscape(reason) + "\"}");
+        abortUpload(reason, !failed); // a failure was logged when it happened
+        releaseOwner();
+        request->send(failed ? 500 : 400, "application/json", "{\"error\":\"" + jsonText(reason) + "\"}");
         otaUploadHasError = false;
         otaUploadErrorMsg = "";
         otaUploadExpected = otaUploadWritten = 0;
         return;
     }
 
+    const GatewayImage::Class cls = otaUploadOutcome.cls;
+    GatewayOta::Result result = concludeUpload();
+    releaseOwner();
+    otaUploadExpected = otaUploadWritten = 0;
+    const String msg = jsonText(result.message);
+    switch (result.action)
+    {
+    case GatewayImage::Activation::Activate:
+        if (result.activated)
+        {
+            request->send(200, "application/json",
+                          String("{\"status\":\"activated\",\"sig\":\"") + GatewayImage::className(cls) +
+                              "\",\"message\":\"" + msg + "\"}");
+            return;
+        }
+        break;
+    case GatewayImage::Activation::Confirm:
+        request->send(200, "application/json",
+                      String("{\"status\":\"confirm\",\"sig\":\"") + GatewayImage::className(cls) + "\",\"image\":\"" +
+                          result.digestHex + "\",\"message\":\"" + msg + "\"}");
+        return;
+    default:
+        break;
+    }
+    request->send(400, "application/json", "{\"error\":\"" + msg + "\"}");
+}
+
+// POST /firmware/confirm (image = SHA-256 hex of the waiting image): the
+// admin activates an unsigned image that the same login session installed
+// within the last 10 minutes
+void WebPortal::handleFirmwareConfirm(AsyncWebServerRequest *request)
+{
+    logger.debug("HTTP request: POST /firmware/confirm");
+    if (guardAPOnly(request)) return;
+    const String image = request->hasParam("image", true) ? request->getParam("image", true)->value() : String();
+    bool signedOnly;
+    {
+        std::lock_guard<std::recursive_mutex> guard(configManager.mutex());
+        signedOnly = configManager.signedOnly;
+    }
+    if (restartRequested)
+    {
+        request->send(409, "application/json", "{\"error\":\"The gateway is about to restart\"}");
+        return;
+    }
+    const String error = GatewayOta::confirm(image.c_str(), auth.sessionTag(request), signedOnly);
+    if (error.length() > 0)
+    {
+        request->send(400, "application/json", "{\"error\":\"" + jsonText(error) + "\"}");
+        return;
+    }
     request->send(200, "application/json",
-                  "{\"status\":\"update-started\",\"message\":\"Firmware uploaded. Installing… device will reboot automatically.\",\"bytes\":" +
-                      String(otaUploadWritten) + "}");
-    // Deferred, see handleClient()
+                  "{\"status\":\"activated\",\"message\":\"Confirmed firmware activated - the gateway restarts.\"}");
     restartAt = millis() + 1500;
     restartRequested = true;
 }
@@ -2840,32 +3168,54 @@ void WebPortal::handleFirmwareUploadChunk(AsyncWebServerRequest *request, String
         return;
     }
     // A second file part in the same upload: never flash or report it, and
-    // do not boot into the first one either
+    // do not activate the first one either (it is concluded only at the
+    // completion of a request with exactly one file)
     if (index == 0 && otaUploadOwner == request && otaUploadSawFile)
     {
         if (!otaUploadHasError)
         {
-            otaUploadActive = otaUploadActive || Update.isRunning();
-            abortUpload("Only one firmware file per upload");
+            if (otaWriter && otaUploadFinished)
             {
-                FlashWriteGuard guard; // writes the otadata partition
-                esp_ota_set_boot_partition(esp_ota_get_running_partition());
+                // Classified, not activated: erased like any refused image
+                GatewayOta::discard(*otaWriter);
+                otaWriter.reset();
             }
-            restartRequested = false;
+            abortUpload("Only one firmware file per upload");
         }
         return;
     }
     if (index == 0)
     {
-        // Upload start (first chunk)
+        // Upload start (first chunk). Not during an update-mode session:
+        // the request's completion is then answered 503 by the middleware.
+        // Not while a URL update is queued or runs either (it goes ahead;
+        // this request's completion answers 409). Checked under otaUrlMutex
+        // (handleFirmwareUpdate queues a URL under it and refuses while an
+        // upload owner is set), then claimed under the gate the update mode
+        // checks uploads under: one of the two always proceeds
+        {
+            std::lock_guard<std::mutex> lock(otaUrlMutex);
+            if (urlOtaRunning || pendingOtaUrl.length() > 0)
+            {
+                logger.warning("Firmware upload ignored: a firmware update from a URL is queued or running");
+                return;
+            }
+            std::lock_guard<std::mutex> gate(UpdateMode::uploadGate());
+            if (UpdateMode::active())
+            {
+                return;
+            }
+            otaUploadOwner = request;
+        }
         otaUploadHasError = false;
         otaUploadErrorMsg = "";
         otaUploadExpected = request->contentLength(); // HINT: may be inaccurate with multipart
         otaUploadWritten = 0;
-        otaHeaderLen = 0;
+        otaUploadFinished = false;
+        otaUploadSession = auth.sessionTag(request);
 
         logger.info("Firmware upload started: " + filename + " size=" + String(otaUploadExpected));
-        if (otaUploadActive)
+        if (otaUploadActive || otaWriter)
         {
             // Leftover of a finished owner (no live request holds it)
             abortUpload("interrupted");
@@ -2873,17 +3223,26 @@ void WebPortal::handleFirmwareUploadChunk(AsyncWebServerRequest *request, String
             otaUploadErrorMsg = "";
         }
         // Client disconnecting mid-upload: no completion callback follows
-        otaUploadOwner = request;
         otaUploadSawFile = true;
         // Own disconnect callback: this request must never pass through
         // rejectLowMemory(), which would replace it (one callback per request)
         request->setAttribute(OWN_DISCONNECT_ATTR, true);
         request->onDisconnect([this, request]()
                               {
-            // Only the request that owns the upload may abort it
-            if (otaUploadActive && otaUploadOwner == request && !Update.isFinished())
+            // Only the request that owns the upload may abort it. A file
+            // that ended completely is still concluded (a verified image is
+            // installed, an unsigned one waits for the confirmation on the
+            // Firmware page) - the client may be gone before the completion
+            if (otaUploadOwner == request && otaWriter)
             {
-                abortUpload("client disconnected");
+                if (otaUploadFinished && !otaUploadHasError)
+                {
+                    concludeUpload();
+                }
+                else
+                {
+                    abortUpload("client disconnected");
+                }
             }
             if (otaUploadOwner == request)
             {
@@ -2891,7 +3250,8 @@ void WebPortal::handleFirmwareUploadChunk(AsyncWebServerRequest *request, String
                 otaUploadSawFile = false;
             } });
 
-        // Target OTA slot
+        // If server/client specified expected size, at least verify it fits in slot
+        // contentLength() includes the multipart framing (a few hundred bytes)
         const esp_partition_t *ota = esp_ota_get_next_update_partition(nullptr);
         if (!ota)
         {
@@ -2899,9 +3259,6 @@ void WebPortal::handleFirmwareUploadChunk(AsyncWebServerRequest *request, String
             otaUploadErrorMsg = "No OTA partition";
             return;
         }
-
-        // If server/client specified expected size, at least verify it fits in slot
-        // contentLength() includes the multipart framing (a few hundred bytes)
         if (otaUploadExpected > ota->size + 1024)
         {
             otaUploadHasError = true;
@@ -2909,92 +3266,49 @@ void WebPortal::handleFirmwareUploadChunk(AsyncWebServerRequest *request, String
             return;
         }
 
-        bool urlBusy;
-        {
-            std::lock_guard<std::mutex> lock(otaUrlMutex);
-            urlBusy = urlOtaRunning || pendingOtaUrl.length() > 0;
-        }
-        if (urlBusy || restartRequested)
+        if (restartRequested)
         {
             otaUploadHasError = true;
-            otaUploadErrorMsg = "Another firmware update is running";
+            otaUploadErrorMsg = "The gateway is about to restart - install again after the restart";
             return;
         }
-        // IMPORTANT: use size UNKNOWN for multipart - otherwise risk "premature end"
-        if (!otaBegin((size_t)UPDATE_SIZE_UNKNOWN))
+        otaWriter.reset(new (std::nothrow) GatewayOta::Writer());
+        String error = otaWriter ? otaWriter->begin() : String("not enough memory");
+        if (error.length() > 0)
         {
+            otaWriter.reset();
             otaUploadHasError = true;
-            otaUploadErrorMsg = otaBeginError();
+            otaUploadErrorMsg = error;
+            logger.warning("Firmware upload refused: " + error);
             return;
         }
         otaUploadActive = true;
     }
 
-    if (otaUploadHasError)
+    if (otaUploadHasError || !otaWriter || otaUploadFinished)
         return;
 
-    // Write chunk
+    // Write chunk (the writer classifies it and holds the image header
+    // until it is checked against this chip)
     if (len)
     {
-        // Safety: never overwrite OTA slot size
-        const esp_partition_t *ota = esp_ota_get_next_update_partition(nullptr);
-        if (ota && (otaUploadWritten + len) > ota->size)
+        String error = otaWriter->write(data, len);
+        if (error.length() > 0)
         {
-            abortUpload("Data exceed OTA slot size");
+            abortUpload(error);
             return;
         }
-
-        // Hold back the first bytes until the whole image header is there
-        if (otaUploadWritten == 0)
-        {
-            size_t need = sizeof(esp_image_header_t) - otaHeaderLen;
-            size_t take = std::min(need, len);
-            memcpy(otaHeader + otaHeaderLen, data, take);
-            otaHeaderLen += take;
-            data += take;
-            len -= take;
-            if (otaHeaderLen < sizeof(esp_image_header_t))
-            {
-                return;
-            }
-            String imageError;
-            if (!firmwareImageMatches(otaHeader, otaHeaderLen, imageError))
-            {
-                abortUpload(imageError);
-                return;
-            }
-            if (otaWrite(otaHeader, otaHeaderLen) != otaHeaderLen)
-            {
-                abortUpload("Short write of the image header");
-                return;
-            }
-            otaUploadWritten = otaHeaderLen;
-            if (len == 0)
-            {
-                return;
-            }
-        }
-
-        size_t w = otaWrite(data, len);
-        if (w != len)
-        {
-            abortUpload("Short write: " + String(w) + "/" + String(len));
-            return;
-        }
-        otaUploadWritten += w;
+        otaUploadWritten += len;
 
         // Progress log
         if (otaUploadExpected > 0)
         {
             int pct = (int)((otaUploadWritten * 100ULL) / (size_t)otaUploadExpected);
-            if (pct == 1 || pct % 5 == 0 || pct >= 99)
+            int before = (int)(((otaUploadWritten - len) * 100ULL) / (size_t)otaUploadExpected);
+            if (pct / 10 != before / 10)
             {
                 logger.info("OTA progress: " + String(pct) + "% (" + String(otaUploadWritten) + " / " + String(otaUploadExpected) + " bytes)");
             }
-        }
-        else if ((otaUploadWritten % (128 * 1024)) < len)
-        {
-            logger.info("OTA written: " + String(otaUploadWritten) + " bytes (chunked)");
         }
 
         // Yield + WDT
@@ -3005,22 +3319,16 @@ void WebPortal::handleFirmwareUploadChunk(AsyncWebServerRequest *request, String
     if (final)
     {
         logger.info("Firmware upload finished: total " + String(otaUploadWritten) + " bytes");
-
-        if (otaUploadExpected > 0 && otaUploadWritten != otaUploadExpected)
+        // Length: a multipart upload ends at its boundary (no announced
+        // length); a cut upload never gets here
+        otaUploadOutcome = otaWriter->finish(0);
+        if (otaUploadOutcome.cls == GatewayImage::Class::Refused)
         {
-            logger.warning("Upload size hint mismatch: written=" + String(otaUploadWritten) + " expected=" + String(otaUploadExpected));
-        }
-
-        // IMPORTANT: finish multipart upload with evenIfRemaining=true
-        if (!otaEnd(true) || !Update.isFinished())
-        {
-            abortUpload("Update.end error: " + String(Update.getError()));
+            // logged once, as an error (a wrong signature block or a damaged image)
+            abortUpload(String("refused: ") + otaUploadOutcome.text);
             return;
         }
-        otaUploadActive = false;
-        // Restart even if the client is gone before the completion callback
-        restartAt = millis() + 1500;
-        restartRequested = true;
-        // response will be sent by handleFirmwareUploadComplete()
+        otaUploadFinished = true;
+        // concluded by handleFirmwareUploadComplete() (or at the disconnect)
     }
 }

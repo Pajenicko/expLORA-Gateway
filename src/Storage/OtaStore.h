@@ -5,11 +5,16 @@
  * 14.5): one image per HW type (at most 4) in LittleFS under /ota/.
  *
  * An upload is streamed to /ota/upload.tmp under the flash write permit,
- * the CRC-32 running over the stream (OtaImage::Streamer), never buffered in
- * RAM; at the end it is validated (length from the vector table word, trailer
- * magic / version / load address / CRC, size, the OTA flags) and stored as
+ * the CRC-32 and SHA-256 running over the stream, never buffered in RAM.
+ * Only the image itself (size word at 0x20 + 32 bytes) is written; a
+ * signature block after it stays in RAM (Protocol/OtaImageSigned.h), so the
+ * stored .bin is the unsigned image byte for byte. At the end it is
+ * validated (length from the vector table word, trailer magic / version /
+ * load address / CRC, size, the OTA flags), the signature classified
+ * (verified / unsigned / unknown key; anything else refused) and it is stored as
  * /ota/hw<HHHH>.bin with /ota/hw<HHHH>.json (HW type, firmware version,
- * length, CRC, flags, upload time): the description goes to /ota/meta.tmp,
+ * length, CRC, flags, upload time, signature key; Storage/OtaMeta.h): the
+ * description goes to /ota/meta.tmp,
  * then upload.tmp and meta.tmp are renamed in this order (a failed last
  * rename writes the .json directly; a description write counts only once it
  * reads back as written). A leftover upload.tmp is deleted at
@@ -34,19 +39,11 @@
 #include <Arduino.h>
 #include "../Data/Logging.h"
 #include "../Protocol/OtaImage.h"
+#include "OtaMeta.h"
 
 namespace OtaStore
 {
-struct Meta
-{
-    bool valid = false;
-    uint16_t hwType = 0;
-    uint32_t fw = 0;
-    uint32_t len = 0;
-    uint32_t crc = 0;
-    uint32_t flags = 0;
-    uint32_t uploadUnix = 0;
-};
+using Meta = OtaMeta::Meta;
 
 // setup(): /ota exists, a leftover upload.tmp is gone, a cut commit sorted out
 void begin(Logger &logger);
@@ -54,8 +51,12 @@ void begin(Logger &logger);
 // Upload (web server task), one at a time
 bool uploadBegin(String &error);
 bool uploadWrite(const uint8_t *data, size_t len, String &error);
-// Validate the finished upload; meta describes it (not yet stored)
-bool uploadValidate(Meta &meta, String &error);
+// Validate the finished upload and classify its signature; meta describes
+// it (not yet stored; signedKey / unknownKey set). false: refused, error
+// says why, severe = a signature block was present but wrong (bad
+// signature, binding mismatch, malformed: log as an error). state: how it
+// would be stored ("verified (key ...)", "unsigned", ...)
+bool uploadValidate(Meta &meta, String &error, bool &severe, String &state);
 // Store it as the image of its HW type (replaces an older one)
 bool uploadCommit(const Meta &meta, String &error);
 void uploadAbort();

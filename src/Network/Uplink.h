@@ -156,6 +156,33 @@ public:
     const LteModem &getLte() const { return *lte; }
 #endif
 
+    // Update mode (Update/UpdateMode.cpp, loop task). Interfaces as
+    // UpdateModePolicy::IF_* bits: WIFI_STA = the WiFi driver for anything
+    // but the access point alone (station, or a driver left loaded),
+    // WIFI_AP = the access point, LTE = the modem (not disabled)
+    uint8_t updateModeRunning() const;
+    // Switch these off and keep them off (the station does not reconnect,
+    // the AP does not restart, LTE stays powered down); returns the bits
+    // that went off. WIFI_STA deinitialises the whole driver (AP included)
+    uint8_t updateModeSuspend(uint8_t mask);
+    // Everything back: the station reconnects at once, the AP comes back
+    // per the WiFi policy, LTE attaches again
+    void updateModeResume();
+    uint8_t updateModeSuspended() const { return suspendedMask.load(); }
+    // The WiFi policy wants the access point (as of the last process())
+    bool apWantedNow() const { return apWantedLast; }
+    bool lteOnline() const;
+    // Connectivity watch after an update session: the interface (one IF_*
+    // bit) is still enabled, and a fingerprint of its settings (a change
+    // after the session means it is not expected back as it was)
+    bool updateModeWanted(uint8_t bit) const;
+    uint32_t updateModeConfigKey(uint8_t bit) const;
+    // DNS servers and default route of the active uplink again, at once
+    // (process() does this every few seconds, but not while an update
+    // session blocks the loop; switching interfaces off can clear lwIP's
+    // DNS list or move the default route)
+    void refreshRoutes();
+
     // Called when the captive portal turns on or off
     void setCaptiveCallback(std::function<void(bool)> callback) { captiveCallback = callback; }
 
@@ -183,6 +210,8 @@ private:
     bool captive = false;
     Type active = Type::None;
     bool switchedOffAtBoot = false; // "Enable WiFi" off, read in begin()
+    std::atomic<uint8_t> suspendedMask{0}; // update mode, UpdateModePolicy::IF_* bits
+    bool apWantedLast = false;              // WifiPolicy::apWanted at the last processAp()
 
     bool localWasUp = false;
     unsigned long localAccessSince = 0; // when local access came up

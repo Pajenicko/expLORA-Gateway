@@ -57,6 +57,11 @@ public:
 
     void logout(AsyncWebServerRequest *request);
 
+    // Tag of the request's login session (64-bit hash of its token), 0 when
+    // the request has no valid session. Binds a firmware confirmation to the
+    // session that installed the image; a new login gets another tag
+    uint64_t sessionTag(AsyncWebServerRequest *request);
+
     // Set a new password; ends all sessions. Returns an error, empty on success
     String changePassword(AsyncWebServerRequest *request, const String &current, const String &password,
                           const String &confirm);

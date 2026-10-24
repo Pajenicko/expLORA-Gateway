@@ -212,6 +212,13 @@ void otaCancel(uint32_t seq);
 bool otaTakeResult(OtaResult &result);
 const char *otaOutcomeName(OtaOutcome outcome);
 
+// Update mode (Update/UpdateMode.h): ask the task to put the radio in
+// standby (true) or back to receive (false), any task. paused() is true
+// once the radio is in standby; a response in progress is finished first
+// (<= ~3 s). Paused, the task keeps its liveness heartbeat
+void setPaused(bool paused);
+bool paused();
+
 // loop(): log what the radio task counted since the last call (the task
 // itself never logs - Logger formats Strings and takes the UART lock)
 void logEvents(Logger &logger);

@@ -101,12 +101,106 @@ log buffer size) and `variants/<env>/platformio.ini`.
 
 ### OTA
 - Upload: chip-id check on the image header (also across TCP segments), only one
-  upload at a time, abort on disconnect, restart scheduled from the last chunk.
+  upload at a time, abort on disconnect; the file is concluded (activated /
+  waiting for a confirmation / refused) at the request's completion, or at
+  the disconnect after a complete file; a second file part discards it.
+- Gateway image (M4c S3, `src/Update/GatewayOta.{h,cpp}`, pure rules in
+  `GatewayImage.h` + `test/test_gateway_image`): esp_ota_begin (sequential
+  erase) / esp_ota_write / esp_ota_end instead of the Update library; every
+  byte also goes through `SigBlock::TailRing` into SHA-256 (the Pro's HW
+  engine is held for the download only; the TLS handshake is done before,
+  measured no throughput difference: 13 s for 1.67 MB with and without the
+  hash). At the end: length vs Content-Length first, then verified / unknown
+  key / unsigned / refused (binding kind, board, length, hash before the key;
+  the block's version is trusted as signed - esp_app_desc_t carries the
+  library builder's id, the release tool binds the version to the image's
+  marker when it signs). `esp_ota_set_boot_partition` only for verified, or
+  unsigned after `POST /firmware/confirm` (10 min, image SHA-256 + length,
+  login session via `WebAuth::sessionTag`, "Signed images only" off). A
+  verified image with a lower signed version than `FIRMWARE_VERSION` (a
+  downgrade) takes the confirmation path too (same binding, not refused by
+  "Signed images only"); the same version activates (reinstall). A
+  `FIRMWARE_VERSION` (src/version.h) that is not maj.min.pat fails closed:
+  every verified image then needs the confirmation (logged at start; a
+  native test checks the committed value). Refused
+  images get the slot's first sector erased, and so does an image that
+  waited and was dropped (expiry - checked every loop pass, so the millis()
+  age cannot wrap -, "Signed images only" switched on, a refused confirm) or
+  was left waiting across a restart (`written` record; erased at the next
+  start unless it is the running slot or otadata's boot target; a possibly
+  stale record is never acted on: not while the running image is
+  PENDING_VERIFY - the other slot is its rollback target -, not for a slot
+  otadata marks VALID - `esp_ota_begin` clears the written slot's otadata
+  entry, so a never-activated image has none -, and not after a failed state
+  save in that run; `Writer::begin()` clears the record when it drops a
+  waiting image). A failed `esp_ota_set_boot_partition` erases the slot's
+  first sector as well (logged).
+  `conclude()` releases the slot inside the same locked section that sets
+  the boot partition or registers the waiting image; after an activation
+  every install (upload, URL, confirm) is refused until the restart.
+  `/update/state.json` (v 1): running / pending / written / last install;
+  later stages extend v 1 with optional fields (this firmware drops unknown
+  fields when it rewrites the file - contract in `UpdateState.h`). A failed
+  state save does not stop an activation (the otadata state does the
+  rollback; logged). When marking the image valid failed five times the
+  refusals and the Firmware page say "validation failed - the next restart
+  rolls back" (`/diag/heap` update.validateFailed).
+- Known limits: a signed upload (no announced length) with appended bytes
+  or a cut block degrades to unsigned (confirmation, refused with "Signed
+  images only") - no privilege gain; the URL path compares Content-Length.
+  `esptool write_flash` of only the app into the running slot keeps otadata
+  VALID and so the install record (it may still say "verified").
+- Rollback: the precompiled bootloader has `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`
+  (read from both boards: identical to the framework's bootloader, rollback
+  code present); `verifyRollbackLater()` returns true, the new image stays
+  PENDING_VERIFY until 120 s of loop() with the web server up and the
+  liveness heartbeats fresh, then `esp_ota_mark_app_valid_cancel_rollback()`.
+  A restart from the web UI marks it valid first (the admin reached the UI);
+  liveness / watchdog / crash resets before that roll back. esp_ota_begin
+  refuses installs while the running image waits (message with seconds left);
+  the update check is refused too (an update-mode restore restart would roll
+  back). The mark is written first (under the flash write permit) and the
+  image counts as valid only when it succeeded; a failure is retried 5 times,
+  10 s apart (logged). Connectivity is deliberately not a criterion: a site
+  or uplink outage must not roll back a good image.
+  After a rollback the old firmware finds the pending record and logs
+  "rolled back from vX" (the new firmware writes its version into the record
+  when it starts).
 - From URL: HTTPS only, server certificate checked against the built-in CA
   bundle, redirects followed, Content-Length required, runs in the loop task;
   update check also in the loop task (page polls). The filesystem is not
   unmounted during OTA.
-- Images are **not signed** (open source, users build their own).
+- Update mode (2.0.0, `src/Update/UpdateMode.h`, pure rules in
+  `UpdateModePolicy.h` + `test/test_update_mode`): every outbound TLS
+  session that checks for or downloads an update. Refused while another
+  session, an upload or a sensor OTA job (anything but Paused / terminal)
+  runs, offline or without a set clock. Always: MQTT held, the radio task
+  puts the radio in standby (keeps its liveness heartbeat), heavy pages and
+  actions answered 503. Then the TLS check (60 kB + the session's own needs:
+  check 8 kB, gateway download 28 kB - measured downloads took 69.5-77 kB in
+  all); only if it does not fit, every interface that does not carry the
+  uplink is switched off, re-checked after up to 3 s, aborted (and restored)
+  if still short; DNS servers and the default route are re-applied after
+  the switch-off and right before the connection (the host resolved once
+  more if the lookup fails). Leaving restores in reverse; hard cap 15 min
+  (sessions numbered, so a stale owner never ends a newer one). Restart
+  watch: interfaces the session switched off that worked before and are
+  still enabled with the same settings, the uplink only if it was online
+  before; not back 5 min after the session = restart (logged at boot),
+  deferred while an upload, a sensor job in Transfer / Swapping /
+  Confirming or a queued job start runs; a later session merges into a
+  running watch and restarts its window (also when it switched nothing
+  off); every watched interface disabled = "watch cancelled". No session
+  while a restart is requested. During a
+  session `/firmware` is a ~1 kB status page, `/reboot` and `/api` are 503
+  (the reason only after the login). `/diag/heap` `updateMode` (incl.
+  `lastRefusal`), the Firmware page shows the last session and refusal.
+- Signatures (2.0.0, M4c): sensor images in the store are checked against
+  the release keys (`src/Security/ReleaseKeys.h`, empty until the owner
+  creates the key: signed files then show "unknown key" = unsigned) –
+  verified / unsigned / refused, see docs/protocol-v2.md §14.5; "Signed
+  images only" on the Firmware page (Preferences `signedOnly`, default off).
+  The gateway's own firmware: see "Gateway image" above (same setting).
 
 ### MQTT / Home Assistant
 - Gateway device with diagnostics (uplink, IP, power source, LTE signal/state,
@@ -139,7 +233,8 @@ log buffer size) and `variants/<env>/platformio.ini`.
 - Heap guards use the 8-bit heap (`heap_caps_*(MALLOC_CAP_8BIT)`,
   `src/Hardware/HeapGuard.h`): on the ESP32 (Pro) `ESP.getFreeHeap()` also
   counts ~33 kB of 32-bit-only IRAM that malloc never gets.
-- HTTPS (OTA, forwarding) only with enough internal heap (60 kB free /
+- HTTPS (update check, URL OTA: inside the update mode, see OTA; forwarding)
+  only with enough internal heap (60 kB free /
   16.7 kB block: measured peak of a whole HTTPS session 51.1 kB on the Lite +
   8 kB reserve; each 16.7 kB record buffer is its own allocation). The
   persistent MQTT TLS session keeps ~40 kB while connected and needs 80 kB
@@ -232,7 +327,9 @@ after 45 s), received data waits in lwIP once 16 events overflowed;
 
 ## Deliberately left open
 
-- Unsigned OTA; MQTT TLS and custom-URL HTTPS without certificate check
+- No secure boot / flash encryption: signatures protect the update path only
+  (a logged-in admin can still install unsigned firmware with a confirmation,
+  USB flashing is unrestricted); MQTT TLS and custom-URL HTTPS without certificate check
   (self-signed brokers/endpoints); weak sensor protocol crypto (needs new sensor
   firmware); public read-only `/api`.
 - Open setup AP; the first login sets the password (documented in README).

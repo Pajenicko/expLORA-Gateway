@@ -1566,7 +1566,8 @@ trailer, trailer magic and version 1, load address 0x08002000, the CRC-32 over
 the image and the first 28 trailer bytes equals the stored one, size ≤
 114,688, **trailer flags bit 0 (OTA-capable) and 1 ≤ transfer version ≤ 1** –
 then stored as `/ota/hw<HHHH>.bin` with `/ota/hw<HHHH>.json` (HW type,
-firmware version, length, CRC, flags, upload time): the description is written
+firmware version, length, CRC, flags, upload time, signature – see below):
+the description is written
 to `/ota/meta.tmp`, then `upload.tmp` and `meta.tmp` are renamed in this order;
 when the last rename fails the `.json` is written directly, and only when that
 fails too (every description write counts only once it reads back as written)
@@ -1591,6 +1592,54 @@ flag (every image built before M4b: the field was 0) is refused with "the
 image has no OTA receiver – a sensor running it could not be updated over the
 air again". Block reads from LittleFS in `loop()` follow the flash permit rule
 (§7) like the configuration writes.
+
+**Signed images (gateway 2.0.0, M4c).** The file may carry the 128-byte
+signature block (`src/Security/SigBlock.h`, ECDSA P-256 / SHA-256, written by
+`tools/release/explora_sign.py --kind sensor`) after the image. Only the image
+(size word + 32 bytes) is written to `upload.tmp`; whatever follows stays in
+RAM, so the stored `.bin` is the unsigned image byte for byte and the sensor,
+the bootloader, the job and the store recovery are unchanged. The remainder
+must be empty (unsigned) or exactly 128 bytes starting with `EXSG`; more than
+128 bytes stop the upload at once, anything else is refused at the end. After
+the image checks above the block is classified: **verified** – kind sensor,
+target = trailer HW type, version = trailer firmware, payload length = image
+length, hash = SHA-256 of the stored bytes (computed while streaming), key id
+in the firmware's release key table and the signature valid – `"signed"` =
+key id; **unknown key** – a well-formed, bound block whose key id is not in
+the table: stored as unsigned with `"unknownKey"` and a note (until the owner
+creates the release key the table is empty and every signed file ends here);
+**refused** – a malformed block (incl. key id 0, which marks an empty key
+slot and is never made by `explora_keygen.py`), a binding mismatch (also
+with an unknown key: the binding is checked first; a well-formed block for
+another length says "signature is for a file of another length") or a bad
+signature with a known key, also for a logged-in admin, logged as an error
+as soon as the file has arrived. A signed file cut exactly at the end of
+the image (the block missing entirely) is an unsigned file and is stored as
+unsigned – the same as uploading the unsigned image; a cut inside the image
+or inside the block is refused. Unsigned (incl. unknown key) images need the
+admin's confirmation at the start ("Unsigned image."); the confirmation is
+bound to the reasons shown when the page was loaded and to the image's CRC
+(a token in the form): another image or another reason at the submit asks
+again. The setting **Signed images only** (Firmware page, default off,
+Preferences only, shared with the gateway's own firmware from stage S3)
+refuses unsigned uploads at the end (the store unchanged) and with an
+unsigned image: blocks a new start; drops a queued start when the job is
+created (and when the option is switched on); holds a job that has not
+transferred the whole image yet (Waiting, Transfer, Paused) as Paused with
+the reason "unsigned image" – when the option is switched on and when the
+job is restored after a restart – and refuses its Resume until the option is
+off (Abort stays possible). A job past the transfer (Verified, Swapping,
+Confirming) is not stopped: the image is already on the sensor – unless a
+Verified job would transfer again (the sensor accepts a start with less than
+the whole image, or it left and would get a new start): then it is held the
+same way instead of sending the unsigned image again. An image
+counts as signed for a job only when the stored image is the job's (same
+CRC and length) and verified. A `.json` of an older firmware has no
+`"signed"` and reads as unsigned; a `.json` of a later firmware with extra
+fields still reads (only the known fields are kept). The signature binds the image only at the upload: the stored file
+is protected by the CRC check at every job start, and anyone with the admin
+login can still store an unsigned image (with the confirmation) unless the
+setting is on.
 
 **Starting** ("Update to vX" on the gen2 detail page). Refused, with the
 reason shown, when: no image for the sensor's HW type (from its JOIN_REQ);
@@ -1931,6 +1980,12 @@ scheduled windows stay the design (D6). 2 × AA hold ≈ 2,500 mAh: an OTA costs
   (empty = unsigned) keeps self-built firmware working. About 4–6 kB of code.
 - The image store on the gateway is behind the admin login; the upload is
   validated and the CRC re-verified at every job start (§14.5).
+- Since gateway 2.0.0 (M4c) the **gateway** checks an optional signature
+  block on uploaded images (§14.5 "Signed images"): it decides what the
+  gateway stores and may start (automatic updates will take signed images
+  only), it does not change the sensor side – the sensor and the bootloader
+  still check only the CRC and the HW type, so the label-key limit above
+  stays as it is.
 
 ### 14.10 Open questions for the owner
 

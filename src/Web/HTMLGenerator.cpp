@@ -29,6 +29,7 @@
 #include "../config.h"
 #include "../Hardware/RadioTask.h"
 #include "../Data/TimeZones.h"
+#include "../Protocol/OtaImageSigned.h"
 
 String HTMLGenerator::htmlEscape(const String &text)
 {
@@ -191,8 +192,16 @@ void HTMLGenerator::addHtmlFooter(String &html, bool isAPMode)
 
     html += "  function parseJsonSafe(text){ try{ return JSON.parse(text); }catch(e){ return null; } }";
 
+    // Update mode (Update/UpdateMode.h): the admin connection may drop
+    html += "  var UM_WARN='The gateway enters update mode for this: MQTT and sensor reception pause, and if memory is short, "
+            "the network interfaces that do not carry the uplink (WiFi, its access point, LTE) are switched off for the "
+            "download. If this page is loaded over one of them, the connection drops - reload the page in a few minutes. "
+            "Continue?';";
+    html += "  var UM_LOST='The connection to the gateway was lost - it may be in update mode with this interface switched off. "
+            "Reload the page in a few minutes.';";
     html += "  window.checkUpdate = function(tries){";
     html += "    tries = tries || 0;";
+    html += "    if(!tries && !confirm(UM_WARN)) return;";
     html += "    fetch('/firmware/check')";
     html += "      .then(function(response){";
     html += "        return response.text().then(function(text){ return { ok: response.ok, status: response.status, data: parseJsonSafe(text), raw:text }; });";
@@ -205,16 +214,17 @@ void HTMLGenerator::addHtmlFooter(String &html, bool isAPMode)
     html += "        var newer=function(a,b){a=String(a).split('.');b=String(b).split('.');for(var i=0;i<Math.max(a.length,b.length);i++){var x=parseInt(a[i]||0,10),y=parseInt(b[i]||0,10);if(x!==y)return x>y;}return false;};";
     html += "        if(d.version && newer(d.version,'" + String(FIRMWARE_VERSION) + "')){";
     html += "          if(confirm('New version '+d.version+' available. Update now?')){";
-    html += "            window.updateFirmware(d.url);";
+    html += "            window.updateFirmware(d.url, true);";
     html += "          }";
     html += "        } else {";
     html += "          alert('You have the latest version: " + String(FIRMWARE_VERSION) + "');";
     html += "        }";
     html += "      })";
-    html += "      .catch(function(err){ alert('Update check failed: '+err.message); });";
+    html += "      .catch(function(err){ if(err instanceof TypeError){ window.showNotice(UM_LOST); } else { alert('Update check failed: '+err.message); } });";
     html += "  };";
 
-    html += "  window.updateFirmware = function(url){";
+    html += "  window.updateFirmware = function(url, warned){";
+    html += "    if(!warned && !confirm(UM_WARN)) return;";
     html += "    var btn=document.getElementById('btnUpdate'); if(btn) btn.disabled=true;";
     html += "    window.showNotice('Firmware update started. Please wait ~2 minutes. Do not power off.');";
     html += "    if (typeof startAutoRefresh==='function') { startAutoRefresh(120000); } else { setTimeout(function(){ location.reload(); },120000); }";
@@ -1421,10 +1431,14 @@ static String durationText(uint32_t s)
     return String(s / 3600) + " h " + String((s % 3600) / 60) + " min";
 }
 
-static String otaReason(const OtaJob::Job &j)
+static String otaReason(const OtaJob::Job &j, bool signedOnly)
 {
     String r = OtaJob::whyText(j.why);
-    if (j.why == OtaJob::Why::Refused)
+    if (j.why == OtaJob::Why::Unsigned && !signedOnly)
+    {
+        r = "unsigned image - held while \"Signed images only\" was on";
+    }
+    else if (j.why == OtaJob::Why::Refused)
     {
         r += String(": ") + OtaJob::refusalText(j.whyArg);
     }
@@ -1483,7 +1497,7 @@ static void addGen2OtaCard(String &html, const Gen2Sensor &g, const Gen2OtaView 
         const uint16_t done = j.maxConfirmed < n ? j.maxConfirmed : n;
         html += "<table>";
         html += "<tr><td>State</td><td><strong>" + String(OtaJob::stateName(j.state)) + "</strong>";
-        const String reason = otaReason(j);
+        const String reason = otaReason(j, v.signedOnly);
         if (reason.length() > 0)
         {
             html += " <small>(" + HTMLGenerator::htmlEscape(reason) + ")</small>";
@@ -1496,7 +1510,12 @@ static void addGen2OtaCard(String &html, const Gen2Sensor &g, const Gen2OtaView 
         {
             html += " <small>installed despite abort</small>";
         }
-        if (j.manualPause)
+        if (j.manualPause && j.why == OtaJob::Why::Unsigned)
+        {
+            html += v.signedOnly ? " <small>held - Resume needs \"Signed images only\" off</small>"
+                                 : " <small>\"Signed images only\" is off now - Resume possible</small>";
+        }
+        else if (j.manualPause)
         {
             html += " <small>paused by the admin</small>";
         }
@@ -1564,7 +1583,8 @@ static void addGen2OtaCard(String &html, const Gen2Sensor &g, const Gen2OtaView 
                 if (v.confirm.length() > 0)
                 {
                     html += "<p style='color:#c0392b;'>" + HTMLGenerator::htmlEscape(v.confirm) +
-                            "</p><label><input type='checkbox' name='confirm' value='1'> I confirm</label> ";
+                            "</p><label><input type='checkbox' name='confirm' value='" + String(v.confirmToken) +
+                            "'> I confirm</label> ";
                 }
                 html += "<button type='submit' class='btn'>Retry" +
                         (v.imageOk ? String(" with v") + fwText(v.imageFw) : String("")) + "</button></form>";
@@ -1599,33 +1619,41 @@ static void addGen2OtaCard(String &html, const Gen2Sensor &g, const Gen2OtaView 
             if (v.confirm.length() > 0)
             {
                 html += "<p style='color:#c0392b;'>" + HTMLGenerator::htmlEscape(v.confirm) +
-                        "</p><label><input type='checkbox' name='confirm' value='1'> I confirm</label> ";
+                        "</p><label><input type='checkbox' name='confirm' value='" + String(v.confirmToken) +
+                        "'> I confirm</label> ";
             }
             html += "<button type='submit' class='btn'>Update to v" + fwText(v.imageFw) + "</button></form>";
         }
     }
     // Image store
-    html += "<h3>Images</h3><table><tr><th>HW type</th><th>Version</th><th>Size</th><th></th></tr>";
+    html += "<h3>Images</h3><table><tr><th>HW type</th><th>Version</th><th>Size</th><th>Signature</th><th></th></tr>";
     for (size_t i = 0; i < v.imageCount; i++)
     {
         const OtaStore::Meta &m = v.images[i];
         char hw[8];
         snprintf(hw, sizeof(hw), "%04X", m.hwType);
-        html += "<tr><td>0x" + String(hw) + "</td><td>v" + fwText(m.fw) + "</td><td>" + String(m.len) +
-                " B</td><td><form method='post' action='/ota/delete' onsubmit='return confirm(\"Delete this image?\")'>"
+        char sig[48];
+        OtaImageSigned::stateText(m.signedKey, m.unknownKey, sig, sizeof(sig));
+        html += "<tr><td>0x" + String(hw) + "</td><td>v" + fwText(m.fw) + "</td><td>" + String(m.len) + " B</td><td" +
+                (m.isSigned() ? String(">") : String(" style='color:#e67e22;'>")) + sig + "</td><td><form method='post' action='/ota/delete' onsubmit='return confirm(\"Delete this image?\")'>"
                 "<input type='hidden' name='hw' value='" +
                 String(m.hwType) + "'><input type='hidden' name='devId' value='" + String(id) +
                 "'><button type='submit' class='btn-delete'>Delete</button></form></td></tr>";
     }
     if (v.imageCount == 0)
     {
-        html += "<tr><td colspan='4'>none</td></tr>";
+        html += "<tr><td colspan='5'>none</td></tr>";
     }
     html += "</table>";
     html += "<form method='post' action='/ota/upload?devId=" + String(id) +
             "' enctype='multipart/form-data'><p>Upload a sensor image (<code>firmware.bin</code> with the trailer, "
-            "built with the OTA receiver): <input type='file' name='image' accept='.bin' required> "
-            "<button type='submit' class='btn'>Upload</button></p></form></div>";
+            "built with the OTA receiver, optionally signed): <input type='file' name='image' accept='.bin' required> "
+            "<button type='submit' class='btn'>Upload</button></p></form>";
+    html += String("<p><small>Signed images only: <strong>") + (v.signedOnly ? "on" : "off") +
+            "</strong> (Firmware page). " +
+            (v.signedOnly ? "Unsigned images are refused and cannot be started or resumed."
+                          : "Unsigned images are stored with a warning; a start needs a confirmation.") +
+            "</small></p></div>";
 }
 
 String HTMLGenerator::generateGen2DetailPage(const Gen2Sensor &g, const String &message, const Gen2OtaView *ota)
@@ -1836,35 +1864,139 @@ String HTMLGenerator::generateGen2DetailPage(const Gen2Sensor &g, const String &
     return html;
 }
 
-String HTMLGenerator::generateFirmwarePage() {
+String HTMLGenerator::generateUpdateProgressPage(const String &updateStatus) {
+    String html;
+    html.reserve(1024);
+    html += "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' "
+            "content='width=device-width,initial-scale=1'><meta http-equiv='refresh' content='15'>"
+            "<title>Update in progress</title></head><body style='font-family:sans-serif;max-width:40em;"
+            "margin:1em auto;padding:0 1em;'><h2>Update in progress</h2><p>";
+    html += htmlEscape(updateStatus);
+    html += "</p><p><small>This page reloads every 15 s and shows the firmware page again when the update ends. "
+            "If it stops answering, the connection went over an interface that is switched off for the update - "
+            "reload it in a few minutes.</small></p></body></html>";
+    return html;
+}
+
+String HTMLGenerator::generateFirmwarePage(const String &updateStatus, bool signedOnly, const GatewayOta::View &gw) {
     String html;
     html.reserve(4096);
     addHtmlHeader(html, "Firmware");
 
+    // Update mode: the last session (while one runs, /firmware serves
+    // generateUpdateProgressPage instead)
+    if (updateStatus.length() > 0)
+    {
+        html += "<div class='card' style='border-left:4px solid #3498db;'>";
+        html += "<h2>Update mode</h2>";
+        html += "<p>" + htmlEscape(updateStatus) + "</p>";
+        html += "</div>";
+    }
+
     // card: Online update
     html += "<div class='card'>";
     html += "<h2>Online Update</h2>";
-    html += "<p>Current firmware: <strong>v" + String(FIRMWARE_VERSION) + "</strong></p>";
+    html += "<p>Current firmware: <strong>v" + String(FIRMWARE_VERSION) + "</strong> - installed: " +
+            htmlEscape(gw.runningSig) + "</p>";
+    if (gw.validating && gw.validateFailed)
+    {
+        html += "<p><small>New firmware: validation failed (it could not be marked valid) - the next restart rolls "
+                "back to the previous firmware.</small></p>";
+    }
+    else if (gw.validating && gw.validateLeftS == 0)
+    {
+        html += "<p><small>New firmware: being marked valid (retrying).</small></p>";
+    }
+    else if (gw.validating)
+    {
+        html += "<p><small>New firmware: validated after about " + String(gw.validateLeftS) +
+                " s more of normal operation (until then a reset rolls back to the previous firmware, and no other "
+                "firmware can be installed).</small></p>";
+    }
+    if (gw.lastText.length() > 0)
+    {
+        html += "<p><small>Last install: " + htmlEscape(gw.lastText) + "</small></p>";
+    }
     html += "<p><button id='btnUpdate' onclick='checkUpdate()' class='btn'>Check for update</button></p>";
+    html += "<p><small>The check and a download from a URL run in update mode: MQTT and sensor reception pause, and "
+            "when memory is short the interfaces that do not carry the uplink are switched off until it ends - the "
+            "connection to this page may drop then; reload it after a few minutes.</small></p>";
     html += "<hr>";
     html += "<label for='fwUrl'>Custom firmware URL:</label>";
     html += "<input type='text' id='fwUrl' placeholder='https://example.com/firmware.bin'>";
     html += "<button class='btn' onclick='(function(){var u=document.getElementById(\"fwUrl\").value.trim(); if(u){ updateFirmware(u); } else { alert(\"Enter firmware URL first\"); }})()'>Update from URL</button>";
     html += "</div>";
 
+    // Card: an unsigned (or older verified) image waiting for the admin's
+    // confirmation
+    if (gw.waiting)
+    {
+        html += "<div class='card' style='border-left:4px solid #e67e22;'>";
+        html += "<h2>Firmware waiting for confirmation</h2>";
+        html += "<p>Written but not activated: " + htmlEscape(gw.waitingText) +
+                (gw.waitingDowngrade ? String(". Confirm to downgrade.</p>")
+                                     : String(". The image is not verified - install it only if you trust where it "
+                                              "comes from.</p>"));
+        if (gw.waitingMine)
+        {
+            html += "<p><button class='btn' onclick='confirmFw(\"" + gw.waitingDigest + "\")'>" +
+                    (gw.waitingDowngrade ? "Downgrade" : "Activate unsigned firmware") + "</button> <small>(within " +
+                    String((gw.waitingLeftS + 59) / 60) + " min)</small></p>";
+        }
+        else
+        {
+            html += "<p><small>Only the login session that installed it can confirm it (within " +
+                    String((gw.waitingLeftS + 59) / 60) + " min).</small></p>";
+        }
+        html += "</div>";
+    }
+
     // Card: Manual upload (.bin)
     html += "<div class='card'>";
     html += "<h2>Manual Upload (.bin)</h2>";
     html += "<form id='uploadForm' enctype='multipart/form-data'>";
     html += "  <input type='file' name='bin' id='fwFile' accept='.bin,application/octet-stream' required>";
-    html += "  <p><small>Do not power off the device during upload and install.</small></p>";
+    html += "  <p><small>Do not power off the device during upload and install. A file signed with a release key "
+            "is verified and installed; an unsigned file (or an older version than the running one) is written and installed "
+            "only after you confirm it.</small></p>";
     html += "  <button type='submit' id='btnUpload' class='btn'>Upload & Install</button>";
+    html += "</form>";
+    html += "</div>";
+
+    // Card: signed images (one setting for sensor images and, later, the
+    // gateway's own firmware)
+    html += "<div class='card'>";
+    html += "<h2>Signed Images</h2>";
+    html += "<form method='post' action='/firmware/signed'>";
+    html += String("<label><input type='checkbox' name='signedOnly' value='1'") + (signedOnly ? " checked" : "") +
+            "> Signed images only</label>";
+    html += "<p><small>Gateway firmware (upload or URL) and sensor images uploaded on the generation 2 sensor page "
+            "are checked against the release keys built into this firmware. A verified gateway firmware is installed "
+            "at once; an unsigned one (or one signed with an unknown key) is installed only after the admin confirms "
+            "it. A verified sensor image is marked as such; an unsigned one is stored with a warning and a start "
+            "needs a confirmation. With this option on, unsigned files are refused: gateway firmware is not "
+            "installed; an unsigned sensor image already stored cannot be started (a queued start is dropped), and "
+            "a job that has not finished sending an unsigned image is held Paused, also after a restart, and cannot "
+            "be resumed until the option is off. A sensor job whose image is already complete on the sensor is not "
+            "stopped. A file whose signature is present but wrong is always refused.</small></p>";
+    html += "<button type='submit' class='btn'>Save</button>";
     html += "</form>";
     html += "</div>";
 
     html += "<script>";
     html += "(function(){";
     html += "  function parseJsonSafe(t){ try{return JSON.parse(t);}catch(e){return null;} }";
+    html += "  window.confirmFw=function(img){";
+    html += "    fetch('/firmware/confirm',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'image='+encodeURIComponent(img)})";
+    html += "      .then(function(resp){ return resp.text().then(function(t){ return {ok:resp.ok,data:parseJsonSafe(t)}; }); })";
+    html += "      .then(function(res){";
+    html += "        var m=(res.data&&(res.data.message||res.data.error))||'No answer';";
+    html += "        if(!res.ok){ alert('Not activated: '+m); location.reload(); return; }";
+    html += "        if(window.showNotice){ window.showNotice(m); } else { alert(m); }";
+    html += "        setTimeout(function(){ location.reload(); },60000);";
+    html += "      })";
+    html += "      .catch(function(err){ alert('Confirmation failed: '+err.message); });";
+    html += "  };";
     html += "  var f=document.getElementById('uploadForm');";
     html += "  var b=document.getElementById('btnUpload');";
     html += "  if(f){";
@@ -1878,7 +2010,9 @@ String HTMLGenerator::generateFirmwarePage() {
     html += "        .then(function(resp){ return resp.text().then(function(t){ return {ok:resp.ok,status:resp.status,data:parseJsonSafe(t),raw:t}; }); })";
     html += "        .then(function(res){";
     html += "          if(!res.ok){ throw new Error((res.data&&(res.data.error||res.data.message))||('HTTP '+res.status)); }";
-    html += "          var msg=(res.data&&res.data.message)?res.data.message:'Firmware uploaded. Installing… device will reboot automatically.';";
+    html += "          var d=res.data||{};";
+    html += "          if(d.status==='confirm'){ if(window.hideNotice){ window.hideNotice(); } if(confirm(d.message+(d.sig==='verified'?'\\n\\nDowngrade to this older firmware now?':'\\n\\nActivate this unsigned firmware now?'))){ confirmFw(d.image); } else { location.reload(); } return; }";
+    html += "          var msg=d.message?d.message:'Firmware uploaded. Installing… device will reboot automatically.';";
     html += "          if(window.showNotice){ window.showNotice(msg); } else { alert(msg); }";
     html += "          setTimeout(function(){ location.reload(); },60000);";
     html += "        })";

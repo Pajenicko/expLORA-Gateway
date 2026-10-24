@@ -166,8 +166,12 @@ public:
         Failed,       // the broker refused / was unreachable, statusState() has the code
         Disconnected, // was connected, reconnects
         TlsLowMemory, // TLS needs more free memory than there is; not tried
-        HeldForAp     // TLS dropped / held back while the access point cannot start
+        HeldForAp,    // TLS dropped / held back while the access point cannot start
+        HeldForUpdate // disconnected for an update-mode session (Update/UpdateMode.h)
     };
+    // Update mode (loop task): true disconnects and keeps MQTT off, false
+    // reconnects at once
+    void holdForUpdate(bool hold);
     Status status() const { return statusCode.load(); }
     // A TLS session is up (any task: atomics only - the TLS client itself
     // belongs to the loop task, which may replace it)
@@ -187,6 +191,7 @@ private:
     std::atomic<bool> connectedWithTls{false}; // the last connect used TLS
     std::atomic<uint32_t> tlsLowFree{0};  // internal heap at the last TLS refusal
     std::atomic<uint32_t> tlsLowLargest{0};
+    bool heldForUpdate = false;           // loop task only
     bool tlsLowLogged = false;            // the refusal is logged once per episode,
     unsigned long tlsLowLoggedAt = 0;     // then at most every TLS_LOW_LOG_INTERVAL
 };

@@ -223,25 +223,38 @@ public:
     // loop(): outcome of an OTA frame
     void otaResult(const OtaResult &result);
     // Start checks (gen2 page): blockers stop it, warnings and confirm
-    // (downgrade, reinstall, the reverted image) are shown; estimate in s
+    // (downgrade, reinstall, the reverted image, an unsigned image) are
+    // shown; estimate in s. confirmToken binds a confirmation to exactly
+    // these reasons and this image (OtaJob::startConfirmToken)
     struct OtaCheck
     {
         bool imageOk = false;
-        uint32_t imageFw = 0, imageLen = 0;
+        uint32_t imageFw = 0, imageLen = 0, imageCrc = 0;
         String blockers, warnings, confirm;
+        uint32_t confirmToken = 0;
         uint32_t estimateS = 0;
     };
     // requestStatus: ask the sensor for a status report when none is known
     // (the start path; a page view only shows the blocker)
     OtaCheck otaCheckStart(uint32_t devId, bool requestStatus = false);
-    // Queue a start (loop() re-verifies the image and creates the job);
-    // false: blocked (msg says why)
-    bool otaRequestStart(uint32_t devId, bool confirmed, String &msg);
-    // Admin actions: 'a' abort, 'p' pause, 'r' resume, 'c' clear
+    // Queue a start (loop() re-verifies the image and the signature rule
+    // and creates the job); confirmToken: the token of the page the admin
+    // confirmed on (0 = not confirmed). false: blocked (msg says why)
+    bool otaRequestStart(uint32_t devId, uint32_t confirmToken, String &msg);
+    // Admin actions: 'a' abort, 'p' pause, 'r' resume, 'c' clear. A resume
+    // is refused while "Signed images only" is on and the image is unsigned
     bool otaAdmin(uint32_t devId, char action, String &msg);
+    // "Signed images only" is on (switched on, or at boot after the job was
+    // restored): a queued start or a job that has not transferred its image
+    // yet, with an unsigned image, is dropped / held Paused
+    void otaEnforceSignedOnly(const char *when);
     // Copy of the job (page, diag); false when there is none
     bool otaJobCopy(OtaJob::Job &out) const;
     String otaLastEventText() const;
+    // State of the job (None without one) and whether a start is queued
+    // (Update/UpdateMode.h: the radio is paused only for a Paused or
+    // terminal job)
+    OtaJob::State otaJobState(bool &startPending) const;
     // A non-terminal job uses an image of this HW type (no upload / delete then)
     bool otaImageBusy(uint16_t hwType) const;
     // An image was replaced or deleted: a terminal job of this HW type goes

@@ -9,6 +9,7 @@
 
 #include <unity.h>
 #include <cstdio>
+#include <initializer_list>
 #include "../../src/Protocol/OtaJob.h"
 
 using namespace OtaJob;
@@ -1544,6 +1545,176 @@ static void test_starved_adopted_after_reboot(void)
     TEST_ASSERT_EQUAL((int)Down::Start, (int)r.down);
 }
 
+// "Signed images only" with an unsigned image: an unfinished job is held like
+// a manual pause (switched on, restored after a restart); later states go on
+static void test_hold_unsigned(void)
+{
+    // Waiting, no start sent yet: held, no start until a resume, a quiet abort
+    Job w = inState(State::Waiting);
+    TEST_ASSERT_TRUE(holdUnsigned(w, at(5)));
+    TEST_ASSERT_EQUAL((int)State::Paused, (int)w.state);
+    TEST_ASSERT_EQUAL((int)Why::Unsigned, (int)w.why);
+    TEST_ASSERT_TRUE(w.manualPause);
+    TEST_ASSERT_FALSE(holdUnsigned(w, at(6))); // already held
+    TEST_ASSERT_EQUAL((int)Down::None, (int)onUp(w, up(at(30), false), at(30)).down);
+    TEST_ASSERT_TRUE(canResume(w, at(31)));
+    Job wa = w;
+    TEST_ASSERT_TRUE(abort(wa, at(32)));
+    TEST_ASSERT_FALSE(wa.abortQuiet); // nothing of this job on the sensor
+    // ... a resume lets the start go out with the next report
+    TEST_ASSERT_TRUE(resume(w, at(40)));
+    TEST_ASSERT_EQUAL((int)Down::Start, (int)onUp(w, up(at(50), false), at(50)).down);
+
+    // Transfer: an OTA end pause goes out, the sensor's progress is answered with it
+    Job t = inState(State::Transfer);
+    TEST_ASSERT_TRUE(holdUnsigned(t, at(20)));
+    TEST_ASSERT_EQUAL((int)State::Paused, (int)t.state);
+    TEST_ASSERT_TRUE(t.pendingEnd == PendingEnd::Pause);
+    TEST_ASSERT_EQUAL((int)Down::EndPause, (int)onUp(t, progress(at(846), 0, 0, 32), at(846)).down);
+    Job ta = t;
+    TEST_ASSERT_TRUE(abort(ta, at(850)));
+    TEST_ASSERT_TRUE(ta.abortQuiet); // the sensor holds a transfer state
+
+    // Restored after a restart: Transfer -> Paused (reboot) would start again by
+    // itself; held, it does not
+    Job r = inState(State::Transfer);
+    afterReboot(r, at(100));
+    TEST_ASSERT_EQUAL((int)Why::Reboot, (int)r.why);
+    TEST_ASSERT_TRUE(holdUnsigned(r, at(100)));
+    TEST_ASSERT_EQUAL((int)Why::Unsigned, (int)r.why);
+    TEST_ASSERT_EQUAL((int)Down::None, (int)onUp(r, up(at(700), false), at(700)).down);
+    // A battery refusal keeps the reason (paused by the rule, not by the battery)
+    Up low = up(at(1300), false);
+    low.refused = true;
+    low.refusedArg = ep::ota::kRefuseBattery;
+    onUp(r, low, at(1300));
+    TEST_ASSERT_EQUAL((int)Why::Unsigned, (int)r.why);
+
+    // Paused (left) without a hold: held as well
+    Job p = inState(State::Paused);
+    TEST_ASSERT_FALSE(p.manualPause);
+    TEST_ASSERT_TRUE(holdUnsigned(p, at(30)));
+    TEST_ASSERT_TRUE(p.manualPause);
+
+    // The image is complete on the sensor: not stopped
+    for (State s : {State::Verified, State::Swapping, State::Confirming, State::Aborted, State::None})
+    {
+        Job v;
+        if (s == State::Aborted)
+        {
+            v = inState(State::Waiting);
+            abort(v, at(20));
+        }
+        else if (s != State::None)
+        {
+            v = inState(s);
+        }
+        const State before = v.state;
+        TEST_ASSERT_FALSE(holdUnsigned(v, at(30)));
+        TEST_ASSERT_EQUAL((int)before, (int)v.state);
+    }
+    TEST_ASSERT_EQUAL_STRING("unsigned image - \"Signed images only\" is on", whyText(Why::Unsigned));
+}
+
+// S3 item 0: a Verified job does not transfer again an unsigned image while
+// "Signed images only" is on (the sensor lost the image, or it left and would
+// get a new start); held like holdUnsigned(). A hold keeps its reason
+static void test_hold_verified_unsigned(void)
+{
+    // Re-accept with less than the whole image: held, the sensor is sent away
+    for (int variant = 0; variant < 3; variant++)
+    {
+        Job v = inState(State::Verified);
+        TEST_ASSERT_EQUAL((int)State::Verified, (int)v.state);
+        v.imageVerified = variant == 1;
+        Up a = accepted(at(100), 1, 5, 0);
+        a.signedOnly = variant != 2;
+        Result r = onUp(v, a, at(100));
+        if (variant == 0)
+        {
+            TEST_ASSERT_EQUAL((int)State::Paused, (int)v.state);
+            TEST_ASSERT_EQUAL((int)Why::Unsigned, (int)v.why);
+            TEST_ASSERT_TRUE(v.manualPause);
+            TEST_ASSERT_EQUAL((int)Down::EndPause, (int)r.down);
+            TEST_ASSERT_TRUE(r.log);
+            // Resume refused by the caller while the option is on; after a resume
+            // (option off) the transfer goes on
+            TEST_ASSERT_TRUE(canResume(v, at(110)));
+            TEST_ASSERT_TRUE(resume(v, at(110)));
+            TEST_ASSERT_EQUAL((int)State::Transfer, (int)(onUp(v, accepted(at(120), 1, 5, 0), at(120)), v.state));
+        }
+        else
+        {
+            // verified image, or the option off: transfers again as before
+            TEST_ASSERT_EQUAL((int)State::Transfer, (int)v.state);
+            TEST_ASSERT_FALSE(v.manualPause);
+        }
+    }
+    // Accepted with the whole image: stays Verified (nothing to transfer)
+    {
+        Job v = inState(State::Verified);
+        Up a = accepted(at(100), 1, (uint16_t)v.blocks(), 0);
+        a.signedOnly = true;
+        onUp(v, a, at(100));
+        TEST_ASSERT_EQUAL((int)State::Verified, (int)v.state);
+    }
+    // "left 1" and an UP without bit 4: no new start, held
+    for (int kind = 0; kind < 2; kind++)
+    {
+        Job v = inState(State::Verified);
+        Up u = kind == 0 ? leave1(200) : up(at(200), false);
+        u.signedOnly = true;
+        Result r = onUp(v, u, at(200));
+        TEST_ASSERT_EQUAL((int)Down::None, (int)r.down);
+        TEST_ASSERT_EQUAL((int)State::Paused, (int)v.state);
+        TEST_ASSERT_EQUAL((int)Why::Unsigned, (int)v.why);
+        // ... and stays quiet
+        Up again = up(at(300), false);
+        again.signedOnly = true;
+        TEST_ASSERT_EQUAL((int)Down::None, (int)onUp(v, again, at(300)).down);
+        // The same without the option: the start goes out
+        Job w = inState(State::Verified);
+        Up u2 = kind == 0 ? leave1(200) : up(at(200), false);
+        TEST_ASSERT_EQUAL((int)Down::Start, (int)onUp(w, u2, at(200)).down);
+        TEST_ASSERT_EQUAL((int)State::Verified, (int)w.state);
+        // A verified image: the start goes out with the option on
+        Job x = inState(State::Verified);
+        x.imageVerified = true;
+        Up u3 = kind == 0 ? leave1(200) : up(at(200), false);
+        u3.signedOnly = true;
+        TEST_ASSERT_EQUAL((int)Down::Start, (int)onUp(x, u3, at(200)).down);
+    }
+
+    // A hold keeps its reason: a job paused by missed statuses, then held, then
+    // a "left 1" that would classify as starved
+    Job m = inState(State::Transfer);
+    tick(m, at(1708));
+    TEST_ASSERT_TRUE(m.pausedByMisses);
+    TEST_ASSERT_TRUE(holdUnsigned(m, at(1710)));
+    TEST_ASSERT_FALSE(m.pausedByMisses);
+    onUp(m, leave1(3500), at(3500));
+    TEST_ASSERT_EQUAL((int)Why::Unsigned, (int)m.why);
+    // ... also if the flag were still set (defence in depth)
+    m.pausedByMisses = true;
+    m.pausedUptimeS = at(3600).uptimeS;
+    Result r = onUp(m, leave1(3700), at(3700));
+    TEST_ASSERT_EQUAL((int)Why::Unsigned, (int)m.why);
+    TEST_ASSERT_EQUAL((int)Down::None, (int)r.down);
+}
+
+// The confirmation token: bound to the reasons and the image, never 0
+static void test_confirm_token(void)
+{
+    const char *a = "Reinstall of the running version v0.2.12. ";
+    const char *b = "Reinstall of the running version v0.2.12. Unsigned image. ";
+    const uint32_t ta = startConfirmToken(a, strlen(a), 0x11223344u);
+    TEST_ASSERT_EQUAL_UINT32(ta, startConfirmToken(a, strlen(a), 0x11223344u));
+    TEST_ASSERT_NOT_EQUAL(ta, startConfirmToken(b, strlen(b), 0x11223344u)); // a reason more
+    TEST_ASSERT_NOT_EQUAL(ta, startConfirmToken(a, strlen(a), 0x11223345u)); // another image
+    TEST_ASSERT_NOT_EQUAL(0u, ta);
+    TEST_ASSERT_NOT_EQUAL(0u, startConfirmToken("", 0, 0));
+}
+
 int main(int, char **)
 {
     UNITY_BEGIN();
@@ -1579,5 +1750,8 @@ int main(int, char **)
     RUN_TEST(test_done_counters);
     RUN_TEST(test_abort_out_of_session);
     RUN_TEST(test_eta);
+    RUN_TEST(test_hold_unsigned);
+    RUN_TEST(test_hold_verified_unsigned);
+    RUN_TEST(test_confirm_token);
     return UNITY_END();
 }

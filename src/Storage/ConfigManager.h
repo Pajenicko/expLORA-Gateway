@@ -104,6 +104,13 @@ public:
     // Web admin password, "pbkdf2$..." (see WebAuth); empty = not set yet
     String adminPasswordHash;
 
+    // "Signed images only" (Preferences only, default off): unsigned images
+    // (and images signed with a key the firmware does not know) are refused
+    // at the end of a manual upload; shared by sensor images (store) and,
+    // from stage S3, the gateway's own firmware. Automatic updates always
+    // take signed images only, whatever this says
+    bool signedOnly = false;
+
     // Held by save()/load() and the setters (web and loop task both write);
     // readers in another task take it while copying values (MQTTManager)
     std::recursive_mutex &mutex() { return configMutex; }
@@ -157,6 +164,9 @@ public:
 
     // Set the WiFi radio switch (applies after a restart)
     bool setWifiEnabled(bool enabled, bool saveConfig = true);
+
+    // Set "signed images only"; false = not saved (the previous value is kept)
+    bool setSignedOnly(bool on);
 
     // Set LTE configuration
     bool setLteConfig(bool enabled, const String &apn, const String &pin, bool saveConfig = true);

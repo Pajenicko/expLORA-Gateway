@@ -25,8 +25,8 @@
 #include <WiFi.h>
 #include <esp_mac.h>
 
-// Firmware version
-#define FIRMWARE_VERSION "2.0.0"
+// Firmware version (FIRMWARE_VERSION)
+#include "version.h"
 
 // OTA Configuration: FIRMWARE_UPDATE_URL is per board (board_config.h)
 #include "board_config.h"

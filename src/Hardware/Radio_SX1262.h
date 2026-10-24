@@ -80,6 +80,7 @@ public:
     int16_t prepareTx(const uint8_t *frame, size_t len) override;
     int16_t launchTx() override;
     void finishTx() override;
+    bool standby() override;
     uint32_t timeOnAirUs(size_t len) override;
     bool receiving() const override { return rxRunning; }
     const char *getChipName() const override { return "SX1262"; }

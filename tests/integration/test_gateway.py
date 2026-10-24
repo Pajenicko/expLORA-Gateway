@@ -357,7 +357,7 @@ def wifi_switch_macos(interface: str, ssid: str, password: str = "") -> bool:
 def wifi_switch_prompt(ssid: str, password: str = ""):
     """Cross-platform fallback: tell the user what to do, wait for confirmation."""
     if password:
-        print(f"  {YELLOW}>>{RESET} Please connect this computer to WiFi {BOLD}{ssid!r}{RESET} (password: {password!r})")
+        print(f"  {YELLOW}>>{RESET} Please connect this computer to WiFi {BOLD}{ssid!r}{RESET} (password from the [wifi] section of your config)")
     else:
         print(f"  {YELLOW}>>{RESET} Please connect this computer to the open WiFi {BOLD}{ssid!r}{RESET}")
     input(f"  Press {BOLD}ENTER{RESET} once connected … ")

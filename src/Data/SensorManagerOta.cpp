@@ -27,6 +27,11 @@
 #include "../Protocol/Gen2Crypto.h"
 #include "../Protocol/Gen2Downlink.h"
 #include "../Storage/OtaStore.h"
+#include "../Protocol/OtaImageSigned.h"
+#include "../Storage/ConfigManager.h"
+#include "../Update/UpdateMode.h"
+
+extern ConfigManager *configManager;
 
 static const char *const OTA_JOB_FILE = "/ota/job.json";
 static constexpr uint32_t OTA_SAVE_DELAY_MS = 1500;   // after the response that changed it
@@ -314,6 +319,36 @@ void SensorManager::otaBegin()
                     OtaJob::stateName(j.state));
         otaScheduleSaveLocked(millis());
     }
+    // Whether the restored job's image is verified (RAM only: the key table
+    // of this firmware decides, OtaStore::get applies it). Flash read
+    // without the sensor lock; the image cannot change while the job uses it
+    uint16_t jobHw = 0;
+    uint32_t jobCrc = 0, jobLen = 0;
+    bool restored = false;
+    {
+        std::lock_guard<std::mutex> lock(sensorMutex);
+        if (otaJobPtr && !OtaJob::terminal(otaJobPtr->state))
+        {
+            restored = true;
+            jobHw = otaJobPtr->hwType;
+            jobCrc = otaJobPtr->crc;
+            jobLen = otaJobPtr->len;
+        }
+    }
+    if (restored)
+    {
+        OtaStore::Meta meta;
+        const bool stored = OtaStore::get(jobHw, meta);
+        const bool verified = !OtaImageSigned::jobHeld(true, stored, meta.crc, meta.len, meta.signedKey, jobCrc, jobLen);
+        std::lock_guard<std::mutex> lock(sensorMutex);
+        if (otaJobPtr && otaJobPtr->crc == jobCrc)
+        {
+            otaJobPtr->imageVerified = verified;
+        }
+    }
+    // "Signed images only" holds for a restored job too: one with an
+    // unsigned image does not go on by itself
+    otaEnforceSignedOnly("after the restart (\"Signed images only\" is on)");
 }
 
 // --- UPs of generation 2 sensors (handleGen2Frame, sensorMutex held) ---------------------
@@ -417,7 +452,16 @@ OtaJob::Down SensorManager::otaOnUpLocked(Gen2Sensor &g, OtaJob::Up &u, unsigned
         }
         return g.otaAbort.armed() ? OtaJob::Down::EndAbort : OtaJob::Down::EndPause;
     }
+    // A Verified job of an image that is not verified does not transfer
+    // again while "Signed images only" is on (OtaJob::holdBeforeTransfer)
+    u.signedOnly = configManager && configManager->signedOnly;
+    const bool wasHeld = otaJobPtr->manualPause && otaJobPtr->why == OtaJob::Why::Unsigned;
     OtaJob::Result r = OtaJob::onUp(*otaJobPtr, u, otaNow());
+    if (!wasHeld && otaJobPtr->manualPause && otaJobPtr->why == OtaJob::Why::Unsigned)
+    {
+        logger.warning("OTA " + g.name + ": the sensor would need the image again - held Paused, its image is "
+                       "unsigned and \"Signed images only\" is on; abort the job, or switch the option off and resume");
+    }
     if (r.bindMismatch)
     {
         logger.warning("OTA " + g.name + ": accepting UP FCnt " + String(u.fcnt32) + ", expected " +
@@ -436,6 +480,12 @@ OtaJob::Down SensorManager::otaOnUpLocked(Gen2Sensor &g, OtaJob::Up &u, unsigned
 
 void SensorManager::otaRunStart()
 {
+    // The radio is in standby during an update-mode session: a start queued
+    // meanwhile waits for its end (otaStartPending stays set)
+    if (UpdateMode::active())
+    {
+        return;
+    }
     uint32_t devId = 0;
     OtaJob::Target t;
     {
@@ -473,10 +523,24 @@ void SensorManager::otaRunStart()
         return;
     }
     std::lock_guard<std::mutex> lock(sensorMutex);
+    if (!otaStartPending || otaStartDevId != devId)
+    {
+        return; // dropped meanwhile (otaEnforceSignedOnly)
+    }
     otaStartPending = false;
     if (otaJobPtr && !OtaJob::terminal(otaJobPtr->state))
     {
         return; // another job started meanwhile
+    }
+    // "Signed images only" may have been switched on since the start was
+    // requested (the request checked it, the job is created only now)
+    if (OtaImageSigned::startRule(meta.signedKey, configManager && configManager->signedOnly) ==
+        OtaImageSigned::StartRule::Block)
+    {
+        otaLastEvent = "OTA start of " + devIdText(devId) +
+                       " refused: unsigned image - \"Signed images only\" is on (Firmware page)";
+        logger.warning(otaLastEvent);
+        return;
     }
     // The previous (finished) job's revert watch and pending abort move to its
     // sensor's record (a new job for that sensor overwrites the abort)
@@ -515,6 +579,7 @@ void SensorManager::otaRunStart()
     img.crc = meta.crc;
     img.len = meta.len;
     OtaJob::begin(otaJob, t, img, otaNow());
+    otaJob.imageVerified = meta.signedKey != 0;
 #ifdef OTA_TEST_K64
     // Bench build only: the longest round the sensor accepts (K = 64, C = 46 s)
     otaJob.k = 64;
@@ -820,6 +885,7 @@ SensorManager::OtaCheck SensorManager::otaCheckStart(uint32_t devId, bool reques
         c.imageOk = true;
         c.imageFw = meta.fw;
         c.imageLen = meta.len;
+        c.imageCrc = meta.crc;
         const uint16_t blocks = ep::ota::blockCount(meta.len, ep::ota::kBlockSize);
         const uint16_t cad = ep::ota::cadenceFor(ep::ota::airtimeUs(ep::ota::kBlockFrameLen, 9), ep::ota::kMinK);
         // blocks x C x (K+1)/K, + the wait for the start (one interval) and the swap / confirmation (~25 min)
@@ -889,10 +955,38 @@ SensorManager::OtaCheck SensorManager::otaCheckStart(uint32_t devId, bool reques
             c.confirm += "This image reverted on this sensor before. ";
         }
     }
+    // Signature (M4c S2): an unsigned image (incl. one signed with a key this
+    // firmware does not know) needs the admin's confirmation; with "Signed
+    // images only" on it cannot be started at all (it may have been stored
+    // before the option was switched on). The flag is read without the config
+    // mutex (one aligned bool; sensorMutex is held here)
+    const OtaImageSigned::StartRule rule =
+        OtaImageSigned::startRule(meta.signedKey, configManager && configManager->signedOnly);
+    if (meta.valid && rule != OtaImageSigned::StartRule::Ok)
+    {
+        if (rule == OtaImageSigned::StartRule::Block)
+        {
+            c.blockers += "Unsigned image - \"Signed images only\" is on (Firmware page): upload a signed image. ";
+        }
+        else if (meta.unknownKey)
+        {
+            char k[9];
+            snprintf(k, sizeof(k), "%08lx", (unsigned long)meta.unknownKey);
+            c.confirm += String("Unsigned image (signed with an unknown key ") + k + "). ";
+        }
+        else
+        {
+            c.confirm += "Unsigned image. ";
+        }
+    }
+    if (c.confirm.length() > 0)
+    {
+        c.confirmToken = OtaJob::startConfirmToken(c.confirm.c_str(), c.confirm.length(), meta.crc);
+    }
     return c;
 }
 
-bool SensorManager::otaRequestStart(uint32_t devId, bool confirmed, String &msg)
+bool SensorManager::otaRequestStart(uint32_t devId, uint32_t confirmToken, String &msg)
 {
     OtaCheck c = otaCheckStart(devId, true);
     if (c.blockers.length() > 0)
@@ -900,9 +994,14 @@ bool SensorManager::otaRequestStart(uint32_t devId, bool confirmed, String &msg)
         msg = "Not started: " + c.blockers;
         return false;
     }
-    if (c.confirm.length() > 0 && !confirmed)
+    // The confirmation covers the reasons shown when the page was loaded:
+    // another image or another reason since then (e.g. an unsigned image
+    // uploaded in another tab) asks again
+    if (c.confirm.length() > 0 && confirmToken != c.confirmToken)
     {
-        msg = "Confirmation needed: " + c.confirm;
+        msg = confirmToken == 0 ? "Confirmation needed: " + c.confirm
+                                : "The reasons to confirm changed since the page was loaded - confirm again: " +
+                                      c.confirm;
         return false;
     }
     std::lock_guard<std::mutex> lock(sensorMutex);
@@ -923,6 +1022,28 @@ bool SensorManager::otaRequestStart(uint32_t devId, bool confirmed, String &msg)
 
 bool SensorManager::otaAdmin(uint32_t devId, char action, String &msg)
 {
+    // Resume: the stored image is read first (flash, without the sensor
+    // lock; it cannot change while the job uses it - otaImageBusy), the
+    // "Signed images only" rule is applied below under the same lock as the
+    // resume itself, with the option's value of that moment: switching it on
+    // either comes first (refused here) or holds the resumed job again
+    // (otaEnforceSignedOnly)
+    OtaStore::Meta resumeMeta;
+    bool resumeStored = false;
+    if (action == 'r')
+    {
+        bool have = false;
+        uint16_t hw = 0;
+        {
+            std::lock_guard<std::mutex> lock(sensorMutex);
+            if (otaJobPtr && otaJobPtr->devId == devId)
+            {
+                have = true;
+                hw = otaJobPtr->hwType;
+            }
+        }
+        resumeStored = have && OtaStore::get(hw, resumeMeta);
+    }
     std::lock_guard<std::mutex> lock(sensorMutex);
     if (!otaJobPtr || otaJobPtr->devId != devId)
     {
@@ -948,6 +1069,18 @@ bool SensorManager::otaAdmin(uint32_t devId, char action, String &msg)
         break;
     case 'r':
     {
+        if (OtaJob::canResume(otaJob, n) && configManager && configManager->signedOnly &&
+            OtaImageSigned::jobHeld(true, resumeStored, resumeMeta.crc, resumeMeta.len, resumeMeta.signedKey,
+                                    otaJob.crc, otaJob.len))
+        {
+            // "Signed images only": a job with an unsigned image is not
+            // resumed (it stays Paused; abort it or switch the option off)
+            msg = "Resume refused: the job's image is unsigned and \"Signed images only\" is on (Firmware page) - "
+                  "abort the job, or switch the option off and resume";
+            otaLastEvent = "OTA " + devIdText(devId) + ": " + msg;
+            logger.warning(otaLastEvent);
+            return false;
+        }
         const bool battery = OtaJob::batteryHold(otaJob, n);
         ok = OtaJob::resume(otaJob, n);
         msg = !ok       ? "Resume not possible now"
@@ -974,6 +1107,68 @@ bool SensorManager::otaAdmin(uint32_t devId, char action, String &msg)
     return ok;
 }
 
+void SensorManager::otaEnforceSignedOnly(const char *when)
+{
+    if (!configManager || !configManager->signedOnly)
+    {
+        return;
+    }
+    bool job = false, pending = false;
+    uint16_t jobHw = 0, pendingHw = 0;
+    uint32_t jobDev = 0, jobCrc = 0, jobLen = 0, pendingDev = 0;
+    {
+        std::lock_guard<std::mutex> lock(sensorMutex);
+        if (otaJobPtr && (otaJobPtr->state == State::Waiting || otaJobPtr->state == State::Transfer ||
+                          otaJobPtr->state == State::Paused))
+        {
+            job = true;
+            jobDev = otaJobPtr->devId;
+            jobHw = otaJobPtr->hwType;
+            jobCrc = otaJobPtr->crc;
+            jobLen = otaJobPtr->len;
+        }
+        if (otaStartPending)
+        {
+            int i = findGen2Locked(otaStartDevId);
+            if (i >= 0)
+            {
+                pending = true;
+                pendingDev = otaStartDevId;
+                pendingHw = gen2[i].hwType;
+            }
+        }
+    }
+    if (!job && !pending)
+    {
+        return;
+    }
+    // Flash reads without the sensor lock (the images cannot change while a
+    // job or a queued start uses them: otaImageBusy)
+    OtaStore::Meta jm, pm;
+    const bool hold = job && OtaImageSigned::jobHeld(true, OtaStore::get(jobHw, jm), jm.crc, jm.len, jm.signedKey,
+                                                     jobCrc, jobLen);
+    // A queued start without a stored image is refused by otaRunStart anyway
+    const bool drop = pending && OtaStore::get(pendingHw, pm) &&
+                      OtaImageSigned::startRule(pm.signedKey, true) == OtaImageSigned::StartRule::Block;
+    std::lock_guard<std::mutex> lock(sensorMutex);
+    if (drop && otaStartPending && otaStartDevId == pendingDev)
+    {
+        otaStartPending = false;
+        otaLastEvent = "OTA start of " + devIdText(pendingDev) +
+                       " dropped: unsigned image - \"Signed images only\" is on (Firmware page)";
+        logger.warning(otaLastEvent);
+    }
+    if (hold && otaJobPtr && otaJobPtr->devId == jobDev && otaJobPtr->crc == jobCrc &&
+        OtaJob::holdUnsigned(*otaJobPtr, otaNow()))
+    {
+        otaScheduleSaveLocked(millis());
+        otaLastEvent = "OTA " + devIdText(jobDev) + ": held Paused " + when +
+                       " - its image is unsigned; abort the job, or switch \"Signed images only\" off (Firmware "
+                       "page) and resume";
+        logger.warning(otaLastEvent);
+    }
+}
+
 bool SensorManager::otaJobCopy(OtaJob::Job &out) const
 {
     std::lock_guard<std::mutex> lock(sensorMutex);
@@ -983,6 +1178,13 @@ bool SensorManager::otaJobCopy(OtaJob::Job &out) const
     }
     out = *otaJobPtr;
     return otaJobPtr->state != State::None || otaJobPtr->ghost;
+}
+
+OtaJob::State SensorManager::otaJobState(bool &startPending) const
+{
+    std::lock_guard<std::mutex> lock(sensorMutex);
+    startPending = otaStartPending;
+    return otaJobPtr ? otaJobPtr->state : State::None;
 }
 
 String SensorManager::otaLastEventText() const

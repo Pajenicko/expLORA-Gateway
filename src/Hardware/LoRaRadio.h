@@ -99,6 +99,10 @@ public:
     // After TxDone (or a failed launch): back to receive on the uplink channel
     virtual void finishTx() = 0;
 
+    // Update mode (radio task only): receive off, chip in standby. Back
+    // with reset(), which re-initializes it and restarts receive
+    virtual bool standby() = 0;
+
     // Time on air of a frame on the downlink channel
     virtual uint32_t timeOnAirUs(size_t len) = 0;
 

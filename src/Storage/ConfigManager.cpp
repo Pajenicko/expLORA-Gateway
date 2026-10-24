@@ -324,6 +324,7 @@ bool ConfigManager::loadFromPreferences()
     ltePinRejected = preferences.getBool("ltePinBad", false);
 
     adminPasswordHash = preferences.getString("adminPwd", "");
+    signedOnly = preferences.getBool("signedOnly", false);
 
     ethStatic = preferences.getBool("ethStatic", false);
     ethIp = preferences.getString("ethIp", "");
@@ -374,6 +375,7 @@ bool ConfigManager::saveToPreferences()
 #if defined(HAS_WIFI_SWITCH)
     preferences.putBool("wifiEnabled", wifiEnabled);
 #endif
+    preferences.putBool("signedOnly", signedOnly);
     preferences.putBool("lteEnabled", lteEnabled);
     preferences.putString("lteApn", lteApn);
     preferences.putString("ltePin", ltePin);
@@ -403,6 +405,26 @@ bool ConfigManager::setWifiEnabled(bool enabled, bool saveConfig)
     {
         return save();
     }
+    return true;
+}
+
+bool ConfigManager::setSignedOnly(bool on)
+{
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
+    // The option lives only in Preferences (not in config.json): one key is
+    // written, read back, and RAM changes only when it is on flash - a failed
+    // save never leaves RAM and flash disagreeing
+    if (!preferencesInitialized)
+    {
+        return false;
+    }
+    if (preferences.putBool("signedOnly", on) == 0 || preferences.getBool("signedOnly", !on) != on)
+    {
+        logger.error("Signed images only: the setting could not be saved");
+        return false;
+    }
+    signedOnly = on;
     return true;
 }
 
@@ -678,6 +700,7 @@ void ConfigManager::resetToDefaults()
     mqttPrefix = MQTT_DEFAULT_PREFIX;
     mqttHAEnabled = HA_DISCOVERY_DEFAULT_ENABLED;
     wifiEnabled = WIFI_DEFAULT_ENABLED;
+    signedOnly = false;
     lteEnabled = LTE_DEFAULT_ENABLED;
     lteApn = LTE_DEFAULT_APN;
     ltePin = "";

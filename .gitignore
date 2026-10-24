@@ -410,3 +410,8 @@ compile_commands.json
 
 # Ignore .DS_Store files
 .DS_Store
+
+# Release tooling (the generic "[Rr]elease/" rule above would hide it);
+# keys never go into the repository
+!tools/release/
+*.pem

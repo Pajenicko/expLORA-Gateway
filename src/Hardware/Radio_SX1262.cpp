@@ -272,6 +272,22 @@ void RadioSX1262::finishTx()
     }
 }
 
+bool RadioSX1262::standby()
+{
+    rxRunning = false;
+    if (!initialized)
+    {
+        return false;
+    }
+    int16_t state = radio->standby();
+    if (state != RADIOLIB_ERR_NONE)
+    {
+        recordError("standby", state);
+        return false;
+    }
+    return true;
+}
+
 uint32_t RadioSX1262::timeOnAirUs(size_t len)
 {
     return (uint32_t)radio->getTimeOnAir(len);

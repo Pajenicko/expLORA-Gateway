@@ -46,6 +46,9 @@
 #include "Hardware/SPI_Manager.h"
 #include "Hardware/WatchdogPause.h"
 #include "Hardware/HeapGuard.h"
+#include "Security/VersionMarker.h"
+#include "Update/UpdateMode.h"
+#include "Update/GatewayOta.h"
 
 // Storage
 #include "Storage/ConfigManager.h"
@@ -114,6 +117,14 @@ bool initFileSystem()
 }
 
 // Setup - device initialization
+// Rollback (Update/GatewayOta.h): the core leaves a new firmware in the
+// bootloader's PENDING_VERIFY state; GatewayOta::process() marks it valid
+// after 120 s of normal operation, a reset before that rolls back
+extern "C" bool verifyRollbackLater()
+{
+    return true;
+}
+
 void setup()
 {
     Liveness::captureLastRestart(); // before anything can restart again
@@ -202,7 +213,8 @@ void setup()
     }
 
     // Basic log after initialization
-    logger.info(String(BOARD_NAME) + " starting up - Firmware v" + String(FIRMWARE_VERSION));
+    // The version from the image's version marker (read by the release tool)
+    logger.info(String(BOARD_NAME) + " starting up - Firmware v" + String(VersionMarker::version()));
     if (fragRestartMagic != FRAG_RESTART_MAGIC || esp_reset_reason() == ESP_RST_POWERON ||
         heapFragRestarts > FRAG_RESTARTS_MAX)
     {
@@ -215,6 +227,9 @@ void setup()
                        String(FRAG_RESTARTS_MAX) + " such restarts in a row)");
     }
     Liveness::logLastRestart(logger);
+    UpdateMode::logLastRestart(logger);
+    // Gateway firmware install record: rollback, validation of a new firmware
+    GatewayOta::begin(logger);
 
     // Configuration manager initialization
     configManager = new ConfigManager(logger);
@@ -351,6 +366,22 @@ void loop()
     if (webPortal)
     {
         webPortal->handleClient();
+    }
+
+    // Update mode: hard cap of a session, connectivity after one
+    UpdateMode::process();
+
+    // A new firmware is validated after 120 s with the web server up and the
+    // lwIP thread / radio task heartbeats fresh (Hardware/Liveness); an image
+    // waiting for its confirmation expires after 10 minutes
+    {
+        bool healthy = false;
+        if (GatewayOta::validationPending())
+        {
+            const Liveness::Status live = Liveness::status();
+            healthy = live.tcpipAgeMs < Liveness::TCPIP_HANG_MS && live.radioAgeMs < Liveness::RADIO_HANG_MS;
+        }
+        GatewayOta::process(webPortal && webPortal->started(), healthy);
     }
 
     // Process MQTT communication (settings changes are applied even offline)

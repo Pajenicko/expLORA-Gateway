@@ -14,10 +14,14 @@
 #include "OtaStore.h"
 #include "OtaCommitRecovery.h"
 #include "../Hardware/FlashPermit.h"
+#include "../Protocol/OtaImageSigned.h"
+#include "../Security/Sha256.h"
 
 #include <ArduinoJson.h>
 #include <LittleFS.h>
+#include <memory>
 #include <mutex>
+#include <new>
 #include <sys/time.h>
 
 namespace OtaStore
@@ -30,7 +34,16 @@ static Logger *log = nullptr;
 static std::recursive_mutex storeMutex; // taken after the flash permit
 static File upload;
 static bool uploading = false;
-static OtaImage::Streamer streamer;
+// Only while an upload runs (~0.4 kB heap): the split / CRC state and the
+// SHA-256 context. On the Pro the context holds the hardware SHA engine
+// from the first block to its release here; a TLS session meanwhile hashes
+// in software (and the update mode refuses sessions during an upload)
+struct UploadState
+{
+    OtaImageSigned::Splitter<Sha256> split;
+    Sha256 hash;
+};
+static std::unique_ptr<UploadState> state;
 static Timing times;
 
 static String binPath(uint16_t hw)
@@ -238,46 +251,60 @@ bool uploadBegin(String &error)
 {
     FlashWriteGuard guard;
     std::lock_guard<std::recursive_mutex> lock(storeMutex);
+    // A previous upload ends here whatever follows (its file closed, its
+    // state - SHA context, on the Pro the hardware engine - released)
     if (uploading)
     {
         upload.close();
     }
+    uploading = false;
+    state.reset();
     LittleFS.remove(TMP);
     // Room for the largest image plus the file system's own blocks
     if (LittleFS.totalBytes() - LittleFS.usedBytes() < OtaImage::MAX_LEN + 16384)
     {
         error = "not enough flash space for an image - delete one first";
-        uploading = false;
+        return false;
+    }
+    state.reset(new (std::nothrow) UploadState());
+    if (!state)
+    {
+        error = "not enough memory for an upload";
         return false;
     }
     upload = LittleFS.open(TMP, "w");
     if (!upload)
     {
+        state.reset();
         error = "cannot create the upload file";
-        uploading = false;
         return false;
     }
-    streamer = OtaImage::Streamer();
     uploading = true;
     return true;
 }
 
 bool uploadWrite(const uint8_t *data, size_t len, String &error)
 {
-    if (!uploading)
+    if (!uploading || !state)
     {
         error = "no upload running";
         return false;
     }
-    if (streamer.total() + len > OtaImage::MAX_LEN)
+    // Only the image bytes are stored; what follows them stays in RAM
+    size_t payload = 0;
+    const OtaImageSigned::Early early = state->split.feed(data, len, payload, state->hash);
+    if (early != OtaImageSigned::Early::None)
     {
-        error = OtaImage::errorText(OtaImage::Error::TooLarge);
+        error = OtaImageSigned::earlyText(early);
         return false;
     }
-    streamer.feed(data, len);
+    if (payload == 0)
+    {
+        return true;
+    }
     FlashWriteGuard guard;
     std::lock_guard<std::recursive_mutex> lock(storeMutex);
-    if (upload.write(data, len) != len)
+    if (upload.write(data, payload) != payload)
     {
         error = "flash full or write error";
         return false;
@@ -294,34 +321,42 @@ void uploadAbort()
         upload.close();
     }
     uploading = false;
+    state.reset(); // releases the SHA engine
     LittleFS.remove(TMP);
 }
 
-bool uploadValidate(Meta &meta, String &error)
+bool uploadValidate(Meta &meta, String &error, bool &severe, String &stateText)
 {
+    severe = false;
     {
         FlashWriteGuard guard;
         std::lock_guard<std::recursive_mutex> lock(storeMutex);
-        if (!uploading)
+        if (!uploading || !state)
         {
             error = "no upload running";
             return false;
         }
         upload.close();
     }
-    OtaImage::Trailer t;
-    OtaImage::Error e = OtaImage::validate(streamer, t);
-    if (e != OtaImage::Error::None)
+    // Image, then the signature (one ECDSA verify, ~0.35 s on the Pro)
+    const OtaImageSigned::Outcome o = OtaImageSigned::classify(state->split, state->hash);
+    const uint32_t stored = state->split.streamer().total();
+    state.reset(); // releases the SHA engine
+    if (o.cls == OtaImageSigned::Class::Refused)
     {
-        error = OtaImage::errorText(e);
+        severe = o.severe;
+        error = o.text;
         return false;
     }
+    stateText = o.text;
     meta.valid = true;
-    meta.hwType = t.hwType;
-    meta.fw = t.fw;
-    meta.len = streamer.total();
-    meta.crc = t.crc;
-    meta.flags = t.flags;
+    meta.hwType = o.trailer.hwType;
+    meta.fw = o.trailer.fw;
+    meta.len = stored;
+    meta.crc = o.trailer.crc;
+    meta.flags = o.trailer.flags;
+    meta.signedKey = o.cls == OtaImageSigned::Class::Verified ? o.keyId : 0;
+    meta.unknownKey = o.cls == OtaImageSigned::Class::NoKey ? o.keyId : 0;
     struct timeval tv;
     gettimeofday(&tv, nullptr);
     meta.uploadUnix = tv.tv_sec > 1700000000 ? (uint32_t)tv.tv_sec : 0;
@@ -333,6 +368,7 @@ bool uploadCommit(const Meta &meta, String &error)
     FlashWriteGuard guard;
     std::lock_guard<std::recursive_mutex> lock(storeMutex);
     uploading = false;
+    state.reset();
     // At most MAX_HW_TYPES images: a new HW type needs a free place
     Meta existing;
     if (!get(meta.hwType, existing))
@@ -375,13 +411,8 @@ bool uploadCommit(const Meta &meta, String &error)
 
 static bool writeMeta(const char *path, const Meta &meta)
 {
-    StaticJsonDocument<256> doc;
-    doc["hw"] = meta.hwType;
-    doc["fw"] = meta.fw;
-    doc["len"] = meta.len;
-    doc["crc"] = meta.crc;
-    doc["flags"] = meta.flags;
-    doc["uploaded"] = meta.uploadUnix;
+    DynamicJsonDocument doc(OtaMeta::JSON_CAPACITY); // heap: also called on the async_tcp task
+    OtaMeta::toJson(meta, doc);
     File f = LittleFS.open(path, "w");
     if (!f)
     {
@@ -392,9 +423,7 @@ static bool writeMeta(const char *path, const Meta &meta)
     // A short or lost write (File::write is buffered, close() reports nothing)
     // shows only when the file is read back: success means it is on flash
     Meta back;
-    return ok && readMeta(path, back) && back.hwType == meta.hwType && back.fw == meta.fw &&
-           back.len == meta.len && back.crc == meta.crc && back.flags == meta.flags &&
-           back.uploadUnix == meta.uploadUnix;
+    return ok && readMeta(path, back) && OtaMeta::sameContent(back, meta);
 }
 
 static bool readMeta(const String &path, Meta &meta)
@@ -404,21 +433,25 @@ static bool readMeta(const String &path, Meta &meta)
     {
         return false;
     }
-    StaticJsonDocument<256> doc;
-    DeserializationError e = deserializeJson(doc, f);
+    // Only the fields this firmware knows are kept: a description written by
+    // a later firmware with more fields still reads (a downgraded gateway
+    // must not take it for damage and delete the image)
+    DynamicJsonDocument doc(OtaMeta::JSON_CAPACITY);
+    StaticJsonDocument<OtaMeta::FILTER_CAPACITY> filter;
+    OtaMeta::filter(filter);
+    DeserializationError e = deserializeJson(doc, f, DeserializationOption::Filter(filter));
     f.close();
-    if (e)
+    if (e || doc.capacity() == 0)
     {
         return false;
     }
-    meta.valid = true;
-    meta.hwType = doc["hw"] | 0u;
-    meta.fw = doc["fw"] | 0u;
-    meta.len = doc["len"] | 0u;
-    meta.crc = doc["crc"] | 0u;
-    meta.flags = doc["flags"] | 0u;
-    meta.uploadUnix = doc["uploaded"] | 0u;
-    return meta.len > 0;
+    if (!OtaMeta::fromJson(doc, meta))
+    {
+        return false;
+    }
+    // Verified by a key this firmware no longer carries: unsigned now
+    OtaImageSigned::applyKeyTable(meta);
+    return true;
 }
 
 size_t list(Meta *out, size_t max)
@@ -459,7 +492,9 @@ bool get(uint16_t hwType, Meta &meta)
 {
     FlashWriteGuard guard;
     std::lock_guard<std::recursive_mutex> lock(storeMutex);
-    return readMeta(metaPath(hwType), meta) && meta.hwType == hwType && binLen(hwType) == meta.len;
+    // meta.valid follows the result: no stored image -> not valid
+    meta.valid = readMeta(metaPath(hwType), meta) && meta.hwType == hwType && binLen(hwType) == meta.len;
+    return meta.valid;
 }
 
 bool remove(uint16_t hwType)

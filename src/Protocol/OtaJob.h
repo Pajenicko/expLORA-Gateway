@@ -75,6 +75,7 @@ enum class Why : uint8_t
     Reboot,         // gateway reboot (Paused)
     ManualPause,    // the admin paused
     StartCrc,       // the stored image failed its CRC at the start
+    Unsigned,       // "Signed images only" is on and the image is unsigned (Paused, held like a manual pause)
 };
 
 // --- clock: unix time when valid (0 otherwise), uptime, esp_timer us -------------
@@ -180,6 +181,7 @@ struct Up
     uint32_t sessionNonce = 0;  // devNonce of the session it verified under
     uint32_t curFw = 0;         // the firmware the sensor runs (last JOIN_REQ / status report)
     bool canStart = false;      // session established (not SESSION_NEW) and the configuration in sync
+    bool signedOnly = false;    // "Signed images only" is on (with Job::imageVerified: no new transfer)
 
     bool event() const { return accepted || refused || failed || complete || batteryLow; } // "left" does not suppress
 };
@@ -306,6 +308,10 @@ struct Job
     uint32_t startUptimeS = 0;      // when the pending start went out
     bool pausedByMisses = false;
     uint32_t lastStatusUptimeS = 0;
+    // The stored image of this job is verified (signed by a key of this
+    // firmware). Set when the job is created and when it is restored at
+    // boot; false (unsigned) until then - fail closed
+    bool imageVerified = false;
 
     uint16_t blocks() const { return ep::ota::blockCount(len, ep::ota::kBlockSize); }
     uint32_t cadenceMs() const { return (uint32_t)cadence100ms * 100; }
@@ -473,6 +479,8 @@ inline const char *whyText(Why w)
         return "paused by the admin";
     case Why::StartCrc:
         return "stored image CRC wrong";
+    case Why::Unsigned:
+        return "unsigned image - \"Signed images only\" is on";
     }
     return "";
 }
@@ -731,6 +739,10 @@ inline void refusal(Job &j, const Up &u, const Now &n)
     if (u.refusedArg == ep::ota::kRefuseBattery)
     {
         j.dlBattery.arm(n, BATTERY_RETRY_S);
+        if (j.state == State::Paused && j.manualPause)
+        {
+            return; // paused by the admin (or held for an unsigned image): that stays the reason
+        }
         if (j.state != State::Verified)
         {
             setState(j, State::Paused, n, Why::Battery);
@@ -812,6 +824,24 @@ inline void startSent(Job &j, uint32_t upFcnt32, uint32_t sessionNonce, const No
         j.startsArmed++;
         j.dlState.arm(n, waitingDeadlineS(j));
     }
+}
+
+// A Verified job would transfer again (the sensor accepted with less than
+// the whole image, or it left and would get a new start): with "Signed
+// images only" on and an image that is not verified it is held instead -
+// Paused like holdUnsigned(), nothing more goes to the sensor until the
+// admin resumes (with the option off) or aborts. true: held
+inline bool holdBeforeTransfer(Job &j, const Up &u, const Now &n)
+{
+    if (j.state != State::Verified || !u.signedOnly || j.imageVerified)
+    {
+        return false;
+    }
+    j.manualPause = true;
+    j.laps = 0;
+    j.pausedByMisses = false;
+    setState(j, State::Paused, n, Why::Unsigned);
+    return true;
 }
 
 // --- the UP ----------------------------------------------------------------------------
@@ -994,7 +1024,16 @@ inline Result onUp(Job &j, const Up &u, const Now &n)
             if (!(u.progress && u.base >= j.blocks()))
             {
                 applyAccepted(j, u, n, r);
-                setState(j, State::Transfer, n);
+                if (holdBeforeTransfer(j, u, n))
+                {
+                    // The sensor lost the image: no new transfer of an
+                    // unsigned image under "Signed images only"
+                    r.down = Down::EndPause;
+                }
+                else
+                {
+                    setState(j, State::Transfer, n);
+                }
                 r.changed = r.log = true;
             }
             break;
@@ -1135,9 +1174,9 @@ inline Result onUp(Job &j, const Up &u, const Now &n)
                 setState(j, State::Paused, n, starved ? Why::Starved : Why::Left, u.leftArg);
                 r.log = true;
             }
-            else if (starved)
+            else if (starved && !j.manualPause)
             {
-                j.why = Why::Starved;
+                j.why = Why::Starved; // paused by the admin (or held): that stays the reason
             }
             r.changed = true;
             // "left 1" / "left 3" get a start unless the admin paused (startAllowed)
@@ -1150,7 +1189,14 @@ inline Result onUp(Job &j, const Up &u, const Now &n)
         case State::Verified:
             if (!endLeft && startAllowed(j, u, n))
             {
-                r.down = Down::Start;
+                if (holdBeforeTransfer(j, u, n))
+                {
+                    r.changed = r.log = true;
+                }
+                else
+                {
+                    r.down = Down::Start;
+                }
             }
             break;
         default:
@@ -1182,7 +1228,14 @@ inline Result onUp(Job &j, const Up &u, const Now &n)
         case State::Verified:
             if (startAllowed(j, u, n))
             {
-                r.down = Down::Start;
+                if (j.state == State::Verified && holdBeforeTransfer(j, u, n))
+                {
+                    r.changed = r.log = true;
+                }
+                else
+                {
+                    r.down = Down::Start;
+                }
             }
             break;
         default:
@@ -1231,8 +1284,12 @@ inline bool abort(Job &j, const Now &n)
         j.pendingEnd = PendingEnd::Abort; // OTA end abort in the next block slot
     }
     j.abortPending = true;
-    // Waiting: no transfer of this job on the sensor - unless a start went out
-    j.abortQuiet = j.state != State::Waiting || j.startValid;
+    // Waiting: no transfer of this job on the sensor - unless a start went
+    // out. The same for a job held by holdUnsigned() before the sensor ever
+    // accepted a start (no binding, nothing confirmed)
+    const bool noTransfer = j.state == State::Waiting ||
+                            (j.state == State::Paused && j.why == Why::Unsigned && !j.bindValid && j.maxConfirmed == 0);
+    j.abortQuiet = !noTransfer || j.startValid;
     j.abortKept = false;
     j.dlAbortPending.arm(n, 2 * j.roundS());
     setState(j, State::Aborted, n, Why::Admin);
@@ -1250,6 +1307,51 @@ inline bool pause(Job &j, const Now &n)
     j.pendingEnd = PendingEnd::Pause; // OTA end pause in the next block slot
     setState(j, State::Paused, n, Why::ManualPause);
     return true;
+}
+
+// "Signed images only" (M4c S2) with an unsigned image: a job that has not
+// transferred the whole image yet (Waiting, Transfer, Paused) is held like a
+// manual pause - nothing more goes to the sensor until the admin resumes
+// (refused while the option is on and the image is unsigned) or aborts it.
+// A job past the transfer (Verified and later) is not stopped: the image is
+// already on the sensor. false: nothing to hold (or already held)
+inline bool holdUnsigned(Job &j, const Now &n)
+{
+    if (j.state != State::Waiting && j.state != State::Transfer && j.state != State::Paused)
+    {
+        return false;
+    }
+    if (j.state == State::Paused && j.manualPause && j.why == Why::Unsigned)
+    {
+        return false;
+    }
+    if (j.state == State::Transfer)
+    {
+        j.pendingEnd = PendingEnd::Pause; // OTA end pause in the next block slot
+    }
+    j.manualPause = true;
+    j.laps = 0;
+    j.pausedByMisses = false; // a later "left 1" is not classified (the hold stays the reason)
+    setState(j, State::Paused, n, Why::Unsigned);
+    return true;
+}
+
+// The admin's confirmation of a start covers the reasons shown on the page
+// (downgrade, reinstall, reverted before, unsigned image) for that image:
+// the page carries this token, the start compares it with the reasons and
+// image of that moment and asks again on any difference. Never 0 (FNV-1a)
+inline uint32_t startConfirmToken(const char *reasons, size_t len, uint32_t imageCrc)
+{
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; i++)
+    {
+        h = (h ^ (uint8_t)reasons[i]) * 16777619u;
+    }
+    for (int i = 0; i < 4; i++)
+    {
+        h = (h ^ (uint8_t)(imageCrc >> (8 * i))) * 16777619u;
+    }
+    return h ? h : 1;
 }
 
 inline bool resume(Job &j, const Now &n)

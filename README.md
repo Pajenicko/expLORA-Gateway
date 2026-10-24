@@ -90,6 +90,67 @@ Pin assignments live in `variants/<board>/board_config.h`.
    refused. "Check for update" offers only a newer version (major, minor and
    patch compared as numbers), never an older one.
 
+   **Signed firmware and confirmation:** a file signed with a release key
+   (a 128-byte signature block appended by `tools/release/explora_sign.py`)
+   is verified while it is received and installed at once. An unsigned file
+   (or one signed with a key this firmware does not carry) is written but not
+   installed until you confirm it: the upload answer asks, and the Firmware
+   page shows a "waiting for confirmation" card (for a URL download too). The
+   confirmation is valid for 10 minutes and only from the login session that
+   installed that exact image. With **Signed images only** on, unsigned files
+   are refused. A file whose signature is present but wrong (changed content,
+   another board, a malformed block) or a download shorter or longer than
+   announced is always refused, and a refused image can never start. Older
+   gateways (1.x) install a signed file like an unsigned one (the block after
+   the image is ignored). A manually uploaded signed file with bytes appended
+   or with its block cut off no longer carries a valid block at its end: it
+   counts as unsigned (it needs the confirmation, and is refused with
+   **Signed images only** on) - by design, an upload has no announced length
+   to compare. A download from a URL with a wrong length is refused.
+
+   **Older version:** a verified file whose version is lower than the running
+   firmware is not installed at once either: the Firmware page asks you to
+   confirm the downgrade (same rules as above, also with **Signed images
+   only** on). The same version is a reinstall and is installed without a
+   question. An image that waits for its confirmation and is not confirmed
+   (10 minutes over, **Signed images only** switched on, or a restart
+   meanwhile) is erased so it can never start. A development build whose
+   version is not a plain maj.min.pat (e.g. "2.1.0-dev") cannot compare
+   versions and asks for the confirmation for every verified file.
+
+   **Rollback:** a newly installed firmware must run for 2 minutes with the
+   web server up; a crash or reset before that makes the gateway go back to
+   the previous firmware, which then logs "rolled back from vX". A restart
+   you start in the web interface during these 2 minutes keeps the new
+   firmware. No other firmware can be installed and no update check runs
+   during them. The criterion is the gateway itself (web server up, its
+   internal checks healthy), not its connection to the internet: a site or
+   provider outage must not roll back a good firmware. The Firmware page
+   shows how the running firmware was installed (verified / unsigned) and the
+   last install result; `/diag/heap` has them under `update`. Flashing only
+   the application over USB with esptool into the running slot keeps the
+   install record (the gateway cannot tell without hashing the image), so the
+   Firmware page may then still say "verified" for the replaced firmware; a
+   full USB flash (PlatformIO upload) resets it.
+
+   The check and a download from a URL run in **update mode**: MQTT is
+   disconnected, sensor reception pauses (the radio is in standby) and the
+   web interface answers most pages with "update in progress" (HTTP 503)
+   until it ends (the login, a short status page under Firmware and the
+   diagnostics stay; Restart is not available either - the session ends by
+   itself within 15 minutes). Only when
+   there is not enough free memory for the HTTPS session, the network
+   interfaces that do not carry the uplink are switched off for it
+   (Ethernet uplink: WiFi and LTE; WiFi uplink: the access point and LTE;
+   LTE uplink: WiFi) and switched on again afterwards. If the page was
+   loaded over such an interface, the connection drops - reload it after a
+   few minutes. Update mode is refused during an upload and while a sensor
+   OTA job is running (pause it first). If the interfaces it switched off
+   (and that worked before) are not back 5 minutes after the session, the
+   gateway restarts - not while an upload or a sensor OTA transfer, swap
+   or confirmation runs (it waits for them), and not for an interface you
+   disabled or changed in the settings meanwhile.
+
 4. **Unit tests** run on the host: `pio test -e native`. An end-to-end test against
    a real device is in `tests/integration`.
 
@@ -239,10 +300,28 @@ over LoRa from its detail page (`/sensors/gen2?devId=…`, docs/protocol-v2.md
    OTA receiver is refused – a sensor running it could never be updated over
    the air again) and keeps one image per HW type (at most 4). An image that a
    running job uses cannot be replaced or deleted.
+   **Signed images**: a file signed with `tools/release/explora_sign.py`
+   (`--kind sensor`, the 128-byte signature block appended) is checked
+   against the release keys built into the gateway firmware. The block is
+   not stored – the stored image is the unsigned file byte for byte, the
+   sensor sees no difference. The image list and the upload result show
+   "verified (key xxxxxxxx)", "unsigned" or "unsigned (unknown key
+   xxxxxxxx)" (signed, but with a key this firmware does not know – treated
+   as unsigned). A file whose signature block is there but wrong (another
+   HW type or version, changed content, a bad signature, anything other
+   than exactly one block after the image) is always refused. A signed file
+   cut exactly at the end of the image is simply an unsigned file and is
+   stored as unsigned. **Signed images only** on the Firmware page (default
+   off) refuses unsigned uploads, blocks starts with unsigned images already
+   stored and holds an unfinished job with an unsigned image Paused (also
+   after a restart; Resume refused until the option is off, Abort works); a
+   job whose image is already complete on the sensor is not stopped, but it
+   is held as well if the sensor would need the image again.
 2. **Start** with "Update to vX". The page lists what blocks a start (no
    image, no OTA receiver, no status report yet, RTC not usable, an
-   unconfirmed image running, another job – one at a time) and warnings (weak
-   link, long report interval); a downgrade, a reinstall or an image that
+   unconfirmed image running, another job – one at a time, an unsigned image
+   with "Signed images only" on) and warnings (weak link, long report
+   interval); a downgrade, a reinstall, an unsigned image or an image that
    reverted on this sensor before needs a confirmation. The stored image is
    re-checked first, then the start goes with the sensor's next report.
 3. **Transfer**: one 232-byte block every 26 s in scheduled windows, a
@@ -301,6 +380,9 @@ The gateway provides a read-only REST API for sensor data (no login needed):
 - **List all sensors**: `/api?format=json`
 - **Get specific sensor**: `/api?sensor=XXXXXX&format=json` (where XXXXXX is the sensor's serial number in hex)
 - **CSV format**: Replace `json` with `csv` in the URL
+
+While the gateway checks for or downloads an update (update mode, at most
+15 minutes), `/api` answers `503` with `Retry-After: 60`; retry later.
 
 Example API response:
 ```json

@@ -241,6 +241,19 @@ void MQTTManager::process()
         return;
     }
 
+    // Update mode: off for the session (holdForUpdate)
+    if (heldForUpdate)
+    {
+        disconnect();
+        statusCode = Status::HeldForUpdate;
+        return;
+    }
+    if (statusCode == Status::HeldForUpdate)
+    {
+        statusCode = Status::Waiting;
+        lastReconnectAttempt = 0;
+    }
+
     // The access point is the way in but failed to start for lack of
     // memory (Uplink::apStarved()): a TLS session holds ~40 kB - drop it and
     // hold it back while the AP retries, so the admin is not locked out
@@ -897,6 +910,30 @@ void MQTTManager::processPending()
     }
 }
 
+void MQTTManager::holdForUpdate(bool hold)
+{
+    if (hold == heldForUpdate)
+    {
+        return;
+    }
+    heldForUpdate = hold;
+    if (hold)
+    {
+        disconnect();
+        if (cfg.enabled && mqttClientReady)
+        {
+            statusCode = Status::HeldForUpdate;
+            logger.info("MQTT stopped for the update");
+        }
+    }
+    else if (statusCode == Status::HeldForUpdate)
+    {
+        // Reconnect with the next process()
+        statusCode = Status::Waiting;
+        lastReconnectAttempt = 0;
+    }
+}
+
 // Check connection
 bool MQTTManager::isConnected()
 {
@@ -938,6 +975,8 @@ const char *MQTTManager::statusName(Status s)
         return "tlsLowMemory";
     case Status::HeldForAp:
         return "heldForAp";
+    case Status::HeldForUpdate:
+        return "heldForUpdate";
     }
     return "unknown";
 }
@@ -970,6 +1009,8 @@ String MQTTManager::statusText() const
 #endif
         return text;
     }
+    case Status::HeldForUpdate:
+        return "Not connected: stopped while the gateway updates (reconnects afterwards)";
     case Status::HeldForAp:
         return "Not connected: the access point could not start (" + String(uplink->apFailedStartFree()) +
                " B free memory) - the TLS session is held back to free memory for it (failed start " +

@@ -6,6 +6,8 @@
 
 // OTA auto-update manifest
 #define FIRMWARE_UPDATE_URL "https://pajenicko.cz/webflash/explora-gw-lite-autoupdate.json"
+// Board id in a gateway signature block (Security/SigBlock.h: 1 Pro, 2 Lite)
+#define BOARD_SIGN_TARGET 2
 
 // Radio chip: RFM95W = SX1276
 #define RADIO_SX1276

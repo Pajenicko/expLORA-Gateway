@@ -30,6 +30,7 @@
 #include "../Storage/ConfigManager.h"
 #include "../Storage/OtaStore.h"
 #include "../Protocol/OtaJob.h"
+#include "../Update/GatewayOta.h"
 
 // OTA part of the generation 2 detail page (protocol v2, spec 14.5)
 struct Gen2OtaView
@@ -39,9 +40,11 @@ struct Gen2OtaView
     bool imageOk = false;
     uint32_t imageFw = 0, imageLen = 0;
     String blockers, warnings, confirm;
+    uint32_t confirmToken = 0; // the "I confirm" box carries it (bound to these reasons and this image)
     uint32_t estimateS = 0;
     OtaStore::Meta images[OtaImage::MAX_HW_TYPES];
     size_t imageCount = 0;
+    bool signedOnly = false; // "Signed images only" (Firmware page)
     uint32_t otaHourMs = 0; // OTA airtime of the sliding hour (radio task)
     String lastEvent;
     OtaJob::Now now;
@@ -165,7 +168,10 @@ public:
     static DynamicJsonDocument buildAPIJson(const std::vector<SensorData> &sensors);
 
     // Generate firmware update page
-    static String generateFirmwarePage();
+    static String generateFirmwarePage(const String &updateStatus, bool signedOnly, const GatewayOta::View &gw);
+    // Small page served as /firmware while an update-mode session runs
+    // (no styles, navigation or forms; reloads itself every 15 s)
+    static String generateUpdateProgressPage(const String &updateStatus);
 
     // Optimized versions using buffer
 

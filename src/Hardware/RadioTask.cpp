@@ -35,6 +35,11 @@ static TaskHandle_t task = nullptr;
 // runs normally), read by Hardware/Liveness.cpp
 static std::atomic<uint32_t> beatCounter{0};
 
+// Update mode (Update/UpdateMode.h): loop() asks, the task confirms once
+// the radio is in standby (after a response in progress has ended)
+static std::atomic<bool> pauseWanted{false};
+static std::atomic<bool> pausedNow{false};
+
 static LoRaRadio *radio = nullptr;
 static bool radioOk = false;
 static Stats counters = {};
@@ -159,7 +164,9 @@ static void finishPending(TxOutcome outcome, uint16_t airtimeMs)
 // no other response pending and the flash permit held from now on
 static uint32_t claimSlot(const RadioPacket &p)
 {
-    if (!p.timeReliable || !isGen2Marker(p.data, p.length) || !radioOk)
+    // No new response once the update mode asked for a pause (loop() is in
+    // UpdateMode::enter() and would not answer it anyway)
+    if (!p.timeReliable || !isGen2Marker(p.data, p.length) || !radioOk || pauseWanted.load())
     {
         return 0;
     }
@@ -625,6 +632,60 @@ static void publishDuty()
     portEXIT_CRITICAL(&statsLock);
 }
 
+// Update mode: a pause takes effect once no response is in progress (it
+// ends within ~3 s, RX2 included) and no OTA frame is with the task. While
+// paused the radio is in standby (no receptions, no interrupts) and the
+// task keeps passing its loop once a second (the liveness heartbeat):
+// response requests are answered LateRequest, an OTA frame is cancelled.
+// true: paused, the caller skips the normal pass
+static bool runPause()
+{
+    if (pauseWanted.load())
+    {
+        if (!pausedNow.load())
+        {
+            takeRequests(); // a response loop() built before the pause request
+            if (pending.active && !pending.haveRequest)
+            {
+                // loop() is entering the update mode and will not build it
+                finishPending(TxOutcome::LateRequest, 0);
+            }
+            if (pending.active || otaActive)
+            {
+                return false; // a response or OTA frame on its way: finish it first
+            }
+            if (radioOk)
+            {
+                radio->standby();
+            }
+            pausedNow = true;
+        }
+        takeRequests(); // nothing pending: every request is answered LateRequest
+        if (otaActive || __atomic_load_n(&otaState, __ATOMIC_ACQUIRE) == 1)
+        {
+            otaState = 2;
+            otaActive = true;
+            finishOta(OtaOutcome::Cancelled, 0, 0);
+        }
+        publishDuty();
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
+        return true;
+    }
+    if (pausedNow.load())
+    {
+        // Re-initializes the chip and restarts receive; a planned restart,
+        // not counted (or logged) as a health-check re-initialization
+        radioOk = radio->reset();
+        if (!radioOk)
+        {
+            COUNT(resetsFailed);
+            recordError();
+        }
+        pausedNow = false;
+    }
+    return false;
+}
+
 static void taskMain(void *)
 {
     uint32_t lastHealthCheck = millis();
@@ -632,6 +693,11 @@ static void taskMain(void *)
     for (;;)
     {
         beatCounter.fetch_add(1, std::memory_order_relaxed);
+        if (runPause())
+        {
+            lastHealthCheck = millis();
+            continue;
+        }
         // A packet is read only while the packet-ready line is high: a
         // notification that raced with the polling below then finds the line
         // low and cannot read the same packet twice
@@ -725,6 +791,22 @@ bool start(LoRaRadio *r, Logger &logger)
     // during setup is handed over by setNotifyTask)
     LoRaRadio::setNotifyTask(task);
     return queue != nullptr && task != nullptr;
+}
+
+void setPaused(bool paused)
+{
+    pauseWanted = paused;
+    if (task)
+    {
+        xTaskNotifyGive(task);
+    }
+}
+
+bool paused()
+{
+    // No radio task (start() failed, e.g. no LoRa module): nothing receives
+    // or transmits, so the update mode must not wait for a pause
+    return pausedNow.load() || task == nullptr;
 }
 
 bool receive(RadioPacket &packet)
