@@ -233,7 +233,10 @@ inline int findByPosix(const char *posix)
 //   after the name was written; its string wins (an entry, or custom);
 // - no namePosix (settings of 2.0.0 before it existed): a string of another
 //   entry is taken as a change by an older firmware, any other string is an
-//   outdated rule of the name.
+//   outdated rule of the name. Known case, accepted: America/Vancouver
+//   saved by a pre-release 2.0.0 build with its old rule PST8PDT (= the
+//   America/Los_Angeles entry) becomes America/Los_Angeles; such settings
+//   were never shipped, and the offsets agree until 2026-11-01.
 inline int resolve(const char *name, const char *posix, const char *namePosix = nullptr)
 {
     int index = find(name);

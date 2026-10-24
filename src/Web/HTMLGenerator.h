@@ -47,6 +47,36 @@ struct Gen2OtaView
     OtaJob::Now now;
 };
 
+// Settings shown on the network page, copied under the config mutex before
+// the page is streamed (its pieces are generated later, one per callback of
+// the response, in the AsyncTCP task)
+struct NetworkPageView
+{
+    bool apMode = false;
+    String ssid;
+    bool hasWifiPassword = false;
+    String timezone, timezoneName;
+    bool ethStatic = false;
+    String ethIp, ethMask, ethGateway, ethDns1, ethDns2;
+    bool wifiEnabled = true;
+    bool viaWifi = false; // this page was requested over WiFi (station or AP)
+    String ethAddress;    // current Ethernet address, empty without one
+    bool lteEnabled = false;
+    String lteApn;
+    bool hasLtePin = false;
+};
+
+// Sensor list page data, copied before the page is streamed (see
+// handleSensors): keys wiped, only what the page shows
+struct SensorsPageView
+{
+    std::vector<ActiveSensorEntry> entries;
+    std::vector<Gen2Sensor> gen2;
+    WaitingEntry waiting[8];
+    size_t waitingCount = 0;
+    unsigned long nowMillis = 0; // one 'now' for every row
+};
+
 /**
  * Class for generating HTML content
  *
@@ -81,27 +111,31 @@ public:
 
     // Generate configuration page
     // timeZone: also the time zone select (AP setup page), nullptr = without
-    static void addWiFiForm(String &html, const String &ssid, const String &password, const ConfigManager *timeZone);
-    static void addTimezoneSelect(String &html, const ConfigManager &config);
+    static void addWiFiForm(String &html, const String &ssid, bool hasPassword, const ConfigManager *timeZone);
+    static void addTimezoneSelect(String &html, const String &zoneName, const String &zonePosix);
     static String generateConfigPage(const String &ssid, const String &password, bool configMode, const String &ip,
                                      const ConfigManager &config);
 
     // Generate MQTT settings page
+    // status: connection state with the reason when not connected
     static String generateMqttPage(const String &host, int port, const String &user, const String &password, bool enabled, bool tls,
-                                    const String &prefix, bool haEnabled, String &haPrefix);
+                                    const String &prefix, bool haEnabled, String &haPrefix, const String &status);
 
     // Login and admin password pages
     static String generateLoginPage(bool hasPassword, const String &error, const String &next);
     static String generatePasswordPage(bool hasPassword, const String &error, bool apMode);
 
-    // Generating network page (uplink status, WiFi, ethernet and LTE settings)
-    static String generateNetworkPage(const ConfigManager &config, const String &ssid, const String &password,
-                                      bool apMode);
+    // Network page (uplink status, time zone, WiFi, ethernet and LTE
+    // settings) in pieces of at most ~4 kB, streamed by the web server (see
+    // handleNetwork); part 0, 1, ... until NETWORK_PAGE_PARTS, a piece may be
+    // empty (a card the board does not have)
+    static constexpr size_t NETWORK_PAGE_PARTS = 9;
+    static String generateNetworkPagePart(const NetworkPageView &view, size_t part);
 
-    // Generate sensor list page
-    static String generateSensorsPage(const std::vector<ActiveSensorEntry>& sensors,
-                                      const std::vector<Gen2Sensor> &gen2 = {},
-                                      const WaitingEntry *waiting = nullptr, size_t waitingCount = 0);
+    // Sensor list page in pieces (one per sensor row), streamed by the web
+    // server (see handleSensors); part 0 .. sensorsPageParts() - 1
+    static size_t sensorsPageParts(const SensorsPageView &view);
+    static String generateSensorsPagePart(const SensorsPageView &view, size_t part);
 
     // Add a generation 2 sensor (DevID + label key)
     static String generateGen2AddPage(const String &devId, const String &error);

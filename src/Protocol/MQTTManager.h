@@ -21,6 +21,8 @@
 
 #pragma once
 
+#include <atomic>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -43,7 +45,9 @@ class MQTTManager
 {
 private:
     WiFiClient wifiClient;              // WiFi client for MQTT
-    WiFiClientSecure wifiClientSecure;  // WiFi client for MQTTS
+    // MQTTS client: its TLS context (~2 kB) exists only while TLS is configured,
+    // created by the first TLS connect()
+    std::unique_ptr<WiFiClientSecure> wifiClientSecure;
     PubSubClient mqttClient;            // MQTT client
     SensorManager &sensorManager;       // Reference to sensor manager
     ConfigManager &configManager;       // Reference to configuration
@@ -153,6 +157,36 @@ public:
     bool isConnected();
     bool usesTls() const { return cfg.tls; }
 
+    // Connection state for the MQTT page and /diag/heap (any task)
+    enum class Status : uint8_t
+    {
+        Disabled,
+        Waiting,      // not tried yet (uplink offline, first attempt pending)
+        Connected,
+        Failed,       // the broker refused / was unreachable, statusState() has the code
+        Disconnected, // was connected, reconnects
+        TlsLowMemory, // TLS needs more free memory than there is; not tried
+        HeldForAp     // TLS dropped / held back while the access point cannot start
+    };
+    Status status() const { return statusCode.load(); }
+    // A TLS session is up (any task: atomics only - the TLS client itself
+    // belongs to the loop task, which may replace it)
+    bool tlsSessionUp() const { return statusCode.load() == Status::Connected && connectedWithTls.load(); }
+    int statusState() const { return statusMqttState.load(); }
+    // Human readable, with the reason when not connected
+    String statusText() const;
+    // Short machine name of status() (diagnostics JSON)
+    static const char *statusName(Status s);
+
     // Disconnect from MQTT broker
     void disconnect();
+
+private:
+    std::atomic<Status> statusCode{Status::Disabled};
+    std::atomic<int> statusMqttState{0};  // PubSubClient state of the last failed attempt
+    std::atomic<bool> connectedWithTls{false}; // the last connect used TLS
+    std::atomic<uint32_t> tlsLowFree{0};  // internal heap at the last TLS refusal
+    std::atomic<uint32_t> tlsLowLargest{0};
+    bool tlsLowLogged = false;            // the refusal is logged once per episode,
+    unsigned long tlsLowLoggedAt = 0;     // then at most every TLS_LOW_LOG_INTERVAL
 };

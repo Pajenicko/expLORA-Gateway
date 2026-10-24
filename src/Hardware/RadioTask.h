@@ -44,7 +44,12 @@
 
 constexpr UBaseType_t RADIO_TASK_PRIORITY = 14;
 constexpr BaseType_t RADIO_TASK_CORE = 1;
-constexpr uint32_t RADIO_TASK_STACK = 6144;     // bytes
+// Stack: at most 1.6 kB used (Pro and Lite, incl. downlinks). Queue: never
+// more than one packet waiting in the bench history (radio.queueHigh), but
+// loop() can stall for seconds (MQTT TLS connect, update check, URL update,
+// custom-URL forwarding, sensors.json writes) - 8 packets (~2.1 kB) ride
+// that out
+constexpr uint32_t RADIO_TASK_STACK = 4096;     // bytes
 constexpr UBaseType_t RADIO_QUEUE_LENGTH = 8;   // packets
 constexpr uint32_t RADIO_HEALTH_CHECK_MS = 600000; // radio working
 constexpr uint32_t RADIO_RETRY_MS = 30000;         // radio not initialized / not answering
@@ -151,7 +156,7 @@ struct Stats
     uint32_t received;      // packets queued
     uint32_t crcErrors;     // RxDone with a CRC error
     uint32_t readErrors;    // RxDone without a valid packet (read error, length)
-    uint32_t queueDrops;    // queue full (loop() stalled for more than 8 packets): newest dropped
+    uint32_t queueDrops;    // queue full (loop() stalled for more than RADIO_QUEUE_LENGTH packets): newest dropped
     uint32_t queueHigh;     // most packets waiting at once
     uint32_t maxLatencyMs;  // longest RxDone -> loop() pickup (packets received after loop() started)
     uint32_t resetsOk;      // health check re-initializations that worked
@@ -182,6 +187,11 @@ bool start(LoRaRadio *radio, Logger &logger);
 bool receive(RadioPacket &packet);
 
 Stats stats();
+
+// Heartbeat for Hardware/Liveness.cpp: the task runs, and a counter it
+// advances on every pass of its loop (any task)
+bool running();
+uint32_t beats();
 
 // loop(): answer a responseSlot. false: queue full (the slot then expires)
 bool respond(const TxRequest &request);

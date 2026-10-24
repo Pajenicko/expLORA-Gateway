@@ -24,22 +24,19 @@
 #include <Arduino.h>
 #include <mutex>
 #include "../config.h"
+#include "LogRing.h"
 
-// Preallocated capacities for in-memory log strings
-// Capping stored message length prevents unbounded growth and fragmentation
+// Stored message length is capped (longer ones end in "...")
 #ifndef LOG_MESSAGE_CAPACITY
-#define LOG_MESSAGE_CAPACITY 300   // bytes reserved per log message in buffer
-#endif
-#ifndef LOG_TIME_CAPACITY
-#define LOG_TIME_CAPACITY 32      // bytes reserved for formatted time string
+#define LOG_MESSAGE_CAPACITY 300   // bytes kept per log message
 #endif
 
 /**
  * Definition of a logging system with support for various levels
  *
- * The system supports storing logs in PSRAM (if available) and allows
- * setting the logging level via the web interface. Logs are stored in a circular
- * buffer for efficient memory usage.
+ * Allows setting the logging level via the web interface. Logs are kept in
+ * a byte ring (LogRing.h, LOG_RING_BYTES): each entry takes only its real
+ * size, the oldest ones make room for new ones.
  */
 
 // Logging levels
@@ -52,10 +49,9 @@ enum class LogLevel
     VERBOSE = 4  // All available information
 };
 
-// Structure for storing log entries
+// A log entry as copied out of the ring
 struct LogEntry
 {
-    unsigned long timestamp; // Timestamp in milliseconds since start
     LogLevel level;          // Log level
     String message;          // Text message
     String formattedTime;    // Formatted time (if available)
@@ -111,21 +107,18 @@ class Logger
 {
 private:
     static LogLevel currentLevel;
-    static LogEntry *logBuffer;
-    static size_t logBufferSize;
-    static size_t logIndex;
-    static size_t logCount;
-    static bool usePSRAM;
+    static LogRing ring;
+    static uint8_t *ringBuffer;
     static std::mutex logMutex;
     static bool initialized;
     static bool timeInitialized;
 
-    // Get timestamp (if available)
-    static String getTimeStamp();
+    // Local time of an entry (valid when time is set)
+    static LogRing::Time getTime();
 
 public:
-    // Logger initialization
-    static bool init(size_t bufferSize = LOG_BUFFER_SIZE);
+    // Logger initialization: ring of ringBytes bytes
+    static bool init(size_t ringBytes = LOG_RING_BYTES);
 
     // Free memory on termination
     static void deinit();

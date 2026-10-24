@@ -25,10 +25,12 @@ log buffer size) and `variants/<env>/platformio.ini`.
 ### Build
 - Migrated to **pioarduino** (Arduino core 3.3.12 / ESP-IDF 5.5). `pio` is not
   on PATH here: use `~/.platformio/penv/bin/pio`.
-- `scripts/patch_asyncwebserver.py`: build middleware that compiles a patched
-  copy of ESPAsyncWebServer 3.7.4's `WebRequest.cpp` (the downloaded library
-  stays untouched; the build fails loudly if the library changes and a patch no
-  longer applies). See "Web server limits" below.
+- `scripts/patch_asyncwebserver.py`: build middleware that compiles patched
+  copies of ESPAsyncWebServer 3.7.4's `WebRequest.cpp` and `WebServer.cpp` and
+  AsyncTCP 3.3.8's `AsyncTCP.cpp` (pinned from the registry, the build stops
+  on any other version; the downloaded libraries stay untouched; the
+  build fails loudly if a library changes and a patch no longer applies, or if
+  a copy was linked unpatched). See "Web server limits" below.
 - CI (`.github/workflows/build.yml`): builds both envs, uploads the binaries,
   runs the native unit tests.
 
@@ -62,6 +64,20 @@ log buffer size) and `variants/<env>/platformio.ini`.
   one (lwIP keeps one global DNS list). AP / captive portal while there is no
   local network; first setup over the AP.
 - **Ethernet**: DHCP or static address (Network page, validated, IPv4 only).
+- **Enable WiFi** switch (`wifiEnabled`, NVS, boards with Ethernet only -
+  `HAS_WIFI_SWITCH`), applies with or without WiFi credentials: off = no
+  station; the AP runs for `AP_TIMEOUT` from its first start after every boot
+  (an Ethernet address
+  is no proof of reachability, a power cycle is the recovery path), then the
+  AP stops and the WiFi driver is deinitialised (~21 kB of internal RAM back)
+  while Ethernet has an address; after 10 s without one the AP comes back and
+  stays until Ethernet has had an address for `AP_TIMEOUT`. Saving WiFi
+  credentials sets `wifiEnabled` again. If the AP cannot start for lack of
+  memory (< 48 kB free), MQTT drops its TLS session for up to three AP
+  start attempts (`Uplink::apStarved()`, status `heldForAp`).
+  Pure rules in `src/Network/WifiPolicy.h` (native tests). `/diag/network` →
+  `wifi.enabled/switchedOff/driver/ap`, `/diag/heap` → `wifiDriver`
+  (initialised), `wifiOff`.
 - **LTE** (`src/Network/LteModem.*`): non-blocking state machine over the core's
   PPP library in CMUX mode; disabled by default; automatic APN (read from the
   network with `AT+CGCONTRDP`) or a configured one; SIM PIN checked over raw AT
@@ -120,17 +136,82 @@ log buffer size) and `variants/<env>/platformio.ini`.
 - Blocking network calls (MQTT connect/publish, HTTP forwarding, TLS) run with
   the task watchdog paused (`src/Hardware/WatchdogPause.h`); loop task stack
   10 kB.
-- HTTPS (OTA, forwarding) only with enough heap (48 kB free / 24 kB block).
-- Restart when the heap stays fragmented (largest block < 8 kB) for 15 min.
+- Heap guards use the 8-bit heap (`heap_caps_*(MALLOC_CAP_8BIT)`,
+  `src/Hardware/HeapGuard.h`): on the ESP32 (Pro) `ESP.getFreeHeap()` also
+  counts ~33 kB of 32-bit-only IRAM that malloc never gets.
+- HTTPS (OTA, forwarding) only with enough internal heap (60 kB free /
+  16.7 kB block: measured peak of a whole HTTPS session 51.1 kB on the Lite +
+  8 kB reserve; each 16.7 kB record buffer is its own allocation). The
+  persistent MQTT TLS session keeps ~40 kB while connected and needs 80 kB
+  free (same block) to connect (`HeapGuard::MQTT_TLS_MIN_FREE`; the Pro with
+  WiFi on had 67.8 kB and the web UI starved with the session up). Since the
+  RAM savings below every configuration fits: Pro idle 99 kB (WiFi + LTE on),
+  116 kB (LTE off), 121 kB (WiFi off), Lite 193 kB. Otherwise the reason is
+  on the MQTT page (on the Pro with a hint to switch WiFi off) and in the
+  update check's answer.
+- RAM (2.0.0): the log is a byte ring (`LOG_RING_BYTES`, Pro 8 kB, Lite
+  16 kB; `src/Data/LogRing.h`), sensor slots are allocated per sensor
+  (`src/Data/LazySlots.h`), the MQTT TLS client exists only for TLS, task
+  stacks are sized from measured high-water marks (async_tcp 8 kB,
+  arduino_events / emac_rx 3 kB, radio 4 kB; the radio queue stays at 8 packets for loop() stalls), and linker
+  wraps lower the WiFi driver buffers (static RX 2 with a block-ack window
+  of 2, dynamic RX/TX 16, no ESP-NOW/CSI) and the LTE modem UART buffers
+  (`src/Network/DriverConfig.cpp`; `scripts/check_wraps.py` fails a build
+  whose wrap is not linked). Pro idle with all interfaces up: 44 kB -> 99 kB
+  free, largest block 39 kB -> 90 kB.
+- Pages and `/api`: 503 when 3 (Pro) / 4 (Lite) are already being sent or the
+  heap is short for the page next to them.
+- Restart when the heap stays fragmented (largest block < 8 kB) for 15 min,
+  not counted while an MQTT TLS session is connected (a restart would only
+  recreate it); at most 3 such restarts in a row (RTC counter, logged at
+  boot, `/diag/heap` → `fragRestarts`, cleared after a healthy hour).
 
 ### Web server limits (pre-login, `scripts/patch_asyncwebserver.py`)
 Header line ≤ 2 kB; ≤ 16 headers / 4 kB kept (first `Cookie` always kept –
 Chromium sends it last); ≤ 32 parameters; multipart part buffers ≤ 2 kB and
-`size_t` loop index; ≤ 6 requests being received; a request still being
-received is dropped below 30 kB free heap / 8 kB block or after 10 s, and any
-request is closed after 30 s (logged-in firmware uploads exempt); oversized
-bodies without login are dropped at once; rejected connections are closed from
-`_onPoll`. Bodies over 4 kB without login get 413/reset.
+`size_t` loop index; ≤ 6 requests being received, of them ≤ 2 larger than
+3 kB, each admitted only with 10 kB + 16 kB per large request free (Pro: one
+at a time); incoming data waits in lwIP while the 8-bit heap is below 16 kB
+(AsyncTCP receive callback returns `ERR_MEM`); a request still being received is dropped below 10 kB free 8-bit heap /
+5 kB block or after 10 s, and any request is closed after 30 s (logged-in
+firmware uploads exempt); a new connection is reset at accept below 8 kB free
+8-bit heap (AsyncTCP, `ERR_ABRT` on every abort path); oversized bodies without login are dropped at once;
+rejected connections are closed from `_onPoll`. Bodies over 4 kB without login
+get 413/reset. Counters in `/diag/heap` → `web`. A logged-in upload gets a
+30 s receive timeout (deferred data does not count as received) and its login
+is checked once, when it takes the upload - any later failure aborts it with
+an error. Library fixes: the AsyncTCP event queue is guarded by a mutex (a
+queue rotation on connection clear could swap two receive events: an upload
+under a request flood arrived with two segments swapped); the accept
+callback re-checks the heap, allocates the request with nothrow and hands a
+refused client to `exploraDiscardClient` (close, wait out a running lwIP
+callback, remove its queued events, delete - a FIN/RST that came first left
+an event for the deleted client); the async task removes a connection's
+events inline (frees the pbufs of dropped receive events); the lwIP thread
+never waits for space in the full event queue (overflow list in order,
+`queueOverflow`; it waited holding the core lock the async task needed: a
+deadlock under a connect-and-RST flood, also in the stock library);
+`AsyncClient::_close` detaches and closes under one core lock; `_tcp_error`
+no longer writes into the pcb lwIP already freed; a client's tcpip calls run
+only while its `_pcb` is still the captured pcb (the "closed slot" check was
+reused by new connections under churn: lwIP asserts, heap corruption);
+FIN / ERROR events take a reserve packet when malloc fails (a lost one kept
+the client and a heavy page slot allocated for good; heavy slots also expire
+after 45 s), received data waits in lwIP once 16 events overflowed;
+`/diag/heap` → `web` `queueOverflowHigh`, `eventLost`, `heavyExpired`.
+- Task watchdog: 10 s, panics, configured first thing in `setup()`; watches
+  the loop and AsyncTCP tasks but not the CPU0 idle task: a LAN connection
+  flood (~500/s) keeps the lwIP thread on CPU0 busy, and watching the idle
+  task rebooted the gateway (also at a normal heap). A flood now slows the
+  web UI while it lasts. `src/Hardware/Liveness.*`: a 1 s esp_timer posts a
+  preallocated tcpip callback that advances a counter in the lwIP thread
+  and samples the radio task's loop counter; an accepted probe not run for
+  30 s, 120 s with every post refused (mailbox full), or the radio task not
+  advancing for 120 s restarts the gateway (abort if the restart does not
+  finish in 5 s), the reason is logged at boot, `/diag/heap` → `liveness`.
+  Accepted losses: a CPU0 task spinning without blocking anything else is
+  no longer caught (the interrupt watchdog is unaffected), and `setup()`
+  itself is not watched.
 
 ## Verification
 

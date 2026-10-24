@@ -20,15 +20,19 @@
  */
 
 #include "MQTTManager.h"
+#include <new>
 #include "../Hardware/WatchdogPause.h"
 #include <ArduinoJson.h>
 #include "config.h"
 #include "../Network/Uplink.h"
 #include "../Hardware/PowerSource.h"
+#include "../Hardware/HeapGuard.h"
 
 // Gateway state: checked for changes every 5 s, republished at least every 5 min
 static constexpr unsigned long GATEWAY_STATE_CHECK = 5000;
 static constexpr unsigned long GATEWAY_STATE_REFRESH = 300000;
+// MQTT TLS refused for lack of memory: logged when it starts, then this often
+static constexpr unsigned long TLS_LOW_LOG_INTERVAL = 1800000;
 
 // Constructor
 MQTTManager::MQTTManager(SensorManager &sensors, ConfigManager &config, Logger &log)
@@ -66,24 +70,27 @@ bool MQTTManager::init()
         cfg.haEnabled = configManager.mqttHAEnabled;
     }
 
+    // The plain client until a TLS connect() sets the secure one; a TLS
+    // client left from an earlier configuration goes (reinit disconnected it)
+    mqttClient.setClient(wifiClient);
+    if (!cfg.enabled || !cfg.tls)
+    {
+        wifiClientSecure.reset();
+    }
+
     // Only initialize if MQTT is enabled in configuration
     if (!cfg.enabled)
     {
+        statusCode = Status::Disabled;
         logger.info("MQTT integration disabled in configuration");
         return false;
     }
+    statusCode = Status::Waiting;
+    tlsLowLogged = false;
 
-    if (cfg.tls) {
-        // Brokers on the LAN usually have self-signed certificates: encrypted,
-        // but the server is not verified (README)
-        wifiClientSecure.setInsecure();
-        wifiClientSecure.setHandshakeTimeout(8);
-        wifiClientSecure.setConnectionTimeout(5000);
-        mqttClient.setClient(wifiClientSecure);
-    }
-    else {
+    if (!cfg.tls)
+    {
         wifiClient.setConnectionTimeout(5000);
-        mqttClient.setClient(wifiClient);
     }
     mqttClientReady = true;
 
@@ -118,6 +125,66 @@ bool MQTTManager::connect()
         return false;
     }
     
+    // A TLS session holds ~40 kB for as long as it is connected and needs
+    // ~52 kB during the handshake; the rest of the system needs room next
+    // to it (HeapGuard::MQTT_TLS_MIN_FREE). Without that much it would
+    // fail or starve the web UI - do not start it; process() retries every
+    // MQTT_RECONNECT_INTERVAL
+    if (cfg.tls)
+    {
+        HeapGuard::Heap heap = HeapGuard::tlsHeap();
+        if (!HeapGuard::mqttTlsFits(heap))
+        {
+            tlsLowFree = heap.free;
+            tlsLowLargest = heap.largest;
+            statusCode = Status::TlsLowMemory;
+            if (!tlsLowLogged || millis() - tlsLowLoggedAt > TLS_LOW_LOG_INTERVAL)
+            {
+                tlsLowLogged = true;
+                tlsLowLoggedAt = millis();
+                logger.warning("MQTT TLS not connecting - not enough free memory: needs " +
+                               String(HeapGuard::MQTT_TLS_MIN_FREE) + " B free with a block of " +
+                               String(HeapGuard::TLS_MIN_BLOCK) + " B, has " + String(heap.free) +
+                               " B free, largest block " + String(heap.largest) + " B");
+            }
+            return false;
+        }
+        if (tlsLowLogged)
+        {
+            tlsLowLogged = false;
+            logger.info("MQTT TLS: enough free memory again, connecting");
+        }
+        if (!wifiClientSecure)
+        {
+            // Its constructor allocates the SSL context with a throwing new
+            // (cannot fail after the check above unless the heap changes)
+            try
+            {
+                wifiClientSecure.reset(new (std::nothrow) WiFiClientSecure());
+            }
+            catch (const std::bad_alloc &)
+            {
+                wifiClientSecure.reset();
+            }
+            if (!wifiClientSecure)
+            {
+                HeapGuard::Heap now = HeapGuard::tlsHeap();
+                tlsLowFree = now.free;
+                tlsLowLargest = now.largest;
+                statusCode = Status::TlsLowMemory;
+                logger.warning("MQTT TLS not connecting - the TLS client could not be allocated (" +
+                               String(now.free) + " B free, largest block " + String(now.largest) + " B)");
+                return false;
+            }
+            // Brokers on the LAN usually have self-signed certificates:
+            // encrypted, but the server is not verified (README)
+            wifiClientSecure->setInsecure();
+            wifiClientSecure->setHandshakeTimeout(8);
+            wifiClientSecure->setConnectionTimeout(5000);
+        }
+        mqttClient.setClient(*wifiClientSecure);
+    }
+
     logger.debug("Attempting to connect to MQTT broker...");
 
     // DNS (e.g. homeassistant.local), TCP connect and TLS handshake can
@@ -134,6 +201,8 @@ bool MQTTManager::connect()
 
     if (connected)
     {
+        connectedWithTls = cfg.tls;
+        statusCode = Status::Connected;
         logger.info("Connected to MQTT broker");
 
         // Home Assistant announces a restart here; discovery is resent then
@@ -153,6 +222,8 @@ bool MQTTManager::connect()
     }
     else
     {
+        statusMqttState = mqttClient.state();
+        statusCode = Status::Failed;
         logger.warning("Failed to connect to MQTT broker, error code: " + String(mqttClient.state()));
     }
 
@@ -170,11 +241,34 @@ void MQTTManager::process()
         return;
     }
 
+    // The access point is the way in but failed to start for lack of
+    // memory (Uplink::apStarved()): a TLS session holds ~40 kB - drop it and
+    // hold it back while the AP retries, so the admin is not locked out
+    if (cfg.tls && uplink->apStarved())
+    {
+        if (statusCode != Status::HeldForAp)
+        {
+            logger.warning("MQTT TLS held back: the access point needs the memory");
+        }
+        disconnect();
+        statusCode = Status::HeldForAp;
+        return;
+    }
+    if (statusCode == Status::HeldForAp)
+    {
+        statusCode = Status::Waiting;
+        lastReconnectAttempt = 0; // the AP runs: connect right away
+    }
+
     // Check network connection and MQTT broker
     if (uplink->isOnline())
     {
         if (!mqttClient.connected())
         {
+            if (statusCode == Status::Connected)
+            {
+                statusCode = Status::Disconnected;
+            }
             // Try to reconnect on interval
             unsigned long now = millis();
             if (now - lastReconnectAttempt > MQTT_RECONNECT_INTERVAL)
@@ -819,7 +913,69 @@ void MQTTManager::disconnect()
         // A clean disconnect does not trigger the last will
         mqttClient.publish(statusTopic.c_str(), "offline", true);
         mqttClient.disconnect();
+        if (statusCode == Status::Connected)
+        {
+            statusCode = Status::Disconnected;
+        }
     }
+}
+
+const char *MQTTManager::statusName(Status s)
+{
+    switch (s)
+    {
+    case Status::Disabled:
+        return "disabled";
+    case Status::Waiting:
+        return "waiting";
+    case Status::Connected:
+        return "connected";
+    case Status::Failed:
+        return "failed";
+    case Status::Disconnected:
+        return "disconnected";
+    case Status::TlsLowMemory:
+        return "tlsLowMemory";
+    case Status::HeldForAp:
+        return "heldForAp";
+    }
+    return "unknown";
+}
+
+String MQTTManager::statusText() const
+{
+    String retry = " - retrying every " + String(MQTT_RECONNECT_INTERVAL / 1000) + " s";
+    switch (statusCode.load())
+    {
+    case Status::Disabled:
+        return "Disabled";
+    case Status::Waiting:
+        return "Not connected yet";
+    case Status::Connected:
+        return "Connected";
+    case Status::Failed:
+        return "Connection failed (error code " + String(statusMqttState.load()) + ")" + retry;
+    case Status::Disconnected:
+        return "Disconnected" + retry;
+    case Status::TlsLowMemory:
+    {
+        String text = "Not connected: not enough free memory for TLS (needs " + String(HeapGuard::MQTT_TLS_MIN_FREE) +
+                      " B free with a block of " + String(HeapGuard::TLS_MIN_BLOCK) + " B, had " +
+                      String(tlsLowFree.load()) + " B free, largest block " + String(tlsLowLargest.load()) + " B)" + retry;
+#if defined(HAS_WIFI_SWITCH)
+        if (!uplink->wifiSwitchedOff())
+        {
+            text += ". Turn off WiFi (Network page) to free memory for TLS.";
+        }
+#endif
+        return text;
+    }
+    case Status::HeldForAp:
+        return "Not connected: the access point could not start (" + String(uplink->apFailedStartFree()) +
+               " B free memory) - the TLS session is held back to free memory for it (failed start " +
+               String(uplink->apFailedStarts()) + " of at most " + String(Uplink::apStarvedMaxTries()) + ")";
+    }
+    return "Unknown";
 }
 
 // Remove discovery for deleted sensor

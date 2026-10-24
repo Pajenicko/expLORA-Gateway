@@ -154,6 +154,26 @@ when the gateway loses its local network (Ethernet and WiFi), so it can always
 be reached for configuration; the Network page is available on the access point
 too (http://192.168.4.1/network).
 
+**Enable WiFi** (Network page, Pro only - the Lite has WiFi as its only
+uplink): with WiFi disabled the gateway runs on Ethernet (and LTE) - it never
+connects to a WiFi network, and once the access point is no longer needed the
+WiFi driver is stopped, which frees about 20 kB of memory. It applies after a
+restart, with or without WiFi credentials (an Ethernet-only gateway that was
+never given any can switch WiFi off too).
+So that the gateway can never be locked out, the access point still runs:
+- for 5 minutes after every boot, even when Ethernet has an address - an
+  address does not prove the gateway is reachable (a wrong static address,
+  DHCP on an isolated VLAN), so a power cycle is always a way back in;
+- whenever Ethernet has no address for 10 s (cable unplugged, no DHCP), until
+  Ethernet has had an address for 5 minutes again.
+The Network page is reachable on the access point (http://192.168.4.1/network),
+with the captive portal when there is no other way in. LTE does not count - it
+is not reachable from the local network. Saving WiFi credentials (WiFi
+Settings) switches WiFi back on. Disabling WiFi on a page opened over WiFi asks
+for confirmation, because that connection ends with the restart. There is no
+reset button: the only way to clear all settings is erasing the flash (NVS)
+over USB.
+
 If a wrong static Ethernet address makes the gateway unreachable, restart it:
 the access point runs for 5 minutes after boot, so the address can be fixed on
 its Network page.
@@ -165,9 +185,11 @@ the LTE operator and signal, and the power source (PoE or USB).
 
 The clock is set over NTP once the gateway is online. The time zone is selected
 on the Network page (card "Time") from a list of named zones (`Europe/Prague`,
-`Europe/London`, `America/New_York`, ...): one zone for every European country
-(its capital, plus e.g. the Azores, the Canaries and a few Russian zones) and
-common zones worldwide. Summer time follows the rules of the selected zone
+`Europe/London`, `America/New_York`, ...): the zones of all European
+countries, mostly named after the capital (Vatican City has no entry of its own
+and uses `Europe/Rome`, Kosovo `Europe/Belgrade`, as in the tz database), plus
+e.g. the Azores, the Canaries and a few Russian zones, and common zones
+worldwide. Summer time follows the rules of the selected zone
 automatically. The default is `Europe/Prague`. A change takes effect
 immediately, without a restart; the card shows the current local time, its UTC
 offset and whether summer time applies.
@@ -263,7 +285,10 @@ To connect to a Home Assistant MQTT broker:
 3. Enter your MQTT broker details:
    - Host: The IP or hostname of your MQTT broker
    - Port: Usually 1883 (default) or 8883 (TLS; encrypted, but the broker
-     certificate is not verified, so self-signed brokers work)
+     certificate is not verified, so self-signed brokers work). A TLS session
+     needs about 80 kB of free memory to connect: both boards have it (the
+     Pro ~99 kB with WiFi, Ethernet and LTE on); if not, the MQTT page says
+     why it does not connect
    - Username and Password: If your broker requires authentication
 4. Save the configuration
 

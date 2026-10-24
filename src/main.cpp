@@ -39,11 +39,13 @@
 // Hardware
 #include "Hardware/LoRaRadio.h"
 #include "Hardware/RadioTask.h"
+#include "Hardware/Liveness.h"
 #include "Network/Uplink.h"
 #include "Hardware/PSRAM_Manager.h"
 #include "Hardware/PowerSource.h"
 #include "Hardware/SPI_Manager.h"
 #include "Hardware/WatchdogPause.h"
+#include "Hardware/HeapGuard.h"
 
 // Storage
 #include "Storage/ConfigManager.h"
@@ -68,6 +70,14 @@ LoRaProtocol *loraProtocol;   // LoRa protocol
 MQTTManager *mqttManager;     // MQTT Manager
 WebPortal *webPortal;         // Web interface
 PowerSource *powerSource;     // Supply source (PoE / USB) on boards that detect it
+
+// Restarts because the heap stayed fragmented (loop()), counted in RTC memory:
+// kept across ESP.restart() and panics, cleared by a power cycle and after an
+// hour with a healthy heap. Logged at boot and shown in /diag/heap
+static constexpr uint32_t FRAG_RESTART_MAGIC = 0x46524147; // "FRAG"
+static constexpr uint32_t FRAG_RESTARTS_MAX = 3;
+RTC_NOINIT_ATTR static uint32_t fragRestartMagic;
+RTC_NOINIT_ATTR uint32_t heapFragRestarts;
 
 // Timer for disabling AP mode
 
@@ -106,6 +116,30 @@ bool initFileSystem()
 // Setup - device initialization
 void setup()
 {
+    Liveness::captureLastRestart(); // before anything can restart again
+    // Task watchdog first: the core starts it with 5 s and the CPU0 idle task
+    // watched. Change the timeout, keep panic, and stop watching the CPU0
+    // idle task: the lwIP thread (priority 18, pinned to CPU0) has CPU0 to
+    // itself for as long as a LAN host floods the gateway with connections
+    // (~500 a second on the bench), so the idle task starved and the
+    // watchdog rebooted the gateway (at a normal heap too, and during boot
+    // into a flood before this ran). Watched: the loop task (added at the
+    // end of setup()) and the AsyncTCP task; a hung lwIP thread and a hung
+    // radio task are caught by Hardware/Liveness. Accepted losses: a task on
+    // CPU0 spinning without blocking the others is no longer caught (the
+    // interrupt watchdog is unaffected), and setup() itself is not watched
+    // (the loop task is added at its end; it can block for seconds on WiFi /
+    // modem start)
+    esp_task_wdt_config_t wdtConfig = {
+        .timeout_ms = WDT_TIMEOUT * 1000,
+        .idle_core_mask = 0,
+        .trigger_panic = true,
+    };
+    if (esp_task_wdt_reconfigure(&wdtConfig) == ESP_ERR_INVALID_STATE)
+    {
+        esp_task_wdt_init(&wdtConfig);
+    }
+
     // Serial port initialization
     Serial.begin(115200);
     delay(1000); // Wait for stabilization
@@ -123,7 +157,8 @@ void setup()
 
     // Memory diagnostics
     Serial.printf("Total heap: %d bytes\n", ESP.getHeapSize());
-    Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
+    Serial.printf("Free heap: %d bytes (8-bit: %u bytes)\n", ESP.getFreeHeap(),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT));
 
 // PSRAM initialization
 #ifdef BOARD_HAS_PSRAM
@@ -160,7 +195,7 @@ void setup()
     }
 
     // Logging system initialization
-    if (!logger.init(LOG_BUFFER_SIZE))
+    if (!logger.init(LOG_RING_BYTES))
     {
         Serial.println("ERROR: Logger initialization failed");
         return;
@@ -168,6 +203,18 @@ void setup()
 
     // Basic log after initialization
     logger.info(String(BOARD_NAME) + " starting up - Firmware v" + String(FIRMWARE_VERSION));
+    if (fragRestartMagic != FRAG_RESTART_MAGIC || esp_reset_reason() == ESP_RST_POWERON ||
+        heapFragRestarts > FRAG_RESTARTS_MAX)
+    {
+        fragRestartMagic = FRAG_RESTART_MAGIC;
+        heapFragRestarts = 0;
+    }
+    else if (heapFragRestarts > 0)
+    {
+        logger.warning("Restarted because the heap stayed fragmented (" + String(heapFragRestarts) + " of at most " +
+                       String(FRAG_RESTARTS_MAX) + " such restarts in a row)");
+    }
+    Liveness::logLastRestart(logger);
 
     // Configuration manager initialization
     configManager = new ConfigManager(logger);
@@ -229,6 +276,8 @@ void setup()
     {
         logger.error("Failed to start the radio task");
     }
+    // lwIP thread and radio task heartbeats (Hardware/Liveness.h)
+    Liveness::start();
 
     // LoRa protocol initialization
     loraProtocol = new LoRaProtocol(*sensorManager, logger);
@@ -259,18 +308,18 @@ void setup()
     uplink->setActiveChangeCallback([](Uplink::Type)
                                     { mqttManager->disconnect(); });
 
-    // Initialize task watchdog
-    // The core already starts the TWDT (5 s, idle task on CPU0) - only change timeout, keep panic
-    esp_task_wdt_config_t wdtConfig = {
-        .timeout_ms = WDT_TIMEOUT * 1000,
-        .idle_core_mask = 1 << 0,
-        .trigger_panic = true,
-    };
-    if (esp_task_wdt_reconfigure(&wdtConfig) == ESP_ERR_INVALID_STATE)
+    // Task watchdog (configured at the start of setup()): the loop task from here on
+    esp_task_wdt_add(NULL);
+    // The AsyncTCP task subscribes itself when it starts; make sure a failed
+    // self-subscription (e.g. no memory, booting into a flood) does not
+    // leave it unwatched
+    TaskHandle_t asyncTask = xTaskGetHandle("async_tcp");
+    if (asyncTask && esp_task_wdt_status(asyncTask) == ESP_ERR_NOT_FOUND)
     {
-        esp_task_wdt_init(&wdtConfig);
+        esp_err_t added = esp_task_wdt_add(asyncTask);
+        logger.warning(String("AsyncTCP task was not on the task watchdog - ") +
+                       (added == ESP_OK ? "added" : "could not be added"));
     }
-    esp_task_wdt_add(NULL); // Add current task to watchdog
     logger.info("Task watchdog initialized with timeout of " + String(WDT_TIMEOUT) + " seconds");
 
     logger.info("System initialization complete");
@@ -346,20 +395,38 @@ void loop()
     // Short delay for stability
     delay(5);
 
-    // The web server refuses requests while the largest free block is below
-    // 8 kB; if fragmentation keeps it there for 15 minutes, restart rather than stay
-    // unmanageable until someone power-cycles the gateway
+    // The web server refuses pages while the largest usable (8-bit) block
+    // is below their largest allocation (6-9 kB); if fragmentation keeps it
+    // under 8 kB for 15 minutes, restart rather than stay unmanageable until
+    // someone power-cycles the gateway. Idle: Pro ~36 kB, Lite ~60 kB.
+    // Not counted while an MQTT TLS session is up: its record buffers (2 x
+    // 16.7 kB) stay allocated as long as it is connected, and a restart would
+    // only connect it again into the same heap - a restart every 15 minutes.
+    // HTTPS sessions (update check, URL OTA, forwarding) run inside this loop
+    // and are closed again before this check. At most FRAG_RESTARTS_MAX
+    // restarts in a row; the counter clears after an hour with a healthy heap
     static unsigned long lowBlockSince = 0;
-    if (ESP.getMaxAllocHeap() < 8192)
+    static unsigned long healthySince = 0;
+    static bool fragGaveUp = false;
+    size_t largest8 = HeapGuard::usable().largest;
+    bool tlsSessionUp = mqttManager && mqttManager->isConnected() && mqttManager->usesTls();
+    if (largest8 < 8192)
     {
-        if (lowBlockSince == 0)
+        healthySince = 0;
+        if (tlsSessionUp)
+        {
+            lowBlockSince = 0;
+        }
+        else if (lowBlockSince == 0)
         {
             lowBlockSince = millis() | 1;
-            logger.warning("Heap fragmented: largest free block " + String(ESP.getMaxAllocHeap()) + " B");
+            logger.warning("Heap fragmented: largest free block " + String(largest8) + " B");
         }
-        else if (millis() - lowBlockSince > 900000)
+        else if (millis() - lowBlockSince > 900000 && heapFragRestarts < FRAG_RESTARTS_MAX)
         {
-            logger.error("Heap fragmented for 15 minutes - restarting");
+            heapFragRestarts++;
+            logger.error("Heap fragmented for 15 minutes - restarting (" + String(heapFragRestarts) + " of at most " +
+                         String(FRAG_RESTARTS_MAX) + " such restarts in a row)");
             if (sensorManager)
             {
                 sensorManager->saveSensors(); // keep the rain totals
@@ -367,10 +434,26 @@ void loop()
             delay(200);
             ESP.restart();
         }
+        else if (millis() - lowBlockSince > 900000 && !fragGaveUp)
+        {
+            fragGaveUp = true;
+            logger.error("Heap fragmented for 15 minutes after " + String(FRAG_RESTARTS_MAX) +
+                         " restarts in a row - not restarting again until the heap recovers for an hour");
+        }
     }
     else
     {
         lowBlockSince = 0;
+        if (healthySince == 0)
+        {
+            healthySince = millis() | 1;
+        }
+        else if (heapFragRestarts > 0 && millis() - healthySince > 3600000)
+        {
+            heapFragRestarts = 0;
+            fragGaveUp = false;
+            logger.info("Heap healthy for an hour - fragmentation restart counter cleared");
+        }
     }
 
     if (sensorManager)
@@ -418,8 +501,12 @@ void loop()
     { // 10 minutes
         lastMemCheck = millis();
 
-        logger.info("Memory status - Free heap: " + String(ESP.getFreeHeap()) +
-                    " bytes, Largest block: " + String(ESP.getMaxAllocHeap()) + " bytes");
+        // 8-bit = what malloc / String / lwIP / mbedTLS can use; internal
+        // also counts the Pro's ~33 kB of 32-bit-only IRAM
+        HeapGuard::Heap heap = HeapGuard::usable();
+        logger.info("Memory status - 8-bit heap: free " + String(heap.free) + " B, largest block " +
+                    String(heap.largest) + " B, low " + String(heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT)) +
+                    " B (internal incl. 32-bit-only: free " + String(ESP.getFreeHeap()) + " B)");
 
 #ifdef BOARD_HAS_PSRAM
         if (psramFound())

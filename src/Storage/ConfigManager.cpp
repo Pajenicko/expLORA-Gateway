@@ -315,6 +315,9 @@ bool ConfigManager::loadFromPreferences()
         mqttHAPrefix = preferences.getString("mqttHAPrefix", HA_DISCOVERY_DEFAULT_PREFIX);
     }
 
+#if defined(HAS_WIFI_SWITCH)
+    wifiEnabled = preferences.getBool("wifiEnabled", WIFI_DEFAULT_ENABLED);
+#endif
     lteEnabled = preferences.getBool("lteEnabled", LTE_DEFAULT_ENABLED);
     lteApn = preferences.getString("lteApn", LTE_DEFAULT_APN);
     ltePin = preferences.getString("ltePin", "");
@@ -368,6 +371,9 @@ bool ConfigManager::saveToPreferences()
     preferences.putBool("mqttHAEnabled", mqttHAEnabled);
     preferences.putString("mqttHAPrefix", mqttHAPrefix);
 
+#if defined(HAS_WIFI_SWITCH)
+    preferences.putBool("wifiEnabled", wifiEnabled);
+#endif
     preferences.putBool("lteEnabled", lteEnabled);
     preferences.putString("lteApn", lteApn);
     preferences.putString("ltePin", ltePin);
@@ -388,6 +394,18 @@ bool ConfigManager::saveToPreferences()
 }
 
 // Add a new method to set MQTT configuration
+bool ConfigManager::setWifiEnabled(bool enabled, bool saveConfig)
+{
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
+    wifiEnabled = enabled;
+    if (saveConfig)
+    {
+        return save();
+    }
+    return true;
+}
+
 bool ConfigManager::setLteConfig(bool enabled, const String &apn, const String &pin, bool saveConfig)
 {
     FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
@@ -659,6 +677,7 @@ void ConfigManager::resetToDefaults()
     mqttTls = MQTT_DEFAULT_TLS;
     mqttPrefix = MQTT_DEFAULT_PREFIX;
     mqttHAEnabled = HA_DISCOVERY_DEFAULT_ENABLED;
+    wifiEnabled = WIFI_DEFAULT_ENABLED;
     lteEnabled = LTE_DEFAULT_ENABLED;
     lteApn = LTE_DEFAULT_APN;
     ltePin = "";

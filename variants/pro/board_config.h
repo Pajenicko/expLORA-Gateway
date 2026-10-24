@@ -42,7 +42,13 @@
 #define PWR_SRC_PIN 36 // input only, read by polling (ESP32 errata GPIO-3.14)
 
 // Memory: no PSRAM, and WiFi + Ethernet + LTE share ~300 kB of internal RAM
-#define LOG_BUFFER_SIZE 80
+// Log ring: ~95 typical entries (an entry takes ~86 B)
+#define LOG_RING_BYTES 8192
+// ~99 kB of 8-bit heap at idle with WiFi, LTE and Ethernet up (~56 kB
+// with an MQTT TLS session): three pages at once (a page peaks at 16-26 kB;
+// 60 parallel loads: 36 x 200, 24 x 503 Busy, none Low memory, 8-bit low
+// 35.7 kB; the heap check still answers 503 when it is short)
+#define WEB_HEAVY_RESPONSES_MAX 3
 #define LOG_MESSAGE_CAPACITY 160
 
 #endif

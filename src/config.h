@@ -44,8 +44,11 @@
 
 // Application configuration
 #define MAX_SENSORS 20                // Maximum number of sensors
-#ifndef LOG_BUFFER_SIZE
-#define LOG_BUFFER_SIZE 150           // Size of log buffer (entries)
+#ifndef LOG_RING_BYTES
+#define LOG_RING_BYTES 16384          // Log ring (bytes): ~190 typical entries
+#endif
+#ifndef WEB_HEAVY_RESPONSES_MAX
+#define WEB_HEAVY_RESPONSES_MAX 4     // pages / API responses sent at once, more get 503 (HeapGuard.h)
 #endif
 #define AP_TIMEOUT 300000             // AP mode timeout (5 minutes in milliseconds)
 #define WIFI_RECONNECT_INTERVAL 60000 // WiFi reconnect attempt interval (1 minute in milliseconds)
@@ -112,6 +115,14 @@ inline String makeApName()
 #define MQTT_DEFAULT_PREFIX "explora"
 #define HA_DISCOVERY_DEFAULT_ENABLED true
 #define HA_DISCOVERY_DEFAULT_PREFIX "homeassistant"
+
+// "Enable WiFi" switch: only on boards with another local access (ethernet),
+// which keeps the gateway reachable with WiFi off (Network/Uplink.h). The
+// Lite has WiFi as its only uplink, so the setting does not exist there.
+#if defined(HAS_ETHERNET)
+#define HAS_WIFI_SWITCH
+#endif
+#define WIFI_DEFAULT_ENABLED true
 
 // LTE defaults (boards with HAS_LTE)
 #define LTE_DEFAULT_ENABLED false

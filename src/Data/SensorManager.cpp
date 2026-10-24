@@ -21,6 +21,9 @@
 
 #include "SensorManager.h"
 #include "SensorCalibration.h"
+#include "SensorsJsonBudget.h"
+static_assert(MAX_SENSORS == SensorsJson::MAX_GEN1, "SensorsJsonBudget.h: MAX_GEN1");
+static_assert(MAX_GEN2_SENSORS == SensorsJson::MAX_GEN2, "SensorsJsonBudget.h: MAX_GEN2");
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 #include "../Hardware/FlashPermit.h"
@@ -32,6 +35,7 @@
 #include <memory>
 #include "../Network/Uplink.h"
 #include "../Hardware/WatchdogPause.h"
+#include "../Hardware/HeapGuard.h"
 
 // Constructor
 SensorManager::SensorManager(Logger &log, const char *file)
@@ -87,7 +91,7 @@ int SensorManager::addSensor(SensorType deviceType, uint32_t serialNumber, uint3
     int newIndex = -1;
     for (size_t i = 0; i < MAX_SENSORS; i++)
     {
-        if (!sensors[i].configured)
+        if (i >= sensorCount || !sensors[i].configured)
         {
             newIndex = i;
             break;
@@ -96,6 +100,11 @@ int SensorManager::addSensor(SensorType deviceType, uint32_t serialNumber, uint3
     if (newIndex < 0)
     {
         logger.error("Failed to add sensor: maximum number of sensors reached");
+        return -1;
+    }
+    if (!sensors.ensure(newIndex))
+    {
+        logger.error("Failed to add sensor: not enough memory");
         return -1;
     }
     if ((size_t)newIndex >= sensorCount)
@@ -515,8 +524,8 @@ bool SensorManager::forwardSensorData(const SensorData &sensor)
     // For HTTPS, use a secure client, but ensure we delete it after the request
     if (isHttps)
     {
-        // A TLS session needs ~40 kB (Pro: next to an MQTT TLS session)
-        if (ESP.getFreeHeap() < 48000 || ESP.getMaxAllocHeap() < 24000)
+        // A TLS session needs ~52 kB of the internal heap (HeapGuard.h)
+        if (!HeapGuard::tlsFits(HeapGuard::tlsHeap()))
         {
             logger.warning("Not forwarding to " + urlForLog + " - not enough memory for HTTPS");
             return false;
@@ -780,8 +789,6 @@ void SensorManager::applyTimezone(const String &posix)
     }
 }
 
-// JSON members per stored sensor (see saveSensorsLocked)
-static constexpr size_t SENSOR_JSON_FIELDS = 20;
 
 // Save sensor configuration to file (caller must not hold sensorMutex)
 bool SensorManager::saveSensors()
@@ -820,6 +827,12 @@ bool SensorManager::saveAndUnlock(std::unique_lock<std::mutex> &lock)
 // Caller holds sensorMutex: serialize the configured sensors
 bool SensorManager::snapshotLocked(String &json)
 {
+    if (partialLoad)
+    {
+        logger.error("Not saving the sensor configuration: it was loaded only in part (not enough memory), saving "
+                     "would drop the rest of " + String(sensorsFile) + " - restart the gateway");
+        return false;
+    }
     size_t textSize = 0;
     for (size_t i = 0; i < sensorCount; i++)
     {
@@ -830,9 +843,7 @@ bool SensorManager::snapshotLocked(String &json)
         textSize += gen2[i].name.length() + 32 + 12; // + DevID, label and firmware version strings
     }
     // Sized for the sensors present (one smaller block on a fragmented heap)
-    DynamicJsonDocument doc(JSON_OBJECT_SIZE(2) + JSON_ARRAY_SIZE(sensorCount) +
-                            sensorCount * JSON_OBJECT_SIZE(SENSOR_JSON_FIELDS) + JSON_ARRAY_SIZE(gen2Count) +
-                            gen2Count * (JSON_OBJECT_SIZE(18) + 2 * JSON_ARRAY_SIZE(5)) + textSize + 256);
+    DynamicJsonDocument doc(SensorsJson::writeCapacity(sensorCount, gen2Count, textSize));
     if (doc.capacity() == 0)
     {
         logger.error("Not enough memory to save the sensor configuration");
@@ -1002,6 +1013,7 @@ bool SensorManager::loadSensors()
     std::lock_guard<std::mutex> lock(sensorMutex);
 
     clearLocked();
+    partialLoad = false;
 
     // Power lost between removing the old file and renaming the new one
     String tmpFile = String(sensorsFile) + ".tmp";
@@ -1014,7 +1026,18 @@ bool SensorManager::loadSensors()
     String content;
     int primary = readSensorsFile(sensorsFile, content);
     bool present = primary > 0;
-    bool ok = present && parseSensorsLocked(content);
+    int parsed = present ? parseSensorsLocked(content, sensorsFile) : 0;
+    if (primary == -2 || parsed < 0)
+    {
+        // Out of memory while reading or parsing: the file is fine. Not moved
+        // aside, no restore from the backup; the tables stay as far as they
+        // got and saving is blocked until the next load (restart)
+        partialLoad = true;
+        logger.error("Could not load " + String(sensorsFile) + " (not enough memory, or larger than this firmware "
+                     "expects) - sensors not (fully) loaded, the file is kept, saving is blocked until a restart");
+        return true;
+    }
+    bool ok = parsed > 0;
     if (primary < 0 || (present && !ok))
     {
         // Unreadable or unparsable: move it aside first (kept for recovery),
@@ -1034,7 +1057,14 @@ bool SensorManager::loadSensors()
         // Last good copy (written before every replacement of sensors.json)
         clearLocked();
         String backup;
-        if (readSensorsFile(SENSORS_BACKUP_FILE, backup) > 0 && parseSensorsLocked(backup))
+        int backupRead = readSensorsFile(SENSORS_BACKUP_FILE, backup);
+        int backupParsed = backupRead > 0 ? parseSensorsLocked(backup, SENSORS_BACKUP_FILE) : 0;
+        if (backupRead == -2 || backupParsed < 0)
+        {
+            partialLoad = true; // no memory for the backup either: never save over it
+            logger.error("Not enough memory to load " + String(SENSORS_BACKUP_FILE) + " - saving is blocked until a restart");
+        }
+        if (backupParsed > 0)
         {
             // A restore undoes exactly one save. Save the restored state as the
             // current file at once (the same backup is never applied twice) and
@@ -1060,7 +1090,9 @@ bool SensorManager::loadSensors()
     return ok || primary == 0; // false: the file exists but could not be read or restored
 }
 
-// Read a sensors file: 1 content, 0 missing or empty, -1 could not be opened
+// Read a sensors file: 1 content, 0 missing or empty, -1 could not be opened,
+// read short or larger than SensorsJson::MAX_FILE_BYTES (damage), -2 no
+// memory for its content (the file is fine)
 int SensorManager::readSensorsFile(const char *path, String &content)
 {
     if (!LittleFS.exists(path))
@@ -1073,28 +1105,72 @@ int SensorManager::readSensorsFile(const char *path, String &content)
         logger.error("Failed to open " + String(path) + " for reading");
         return -1;
     }
-    content = file.readString();
+    size_t size = file.size();
+    content = String();
+    if (size > SensorsJson::MAX_FILE_BYTES)
+    {
+        file.close();
+        logger.error(String(path) + " is " + String(size) + " B - more than any configuration");
+        return -1; // damage, not a short heap
+    }
+    if (!content.reserve(size))
+    {
+        file.close();
+        return -2;
+    }
+    uint8_t buf[128];
+    while (content.length() < size)
+    {
+        int n = file.read(buf, sizeof(buf));
+        if (n <= 0)
+        {
+            break;
+        }
+        content.concat((const char *)buf, (unsigned int)n);
+    }
     file.close();
+    if (content.length() < size)
+    {
+        logger.error("Read only " + String(content.length()) + " of " + String(size) + " B of " + String(path));
+        return -1; // the memory was there: the file system could not read it
+    }
     content.trim();
     return content.length() > 0 ? 1 : 0;
 }
 
 // Caller holds sensorMutex: generation 1 and generation 2 sensors from JSON
-bool SensorManager::parseSensorsLocked(const String &fileContent)
+int SensorManager::parseSensorsLocked(const String &fileContent, const char *path)
 {
-    // Strings are copied into the document, so its size follows the file
-    DynamicJsonDocument doc(fileContent.length() + JSON_OBJECT_SIZE(2) + JSON_ARRAY_SIZE(MAX_SENSORS) +
-                            MAX_SENSORS * JSON_OBJECT_SIZE(SENSOR_JSON_FIELDS) + JSON_ARRAY_SIZE(MAX_GEN2_SENSORS) +
-                            MAX_GEN2_SENSORS * JSON_OBJECT_SIZE(14) + 256);
-    if (doc.capacity() == 0 || deserializeJson(doc, fileContent))
+    // Read budget with slack (SensorsJsonBudget.h). A file that still needs
+    // more (another firmware version: more members or sensors) gets one
+    // retry with twice the document; if that fails too it cannot be loaded
+    // here - saves are blocked (-1), the file and sensors.bak stay as they
+    // are. Only a syntax error is damage
+    std::unique_ptr<DynamicJsonDocument> owned;
+    size_t factor = 1;
+    SensorsJson::Load load = SensorsJson::parse(fileContent.c_str(), fileContent.length(), owned, factor);
+    if (load == SensorsJson::Load::NoMemory)
     {
-        return false;
+        logger.error(String(path) + " could not be parsed (no memory for a JSON document of up to twice the "
+                     "expected size) - not loaded");
+        return -1;
     }
+    if (load == SensorsJson::Load::Damage)
+    {
+        return 0;
+    }
+    DynamicJsonDocument &doc = *owned;
 
     // Load sensors from JSON
     JsonArray sensorArray = doc["sensors"].as<JsonArray>();
     for (JsonObject sensorObj : sensorArray)
     {
+        if (sensorCount < MAX_SENSORS && !sensors.ensure(sensorCount))
+        {
+            partialLoad = true;
+            logger.error("Not enough memory for all sensors - the rest is not loaded, saving is blocked until a restart");
+            break;
+        }
         if (sensorCount < MAX_SENSORS)
         {
             uint8_t typeValue = sensorObj["deviceType"];
@@ -1207,6 +1283,13 @@ bool SensorManager::parseSensorsLocked(const String &fileContent)
             logger.warning("Ignoring an invalid or surplus generation 2 sensor entry");
             continue;
         }
+        if (!gen2.ensure(gen2Count))
+        {
+            partialLoad = true;
+            logger.error("Not enough memory for all generation 2 sensors - the rest is not loaded, saving is blocked "
+                         "until a restart");
+            break;
+        }
         Gen2Sensor &g = gen2[gen2Count++];
         g = Gen2Sensor();
         g.configured = true;
@@ -1280,13 +1363,19 @@ void SensorManager::clearLocked()
     sensorCount = 0;
     for (size_t i = 0; i < MAX_SENSORS; i++)
     {
-        sensors[i].configured = false;
+        if (sensors.allocated(i))
+        {
+            sensors[i].configured = false;
+        }
     }
     gen2Count = 0;
     for (size_t i = 0; i < MAX_GEN2_SENSORS; i++)
     {
-        gen2[i].wipeKeys();
-        gen2[i] = Gen2Sensor();
+        if (gen2.allocated(i))
+        {
+            gen2[i].wipeKeys();
+            gen2[i] = Gen2Sensor();
+        }
     }
 }
 
@@ -1360,6 +1449,13 @@ int SensorManager::addGen2Sensor(uint32_t devId, const uint8_t label[ep::kLabelK
     if (gen2Count >= MAX_GEN2_SENSORS)
     {
         return -1;
+    }
+    if (!gen2.ensure(gen2Count))
+    {
+        char hex[9];
+        snprintf(hex, sizeof(hex), "%08lX", (unsigned long)devId);
+        logger.error("Not enough memory to add generation 2 sensor " + String(hex));
+        return -4;
     }
     size_t index = gen2Count++;
     Gen2Sensor &g = gen2[index];
@@ -1437,7 +1533,12 @@ bool SensorManager::deleteGen2Sensor(uint32_t devId)
 std::vector<Gen2Sensor> SensorManager::getGen2Sensors() const
 {
     std::lock_guard<std::mutex> lock(sensorMutex);
-    std::vector<Gen2Sensor> out(gen2, gen2 + gen2Count);
+    std::vector<Gen2Sensor> out;
+    out.reserve(gen2Count);
+    for (size_t i = 0; i < gen2Count; i++)
+    {
+        out.push_back(gen2[i]);
+    }
     for (Gen2Sensor &g : out)
     {
         ep::wipe(&g.joinKeys, sizeof(g.joinKeys)); // callers only display

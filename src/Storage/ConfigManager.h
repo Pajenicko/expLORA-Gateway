@@ -83,6 +83,10 @@ public:
     String mqttHAPrefix; // MQTT Homeassistant topic prefix
     bool mqttHAEnabled;  // MQTT Homeassistant discovery enable
 
+    // WiFi radio switch (boards with HAS_WIFI_SWITCH, always true elsewhere;
+    // stored in Preferences only). Off: no station, AP only for recovery
+    bool wifiEnabled = WIFI_DEFAULT_ENABLED;
+
     // LTE configuration (boards with HAS_LTE; stored in Preferences only)
     bool lteEnabled; // Modem enabled
     String lteApn;   // Access point name
@@ -150,6 +154,9 @@ public:
                        const String &password, bool enabled, bool tls,
                        const String &rootPrefix, const String &haPrefix, bool haEnable,
                        bool saveConfig = true);
+
+    // Set the WiFi radio switch (applies after a restart)
+    bool setWifiEnabled(bool enabled, bool saveConfig = true);
 
     // Set LTE configuration
     bool setLteConfig(bool enabled, const String &apn, const String &pin, bool saveConfig = true);

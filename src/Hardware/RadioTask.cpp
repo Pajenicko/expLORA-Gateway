@@ -15,6 +15,7 @@
 #include "FlashPermit.h"
 #include "../Protocol/Gen2Downlink.h"
 
+#include <atomic>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
@@ -30,6 +31,9 @@ static StaticQueue_t queueBuffer;
 static uint8_t queueStorage[RADIO_QUEUE_LENGTH * sizeof(RadioPacket)];
 static QueueHandle_t queue = nullptr;
 static TaskHandle_t task = nullptr;
+// Advanced on every pass of the task loop (at least once a second while it
+// runs normally), read by Hardware/Liveness.cpp
+static std::atomic<uint32_t> beatCounter{0};
 
 static LoRaRadio *radio = nullptr;
 static bool radioOk = false;
@@ -627,6 +631,7 @@ static void taskMain(void *)
     uint32_t failedPolls = 0;
     for (;;)
     {
+        beatCounter.fetch_add(1, std::memory_order_relaxed);
         // A packet is read only while the packet-ready line is high: a
         // notification that raced with the polling below then finds the line
         // low and cannot read the same packet twice
@@ -852,6 +857,16 @@ const char *txOutcomeName(TxOutcome outcome)
         return "radio error";
     }
     return "?";
+}
+
+bool running()
+{
+    return task != nullptr;
+}
+
+uint32_t beats()
+{
+    return beatCounter.load(std::memory_order_relaxed);
 }
 
 Stats stats()

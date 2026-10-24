@@ -8,7 +8,8 @@
  * library, so a typo cannot silently fall back to UTC on the device. Every
  * entry is also compared with the host's zoneinfo (hourly 2026-2030 and at
  * every transition to the second), skipped without /usr/share/zoneinfo or
- * with a tzdata older than the table's snapshot.
+ * with a tzdata older than the table's snapshot or of unknown version (no
+ * tzdata.zi, e.g. macOS).
  *
  * Run:   pio test -e native
  */
@@ -26,8 +27,24 @@
 using TimeZones::COUNT;
 using TimeZones::ZONES;
 
+// The process's TZ before the tests; every test that sets TZ (setenv) gets
+// it back in tearDown(), so no test depends on the zone an earlier one left
+static bool hadTz = false;
+static std::string originalTz;
+
 void setUp(void) {}
-void tearDown(void) {}
+void tearDown(void)
+{
+    if (hadTz)
+    {
+        setenv("TZ", originalTz.c_str(), 1);
+    }
+    else
+    {
+        unsetenv("TZ");
+    }
+    tzset();
+}
 
 static const char *nameOf(int index)
 {
@@ -266,7 +283,12 @@ static void test_every_entry_matches_the_host_zoneinfo(void)
         TEST_IGNORE_MESSAGE("no zoneinfo on this host");
     }
     std::string host = hostTzdataVersion();
-    if (!host.empty() && host < TimeZones::TZDATA_VERSION)
+    if (host.empty())
+    {
+        // Possibly older data than the table's: a mismatch would prove nothing
+        TEST_IGNORE_MESSAGE("host tzdata version unknown (no tzdata.zi)");
+    }
+    if (host < TimeZones::TZDATA_VERSION)
     {
         std::string message = "host tzdata " + host + " is older than the table's " + TimeZones::TZDATA_VERSION;
         TEST_IGNORE_MESSAGE(message.c_str());
@@ -275,7 +297,7 @@ static void test_every_entry_matches_the_host_zoneinfo(void)
     for (size_t i = 0; i < COUNT; i++)
     {
         const char *name = ZONES[i].name;
-        std::string where = std::string(name) + " (host tzdata " + (host.empty() ? "?" : host) + ")";
+        std::string where = std::string(name) + " (host tzdata " + host + ")";
         if (strcmp(name, "UTC") != 0)
         {
             TEST_ASSERT_EQUAL_INT_MESSAGE(0, access((std::string(ZONEINFO) + "/" + name).c_str(), R_OK), where.c_str());
@@ -455,6 +477,9 @@ static void test_form_refuses_anything_else(void)
 
 int main(int, char **)
 {
+    const char *tz = getenv("TZ");
+    hadTz = tz != nullptr;
+    originalTz = tz ? tz : "";
     UNITY_BEGIN();
     RUN_TEST(test_names_are_unique_and_sorted);
     RUN_TEST(test_names_are_safe_in_html);

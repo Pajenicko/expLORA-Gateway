@@ -27,6 +27,7 @@
 #include <vector>
 #include "SensorData.h"
 #include "Gen2Sensor.h"
+#include "LazySlots.h"
 #include "../Protocol/WaitingList.h"
 #include "../Hardware/RadioTask.h"
 #include "../Protocol/OtaJob.h"
@@ -42,8 +43,10 @@
 class SensorManager
 {
 private:
-    SensorData sensors[MAX_SENSORS]; // Array of sensors - limited to MAX_SENSORS
-    size_t sensorCount;              // Current number of sensors
+    // Sensor tables: a slot is allocated when first used and kept (LazySlots.h).
+    // Slots below sensorCount / gen2Count are always allocated
+    LazySlots<SensorData, MAX_SENSORS> sensors;
+    size_t sensorCount;              // Slots in use, incl. deleted sensors below the last one
     mutable std::mutex sensorMutex;  // Mutex for safe multi-threaded access
     Logger &logger;                  // Reference to logger
 
@@ -55,7 +58,7 @@ private:
     unsigned long lastRainSave = 0;
 
     // Generation 2 sensors (protocol v2) and unknown DevIDs seen in JOIN_REQs
-    Gen2Sensor gen2[MAX_GEN2_SENSORS];
+    LazySlots<Gen2Sensor, MAX_GEN2_SENSORS> gen2;
     size_t gen2Count = 0;
     bool devNonceSaveDue = false;      // devNonce / firmware / boot state changed: write sensors.json after the response
     uint32_t devNonceSaveAtMs = 0;     // next attempt (DueTime::reached)
@@ -67,9 +70,16 @@ private:
     void removeGen2Locked(uint32_t devId);
     void clearLocked();
     int readSensorsFile(const char *path, String &content);
-    bool parseSensorsLocked(const String &fileContent);
+    // 1 loaded, 0 not valid JSON (corrupt), -1 cannot be loaded here: no memory
+    // for the document, or it needs more than twice the budget (saves blocked).
+    // path: the file the content came from (for the log)
+    int parseSensorsLocked(const String &fileContent, const char *path);
 
     uint32_t snapshotSeq = 0; // under sensorMutex
+    // A slot could not be allocated while loading: the tables hold only part
+    // of sensors.json, so saving is refused (it would drop the rest) until
+    // the next load (restart). Under sensorMutex
+    bool partialLoad = false;
     uint32_t writtenSeq = 0;  // under fileMutex
     std::mutex fileMutex;     // sensors.json writes (taken after the flash permit)
     bool snapshotLocked(String &json);
@@ -175,8 +185,15 @@ public:
 
     // Load sensor configuration from file (sensors.bak when it is damaged)
     bool loadSensors();
+    // sensors.json was loaded only in part (memory): every save is refused
+    bool savesBlocked() const
+    {
+        std::lock_guard<std::mutex> lock(sensorMutex);
+        return partialLoad;
+    }
 
-    // Generation 2 sensors. add: index, -1 full, -2 DevID exists, -3 save failed
+    // Generation 2 sensors. add: index, -1 full, -2 DevID exists, -3 save failed,
+    // -4 no memory for its slot
     int addGen2Sensor(uint32_t devId, const uint8_t label[ep::kLabelKeyLen], const String &name);
     bool deleteGen2Sensor(uint32_t devId);
     bool isKnownGen2(uint32_t devId) const;

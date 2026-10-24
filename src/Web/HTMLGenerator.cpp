@@ -381,7 +381,11 @@ String HTMLGenerator::generateHomePage(const std::vector<SensorData> &sensors)
         html += "<p><strong>Ethernet:</strong> Disconnected</p>";
     }
 #endif
-    if (WiFi.STA.connected())
+    if (uplink->wifiSwitchedOff())
+    {
+        html += "<p><strong>WiFi:</strong> Disabled</p>";
+    }
+    else if (uplink->stationConnected())
     {
         html += "<p><strong>WiFi:</strong> Connected to " + htmlEscape(WiFi.SSID()) + "</p>";
     }
@@ -476,20 +480,27 @@ String HTMLGenerator::generateHomePage(const std::vector<SensorData> &sensors)
 
 // Generating configuration page
 // WiFi settings form, used by the AP setup page and the network page
-void HTMLGenerator::addWiFiForm(String &html, const String &ssid, const String &password, const ConfigManager *timeZone)
+void HTMLGenerator::addWiFiForm(String &html, const String &ssid, bool hasPassword, const ConfigManager *timeZone)
 {
     html += "<div class='card'>";
     html += "<h2>WiFi Settings</h2>";
+#if defined(HAS_WIFI_SWITCH)
+    if (uplink->wifiSwitchedOff())
+    {
+        html += "<p><strong>WiFi is switched off</strong> (WiFi Radio on the Network page). Saving WiFi settings "
+                "here switches it back on: the gateway restarts and connects to this network.</p>";
+    }
+#endif
     html += "<form method='post' action='/config'>";
     html += "<label for='ssid'>SSID:</label>";
     html += "<input type='text' id='ssid' name='ssid' value='" + htmlEscape(ssid) + "' required>";
     // Stored secrets never go into the page; empty = keep the stored one
     html += "<label for='password'>Password:</label>";
     html += "<input type='password' id='password' name='password' autocomplete='new-password' placeholder='" +
-            String(password.length() > 0 ? "(unchanged)" : "(open network)") + "'>";
+            String(hasPassword ? "(unchanged)" : "(open network)") + "'>";
     if (timeZone)
     {
-        addTimezoneSelect(html, *timeZone);
+        addTimezoneSelect(html, timeZone->timezoneName, timeZone->timezone);
     }
 
     html += "<input type='submit' value='Save and Restart'>";
@@ -500,17 +511,17 @@ void HTMLGenerator::addWiFiForm(String &html, const String &ssid, const String &
 // Time zone select (field "timezone"): the names of Data/TimeZones.h (an
 // option's value is its text), a custom POSIX string from an old setting
 // as an extra entry with an empty value (= keep it)
-void HTMLGenerator::addTimezoneSelect(String &html, const ConfigManager &config)
+void HTMLGenerator::addTimezoneSelect(String &html, const String &zoneName, const String &zonePosix)
 {
     html += "<label for='timezone'>Time zone:</label>";
     html += "<select id='timezone' name='timezone'>";
-    if (config.timezoneName.length() == 0)
+    if (zoneName.length() == 0)
     {
-        html += "<option value='' selected>Custom: " + htmlEscape(config.timezone) + "</option>";
+        html += "<option value='' selected>Custom: " + htmlEscape(zonePosix) + "</option>";
     }
     for (const TimeZones::Zone &zone : TimeZones::ZONES)
     {
-        html += config.timezoneName == zone.name ? "<option selected>" : "<option>";
+        html += zoneName == zone.name ? "<option selected>" : "<option>";
         html += zone.name;
         html += "</option>";
     }
@@ -565,15 +576,15 @@ String HTMLGenerator::generateConfigPage(const String &ssid, const String &passw
     {
         html += "<p><strong>Mode:</strong> Client</p>";
         html += "<p><strong>SSID:</strong> " + htmlEscape(ssid) + "</p>";
-        html += "<p><strong>Status:</strong> " + String(WiFi.STA.connected() ? "Connected" : "Disconnected") + "</p>";
-        if (WiFi.STA.hasIP())
+        html += "<p><strong>Status:</strong> " + String(uplink->stationConnected() ? "Connected" : "Disconnected") + "</p>";
+        if (uplink->stationHasIP())
         {
-            html += "<p><strong>IP:</strong> " + WiFi.STA.localIP().toString() + "</p>";
+            html += "<p><strong>IP:</strong> " + uplink->getStationIP().toString() + "</p>";
         }
     }
     html += "</div>";
 
-    addWiFiForm(html, ssid, password, &config);
+    addWiFiForm(html, ssid, password.length() > 0, &config);
 
     // Add footer
     addHtmlFooter(html);
@@ -582,7 +593,7 @@ String HTMLGenerator::generateConfigPage(const String &ssid, const String &passw
 }
 // Generate MQTT Configuration Page
 String HTMLGenerator::generateMqttPage(const String &host, int port, const String &user, const String &password, bool enabled, bool tls,
-                                       const String &prefix, bool haEnabled, String &haPrefix)
+                                       const String &prefix, bool haEnabled, String &haPrefix, const String &status)
 {
     String html;
     html.reserve(4096);
@@ -594,6 +605,7 @@ String HTMLGenerator::generateMqttPage(const String &host, int port, const Strin
     html += "<div class='card'>";
     html += "<h2>MQTT Settings</h2>";
     html += "<p>Configure connection to Home Assistant MQTT broker for automatic sensor discovery.</p>";
+    html += "<p><strong>Status:</strong> " + htmlEscape(status) + "</p>";
     html += "<form method='post' action='/mqtt'>";
 
     // Enable MQTT checkbox
@@ -663,100 +675,122 @@ String HTMLGenerator::generateMqttPage(const String &host, int port, const Strin
     return html;
 }
 
-String HTMLGenerator::generateNetworkPage(const ConfigManager &config, const String &ssid, const String &password,
-                                         bool apMode)
+String HTMLGenerator::generateNetworkPagePart(const NetworkPageView &view, size_t part)
 {
+    // Every piece is generated when the response has room for it: the whole
+    // page (about 14 kB with the Ethernet, LTE and power cards on the Pro,
+    // 11.4 kB on the Lite) never sits in RAM. The largest pieces are the
+    // footer (~3.7 kB), the header (~3.4 kB) and the time zone list (~3.5 kB).
     String html;
-    // One allocation (String grows to the exact length on every append past
-    // it): measured from the page's literals, about 14 kB with the Ethernet,
-    // LTE and power cards (Pro), 11.4 kB without (Lite); the time zone list is
-    // 3.5 kB of it. Transient: send() copies it, so twice that while sending.
-#if defined(HAS_ETHERNET) || defined(HAS_LTE)
-    html.reserve(15360);
-#else
-    html.reserve(12288);
-#endif
-
-    addHtmlHeader(html, "Network", apMode);
-
-    html += "<div class='card'>";
-    html += "<h2>Status</h2>";
-    html += "<p><strong>Active uplink:</strong> " + String(uplink->getActiveName());
-    if (uplink->isOnline())
+    switch (part)
     {
-        html += ", " + uplink->getLocalIP().toString();
-    }
-    html += "</p>";
+    case 0:
+        html.reserve(3584);
+        addHtmlHeader(html, "Network", view.apMode);
+        break;
+
+    case 1:
+        // Live uplink state, read in one go (one piece)
+        html.reserve(1536);
+        html += "<div class='card'>";
+        html += "<h2>Status</h2>";
+        html += "<p><strong>Active uplink:</strong> " + String(uplink->getActiveName());
+        if (uplink->isOnline())
+        {
+            html += ", " + uplink->getLocalIP().toString();
+        }
+        html += "</p>";
 #if defined(HAS_ETHERNET) || defined(HAS_LTE)
-    html += "<p>Priority: Ethernet, WiFi, LTE - the first one with an address carries traffic.</p>";
+        html += "<p>Priority: Ethernet, WiFi, LTE - the first one with an address carries traffic.</p>";
 #endif
 #if defined(HAS_PWR_SRC)
-    html += "<p><strong>Power source:</strong> " + String(powerSource->getName()) + "</p>";
+        html += "<p><strong>Power source:</strong> " + String(powerSource->getName()) + "</p>";
 #endif
-    html += "<p><strong>Time:</strong> " + htmlEscape(uplink->getTimeStatus()) + "</p>";
+        html += "<p><strong>Time:</strong> " + htmlEscape(uplink->getTimeStatus()) + "</p>";
 #if defined(HAS_ETHERNET)
-    html += "<p><strong>Ethernet:</strong> ";
-    if (uplink->getEthernetIP())
-    {
-        html += "Connected, " + uplink->getEthernetIP().toString();
-    }
-    else
-    {
-        html += uplink->ethernetLinkUp() ? (config.ethStatic ? "Link up" : "Link up, waiting for DHCP") : "Disconnected";
-    }
-    html += String(config.ethStatic ? " (static)" : " (DHCP)") + "</p>";
+        html += "<p><strong>Ethernet:</strong> ";
+        if (uplink->getEthernetIP())
+        {
+            html += "Connected, " + uplink->getEthernetIP().toString();
+        }
+        else
+        {
+            html += uplink->ethernetLinkUp() ? (view.ethStatic ? "Link up" : "Link up, waiting for DHCP") : "Disconnected";
+        }
+        html += String(view.ethStatic ? " (static)" : " (DHCP)") + "</p>";
 #endif
-    html += "<p><strong>WiFi:</strong> ";
-    if (ssid.length() == 0)
-    {
-        html += "Not configured";
-    }
-    else
-    {
-        html += (WiFi.STA.hasIP() ? "Connected, " + WiFi.STA.localIP().toString() : String("Disconnected")) +
-                " (" + htmlEscape(ssid) + ")";
-    }
-    html += "</p>";
+        html += "<p><strong>WiFi:</strong> ";
+        if (uplink->wifiSwitchedOff())
+        {
+            html += uplink->isApActive() ? "Disabled (access point up for recovery)" : "Disabled";
+        }
+        else if (view.ssid.length() == 0)
+        {
+            html += "Not configured";
+        }
+        else
+        {
+            html += (uplink->stationHasIP() ? "Connected, " + uplink->getStationIP().toString() : String("Disconnected")) +
+                    " (" + htmlEscape(view.ssid) + ")";
+        }
+        html += "</p>";
 #if defined(HAS_LTE)
-    const LteModem &lte = uplink->getLte();
-    html += "<p><strong>LTE:</strong> " + String(lte.getStateName());
-    if (lte.hasIP())
-    {
-        html += ", " + lte.localIP().toString();
-    }
-    html += "</p>";
-    if (lte.getOperator().length() > 0)
-    {
-        html += "<p><strong>Operator:</strong> " + htmlEscape(lte.getOperator()) + ", APN " + htmlEscape(lte.getApn()) + "</p>";
-    }
-    if (lte.getRssiDbm() != 0)
-    {
-        html += "<p><strong>Signal:</strong> " + String(lte.getRssiDbm()) + " dBm (CSQ " + String(lte.getSignalQuality()) + ")</p>";
-    }
-    if (lte.getModuleName().length() > 0)
-    {
-        html += "<p><strong>Modem:</strong> " + htmlEscape(lte.getModuleName()) + ", IMEI " + htmlEscape(lte.getImei()) + "</p>";
-    }
-    if (lte.getLastError().length() > 0)
-    {
-        html += "<p><strong>Last error:</strong> " + htmlEscape(lte.getLastError()) + "</p>";
-    }
+        {
+            const LteModem &lte = uplink->getLte();
+            html += "<p><strong>LTE:</strong> " + String(lte.getStateName());
+            if (lte.hasIP())
+            {
+                html += ", " + lte.localIP().toString();
+            }
+            html += "</p>";
+            if (lte.getOperator().length() > 0)
+            {
+                html += "<p><strong>Operator:</strong> " + htmlEscape(lte.getOperator()) + ", APN " + htmlEscape(lte.getApn()) + "</p>";
+            }
+            if (lte.getRssiDbm() != 0)
+            {
+                html += "<p><strong>Signal:</strong> " + String(lte.getRssiDbm()) + " dBm (CSQ " + String(lte.getSignalQuality()) + ")</p>";
+            }
+            if (lte.getModuleName().length() > 0)
+            {
+                html += "<p><strong>Modem:</strong> " + htmlEscape(lte.getModuleName()) + ", IMEI " + htmlEscape(lte.getImei()) + "</p>";
+            }
+            if (lte.getLastError().length() > 0)
+            {
+                html += "<p><strong>Last error:</strong> " + htmlEscape(lte.getLastError()) + "</p>";
+            }
+        }
 #endif
-    html += "</div>";
+        html += "</div>";
+        break;
 
-    html += "<div class='card'>";
-    html += "<h2>Time</h2>";
-    html += "<p><strong>Local time:</strong> " + localTimeText(config.timezone) + "</p>";
-    html += "<form method='post' action='/timezone'>";
-    addTimezoneSelect(html, config);
-    html += "<p>Summer time (DST) follows the rules of the selected zone. Takes effect immediately.</p>";
-    html += "<input type='submit' value='Save'>";
-    html += "</form></div>";
+    case 2:
+        html += "<div class='card'>";
+        html += "<h2>Time</h2>";
+        html += "<p><strong>Local time:</strong> " + localTimeText(view.timezone) + "</p>";
+        html += "<form method='post' action='/timezone'>";
+        break;
 
-    addWiFiForm(html, ssid, password, nullptr);
+    case 3:
+        html.reserve(3840);
+        addTimezoneSelect(html, view.timezoneName, view.timezone);
+        break;
 
+    case 4:
+        html += "<p>Summer time (DST) follows the rules of the selected zone. Takes effect immediately.</p>";
+        html += "<input type='submit' value='Save'>";
+        html += "</form></div>";
+        break;
+
+    case 5:
+        html.reserve(768);
+        addWiFiForm(html, view.ssid, view.hasWifiPassword, nullptr);
+        break;
+
+    case 6:
 #if defined(HAS_ETHERNET)
     {
+        html.reserve(2560);
         auto field = [&html](const char *id, const char *label, const String &value, bool required)
         {
             html += "<div class='form-group eth-static'>";
@@ -774,14 +808,14 @@ String HTMLGenerator::generateNetworkPage(const ConfigManager &config, const Str
         html += "<div class='form-group'>";
         html += "<label for='ethMode'>Addressing:</label>";
         html += "<select id='ethMode' name='ethMode'>";
-        html += "<option value='dhcp'" + String(config.ethStatic ? "" : " selected") + ">DHCP (automatic)</option>";
-        html += "<option value='static'" + String(config.ethStatic ? " selected" : "") + ">Static</option>";
+        html += "<option value='dhcp'" + String(view.ethStatic ? "" : " selected") + ">DHCP (automatic)</option>";
+        html += "<option value='static'" + String(view.ethStatic ? " selected" : "") + ">Static</option>";
         html += "</select></div>";
-        field("ip", "IP address", config.ethIp, true);
-        field("mask", "Subnet mask", config.ethMask.length() ? config.ethMask : String("255.255.255.0"), true);
-        field("gateway", "Gateway", config.ethGateway, true);
-        field("dns1", "Primary DNS (empty = gateway)", config.ethDns1, false);
-        field("dns2", "Secondary DNS (optional)", config.ethDns2, false);
+        field("ip", "IP address", view.ethIp, true);
+        field("mask", "Subnet mask", view.ethMask.length() ? view.ethMask : String("255.255.255.0"), true);
+        field("gateway", "Gateway", view.ethGateway, true);
+        field("dns1", "Primary DNS (empty = gateway)", view.ethDns1, false);
+        field("dns2", "Secondary DNS (optional)", view.ethDns2, false);
         html += "<input type='submit' value='Save and Restart'>";
         html += "</form></div>";
         html += "<script>(function(){var m=document.getElementById('ethMode');"
@@ -791,36 +825,75 @@ String HTMLGenerator::generateNetworkPage(const ConfigManager &config, const Str
                 "m.addEventListener('change',u);u();})();</script>";
     }
 #endif
+        break;
 
-#if defined(HAS_LTE)
-    html += "<div class='card'>";
-    html += "<h2>LTE Settings</h2>";
-    html += "<p>The LTE connection is kept ready and used only when neither Ethernet nor WiFi is available. Changes take effect after a restart.</p>";
-    html += "<p>Leave LTE disabled when no modem is fitted.</p>";
-    html += "<form method='post' action='/network'>";
-    html += "<input type='hidden' name='section' value='lte'>";
-    html += "<div class='form-group'>";
-    html += "<label for='lteEnabled'>Enable LTE:</label>";
-    html += "<input type='checkbox' id='lteEnabled' name='lteEnabled' value='1'" + String(config.lteEnabled ? " checked" : "") + ">";
-    html += "</div>";
-    html += "<div class='form-group'>";
-    html += "<label for='apn'>APN (empty = automatic):</label>";
-    html += "<input type='text' id='apn' name='apn' maxlength='63' value='" + htmlEscape(config.lteApn) + "'>";
-    html += "</div>";
-    html += "<div class='form-group'>";
-    html += "<label for='pin'>SIM PIN (optional):</label>";
-    html += "<input type='password' id='pin' name='pin' maxlength='8' inputmode='numeric' pattern='[0-9]{4,8}' autocomplete='off' placeholder='" +
-            String(config.ltePin.length() > 0 ? "(unchanged)" : "") + "'>";
-    if (config.ltePin.length() > 0)
-    {
-        html += "<label><input type='checkbox' name='clearPin' value='1'> Remove the stored PIN</label>";
-    }
-    html += "</div>";
-    html += "<input type='submit' value='Save and Restart'>";
-    html += "</form></div>";
+    case 7:
+#if defined(HAS_WIFI_SWITCH)
+        html.reserve(3072);
+        html += "<div class='card'>";
+        html += "<h2>WiFi Radio</h2>";
+        html += "<p>With WiFi disabled the gateway uses only Ethernet (and LTE) and never connects to a WiFi network. "
+                "The access point still runs for 5 min after every restart, and whenever Ethernet has no address for "
+                "10 s (until Ethernet has been back for 5 min), so the gateway stays reachable; the rest of the time the "
+                "WiFi radio is off, which frees about 30 kB of memory (e.g. for MQTT over TLS). "
+                "Changes take effect after a restart.</p>";
+        if (view.viaWifi)
+        {
+            html += "<p style='color:#c0392b;'><strong>You are connected over WiFi.</strong> Disabling WiFi ends this session; ";
+            html += view.ethAddress.length() > 0
+                        ? "reconnect over Ethernet at <a href='http://" + htmlEscape(view.ethAddress) + "/network'>" + htmlEscape(view.ethAddress) + "</a>.</p>"
+                        : String("Ethernet has no address now, so only the recovery access point will be reachable.</p>");
+        }
+        html += "<form method='post' action='/network' id='wifiForm'>";
+        html += "<input type='hidden' name='section' value='wifi'>";
+        html += "<div class='form-group'>";
+        html += "<label for='wifiEnabled'>Enable WiFi:</label>";
+        html += "<input type='checkbox' id='wifiEnabled' name='wifiEnabled' value='1'" + String(view.wifiEnabled ? " checked" : "") + ">";
+        html += "</div>";
+        html += "<input type='submit' value='Save and Restart'>";
+        html += "</form></div>";
+        if (view.viaWifi)
+        {
+            html += "<script>document.getElementById('wifiForm').addEventListener('submit',function(e){"
+                    "if(!document.getElementById('wifiEnabled').checked&&!confirm('This page is loaded over WiFi. "
+                    "Disabling WiFi will drop this connection after the restart. Continue?'))e.preventDefault();});</script>";
+        }
 #endif
+#if defined(HAS_LTE)
+        html.reserve(html.length() + 1536);
+        html += "<div class='card'>";
+        html += "<h2>LTE Settings</h2>";
+        html += "<p>The LTE connection is kept ready and used only when neither Ethernet nor WiFi is available. Changes take effect after a restart.</p>";
+        html += "<p>Leave LTE disabled when no modem is fitted.</p>";
+        html += "<form method='post' action='/network'>";
+        html += "<input type='hidden' name='section' value='lte'>";
+        html += "<div class='form-group'>";
+        html += "<label for='lteEnabled'>Enable LTE:</label>";
+        html += "<input type='checkbox' id='lteEnabled' name='lteEnabled' value='1'" + String(view.lteEnabled ? " checked" : "") + ">";
+        html += "</div>";
+        html += "<div class='form-group'>";
+        html += "<label for='apn'>APN (empty = automatic):</label>";
+        html += "<input type='text' id='apn' name='apn' maxlength='63' value='" + htmlEscape(view.lteApn) + "'>";
+        html += "</div>";
+        html += "<div class='form-group'>";
+        html += "<label for='pin'>SIM PIN (optional):</label>";
+        html += "<input type='password' id='pin' name='pin' maxlength='8' inputmode='numeric' pattern='[0-9]{4,8}' autocomplete='off' placeholder='" +
+                String(view.hasLtePin ? "(unchanged)" : "") + "'>";
+        if (view.hasLtePin)
+        {
+            html += "<label><input type='checkbox' name='clearPin' value='1'> Remove the stored PIN</label>";
+        }
+        html += "</div>";
+        html += "<input type='submit' value='Save and Restart'>";
+        html += "</form></div>";
+#endif
+        break;
 
-    addHtmlFooter(html);
+    case 8:
+        html.reserve(3840);
+        addHtmlFooter(html);
+        break;
+    }
     return html;
 }
 
@@ -890,228 +963,254 @@ static String renderHealthBadge(const SensorHealth::Stats &h, unsigned long nowM
     return badge;
 }
 
-String HTMLGenerator::generateSensorsPage(const std::vector<ActiveSensorEntry> &entries,
-                                          const std::vector<Gen2Sensor> &gen2, const WaitingEntry *waiting,
-                                          size_t waitingCount)
+size_t HTMLGenerator::sensorsPageParts(const SensorsPageView &view)
 {
+    return 5 + view.entries.size() + view.gen2.size();
+}
+
+String HTMLGenerator::generateSensorsPagePart(const SensorsPageView &view, size_t part)
+{
+    // One piece per sensor row, so the page (6 kB plus ~700 bytes per sensor)
+    // never sits in RAM; the largest pieces are the header, the footer and
+    // the waiting list (8 rows at most), each below 4 kB
+    const size_t entries = view.entries.size(), gen2 = view.gen2.size();
     String html;
-    // One allocation for the whole page (no PSRAM on the Pro): sized by the rows
-    html.reserve(6144 + 700 * entries.size() + 600 * gen2.size() + 300 * waitingCount);
-    addHtmlHeader(html, "Sensors");
-
-    html += "<div class='card'><h2>Configured Sensors</h2>";
-
-    if (entries.empty())
+    if (part == 0)
     {
-        html += "<p>No sensors configured yet.</p>";
+        html.reserve(3584);
+        addHtmlHeader(html, "Sensors");
     }
-    else
+    else if (part == 1)
     {
-        // Snapshot 'now' once per page render so every row computes deltas
-        // against the same reference. millis() can wrap every ~50 days but
-        // unsigned subtraction in formatRelativeMillis handles that correctly.
-        const unsigned long nowMillis = millis();
-
-        html += "<table><tr>"
-                "<th>Name</th><th>Type</th><th>Serial</th>"
-                "<th>Status</th><th>Last Seen</th><th>24h</th><th>Actions</th></tr>";
-
-        for (const auto &entry : entries)
+        html += "<div class='card'><h2>Configured Sensors</h2>";
+        if (entries == 0)
         {
-            const auto &s = entry.data;
-            size_t idx    = entry.index;
-            const auto &h = s.health;
-
-            uint32_t ok24h     = SensorHealth::okLast24h(h);
-            uint32_t rejected  = SensorHealth::rejectedLast24h(h);
-
-            html += "<tr>";
-            html += "<td>" + htmlEscape(s.name) + "</td>";
-            html += "<td>" + sensorTypeToString(s.deviceType) + "</td>";
-            html += "<td>" + formatSN(s.serialNumber) + "</td>";
-
-            // Status: badge + optional last reject reason on the line below
-            html += "<td>";
-            html += renderHealthBadge(h, nowMillis);
-            if (h.hasLastReject && h.consecutiveRejections > 0)
-            {
-                html += "<br><small style='color:#c0392b;'>";
-                html += "last reject: ";
-                html += htmlEscape(String(h.lastRejectReason));
-                html += " (";
-                html += formatRelativeMillis(nowMillis, h.lastRejectAtMillis, true);
-                html += ")</small>";
-            }
-            html += "</td>";
-
-            // Last seen: prefer relative form derived from our millis snapshot;
-            // the wall-clock form (getLastSeenString) is kept as a tooltip so
-            // users can still see the exact timestamp if NTP is synced.
-            html += "<td title='" + s.getLastSeenString() + "'>";
-            html += formatRelativeMillis(nowMillis, h.lastOkAtMillis, h.hasLastOk);
-            html += "</td>";
-
-            // 24h column: minimal noise when healthy, loud when broken.
-            //   - no activity:       em-dash
-            //   - all OK:            plain count
-            //   - has rejections:    "<ok> · <reject> err" with reject part red+bold
-            html += "<td title='Last 24 h sliding window'>";
-            if (ok24h == 0 && rejected == 0)
-            {
-                html += "&mdash;";
-            }
-            else if (rejected == 0)
-            {
-                html += String(ok24h);
-            }
-            else
-            {
-                html += String(ok24h);
-                html += " &middot; <span style='color:#c0392b;font-weight:bold;'>";
-                html += String(rejected);
-                html += " err</span>";
-            }
-            html += "</td>";
-
-            html += "<td>";
-            html += "<a class='btn' href='/sensors/edit?index=" + String(idx) + "'>Edit</a> ";
-            html += "<a class='btn btn-delete' href='/sensors/delete?index=" + String(idx) + "&sn=" +
-                    formatSN(s.serialNumber) + "' onclick='return confirm(\"Are you sure you want to delete this sensor?\")'>Delete</a>";
-            html += "</td></tr>";
+            html += "<p>No sensors configured yet.</p>";
         }
-        html += "</table>";
-    }
-
-    html += "<p><a class='btn' href='/sensors/add'>Add New Sensor</a></p>";
-    html += "</div>";
-
-    // Generation 2 sensors (protocol v2): identity and what they reported
-    const unsigned long now = millis();
-    html += "<div class='card'><h2>Generation 2 Sensors</h2>";
-    {
-        // Downlink duty cycle of the gateway (869.525 MHz, 10 % = 360 s per hour)
-        RadioTask::Stats rs = RadioTask::stats();
-        bool high = (uint64_t)rs.dutyUsedMs * 100 >= 360000ULL * 80;
-        html += "<p><small>Downlink duty cycle: " + String(rs.dutyUsedMs / 1000.0f, 1) +
-                " s of 360 s in the last hour (JOIN_ACC " + String(rs.joinUsedMs / 1000.0f, 1) + " s); responses RX1 " +
-                String(rs.txRx1) + ", RX2 " + String(rs.txRx2) + "</small>";
-        if (high)
+        else
         {
-            html += " <span style='color:#c0392b;'>above 80 % &ndash; only join answers once the data share is used "
-                    "up</span>";
+            html += "<table><tr>"
+                    "<th>Name</th><th>Type</th><th>Serial</th>"
+                    "<th>Status</th><th>Last Seen</th><th>24h</th><th>Actions</th></tr>";
         }
-        html += "</p>";
     }
-    if (gen2.empty())
+    else if (part < 2 + entries)
     {
-        html += "<p>No generation 2 sensors added yet.</p>";
-    }
-    else
-    {
-        html += "<table><tr><th>Name</th><th>DevID</th><th>Key</th><th>Reported</th>"
-                "<th>Last heard</th><th>Counters</th><th>Actions</th></tr>";
-        for (const Gen2Sensor &g : gen2)
-        {
-            // The label key is the root secret: only its first 4 hex digits,
-            // enough to tell which label was entered
-            char id[9], key[16];
-            snprintf(id, sizeof(id), "%08lX", (unsigned long)g.devId);
-            snprintf(key, sizeof(key), "%02X%02X&hellip;", g.label[0], g.label[1]);
-            html += "<tr><td>" + htmlEscape(g.name) + "</td><td><code>" + String(id) + "</code></td>";
-            html += "<td><code>" + String(key) + "</code></td><td>";
-            if (g.hasFw)
-            {
-                html += "HW " + String(g.hwType) + ", FW " + String(g.fwMajor) + "." + String(g.fwMinor) + "." +
-                        String(g.fwPatch);
-                if (g.bootState != 0xFF && g.bootState != 0)
-                {
-                    html += "<br><small>" + bootStateText(g.bootState) + "</small>";
-                }
-                html += "<br>";
-            }
-            if (g.seen)
-            {
-                html += "<small>" + String(g.rssi) + " dBm, SNR " + String(g.snr, 1) +
-                        " dB, " + String(g.freqError / 1000.0f, 1) + " kHz</small>";
-                if (g.temperature != INT16_MIN)
-                {
-                    html += "<br>" + String(g.temperature / 100.0f, 2) + " &deg;C";
-                }
-                if (g.humidity != 0xFFFF)
-                {
-                    html += ", " + String(g.humidity / 100.0f, 1) + " %";
-                }
-                if (g.batteryMv != 0xFFFF)
-                {
-                    html += ", " + String(g.batteryMv) + " mV";
-                }
-            }
-            else
-            {
-                html += "&mdash;";
-            }
-            html += "</td><td>" + formatRelativeMillis(now, g.lastSeenMs, g.seen);
-            if (g.seen)
-            {
-                html += "<br><small>devNonce " + String(g.lastJoinDevNonce) + "<br>";
-                html += g.sessionUp ? "session up, FCnt " + String(g.lastFcnt) : String("no session yet");
-                if (g.sessionUp && !Gen2Config::inSync(g.configVersion, g.cfgVersion))
-                {
-                    html += "<br><span style='color:#e67e22;'>config v" + String(g.cfgVersion) +
-                            " waiting for the sensor</span>";
-                }
-                if (g.downlinkRssi != INT8_MIN)
-                {
-                    html += "<br>downlink " + String(g.downlinkRssi) + " dBm at the sensor";
-                }
-                html += "</small>";
-            }
-            html += "</td><td><small>JOIN_REQ " + String(g.joinRequests) + "<br>MIC failed " +
-                    String(g.micFailures);
-            if (g.micFailures > 0 && g.joinRequests == 0)
-            {
-                html += " <span style='color:#c0392b;'>(wrong key, or paired with another gateway?)</span>";
-            }
-            html += "<br>replayed " + String(g.replayedJoins) + "<br>UP " + String(g.upFrames) + ", w/o session " +
-                    String(g.upWithoutSession) + "<br>JOIN_ACC " + String(g.joinAccepts) + ", REJOIN " +
-                    String(g.rejoins) + "<br>DOWN RX1 " + String(g.downRx1) + ", RX2 " + String(g.downRx2) +
-                    ", not sent " + String(g.downNotSent) + "</small></td>";
-            html += "<td><a class='btn' href='/sensors/gen2?devId=" + String(id) + "'>Details</a> ";
-            html += "<form method='post' action='/sensors/delete2' style='display:inline' "
-                    "onsubmit='return confirm(\"Delete this generation 2 sensor?\")'><input type='hidden' "
-                    "name='devId' value='" + String(id) + "'><button type='submit' class='btn-delete'>Delete</button>"
-                    "</form></td></tr>";
-        }
-        html += "</table>";
-    }
-    html += "<p><a class='btn' href='/sensors/add2'>Add Generation 2 Sensor</a></p>";
+        // Every row computes deltas against the same 'now' (the snapshot's).
+        // millis() can wrap every ~50 days but unsigned subtraction in
+        // formatRelativeMillis handles that correctly.
+        const ActiveSensorEntry &entry = view.entries[part - 2];
+        html.reserve(1024);
+        const auto &s = entry.data;
+        size_t idx    = entry.index;
+        const auto &h = s.health;
 
-    html += "<h3>Waiting to be added</h3>";
-    if (waitingCount == 0)
-    {
-        html += "<p><small>No unknown generation 2 sensors heard (a sensor appears here after two "
-                "consistent join requests).</small></p>";
-    }
-    else
-    {
-        html += "<table><tr><th>DevID</th><th>HW / FW</th><th>RSSI</th><th>Requests</th><th>Last heard</th>"
-                "<th></th></tr>";
-        for (size_t i = 0; i < waitingCount; i++)
+        uint32_t ok24h     = SensorHealth::okLast24h(h);
+        uint32_t rejected  = SensorHealth::rejectedLast24h(h);
+
+        html += "<tr>";
+        html += "<td>" + htmlEscape(s.name) + "</td>";
+        html += "<td>" + sensorTypeToString(s.deviceType) + "</td>";
+        html += "<td>" + formatSN(s.serialNumber) + "</td>";
+
+        // Status: badge + optional last reject reason on the line below
+        html += "<td>";
+        html += renderHealthBadge(h, view.nowMillis);
+        if (h.hasLastReject && h.consecutiveRejections > 0)
         {
-            const WaitingEntry &w = waiting[i];
-            char id[9];
-            snprintf(id, sizeof(id), "%08lX", (unsigned long)w.devId);
-            html += "<tr><td><code>" + String(id) + "</code></td><td>HW " + String(w.hwType) + ", FW " +
-                    String(w.fwMajor) + "." + String(w.fwMinor) + "." + String(w.fwPatch) + "</td><td>" +
-                    String(w.rssi) + " dBm</td><td>" + String(w.frames) + "</td><td>" +
-                    formatRelativeMillis(now, w.lastSeenMs, true) + "</td>";
-            html += "<td><a class='btn' href='/sensors/add2?devId=" + String(id) + "'>Add</a></td></tr>";
+            html += "<br><small style='color:#c0392b;'>";
+            html += "last reject: ";
+            html += htmlEscape(String(h.lastRejectReason));
+            html += " (";
+            html += formatRelativeMillis(view.nowMillis, h.lastRejectAtMillis, true);
+            html += ")</small>";
         }
-        html += "</table><p><small>Join requests are not authenticated until the label key is entered: "
-                "compare the DevID with the label.</small></p>";
+        html += "</td>";
+
+        // Last seen: prefer relative form derived from our millis snapshot;
+        // the wall-clock form (getLastSeenString) is kept as a tooltip so
+        // users can still see the exact timestamp if NTP is synced.
+        html += "<td title='" + s.getLastSeenString() + "'>";
+        html += formatRelativeMillis(view.nowMillis, h.lastOkAtMillis, h.hasLastOk);
+        html += "</td>";
+
+        // 24h column: minimal noise when healthy, loud when broken.
+        //   - no activity:       em-dash
+        //   - all OK:            plain count
+        //   - has rejections:    "<ok> · <reject> err" with reject part red+bold
+        html += "<td title='Last 24 h sliding window'>";
+        if (ok24h == 0 && rejected == 0)
+        {
+            html += "&mdash;";
+        }
+        else if (rejected == 0)
+        {
+            html += String(ok24h);
+        }
+        else
+        {
+            html += String(ok24h);
+            html += " &middot; <span style='color:#c0392b;font-weight:bold;'>";
+            html += String(rejected);
+            html += " err</span>";
+        }
+        html += "</td>";
+
+        html += "<td>";
+        html += "<a class='btn' href='/sensors/edit?index=" + String(idx) + "'>Edit</a> ";
+        html += "<a class='btn btn-delete' href='/sensors/delete?index=" + String(idx) + "&sn=" +
+                formatSN(s.serialNumber) + "' onclick='return confirm(\"Are you sure you want to delete this sensor?\")'>Delete</a>";
+        html += "</td></tr>";
     }
-    html += "</div>";
-    addHtmlFooter(html);
+    else if (part == 2 + entries)
+    {
+        if (entries > 0)
+        {
+            html += "</table>";
+        }
+        html += "<p><a class='btn' href='/sensors/add'>Add New Sensor</a></p>";
+        html += "</div>";
+
+        // Generation 2 sensors (protocol v2): identity and what they reported
+        html += "<div class='card'><h2>Generation 2 Sensors</h2>";
+        {
+            // Downlink duty cycle of the gateway (869.525 MHz, 10 % = 360 s per hour)
+            RadioTask::Stats rs = RadioTask::stats();
+            bool high = (uint64_t)rs.dutyUsedMs * 100 >= 360000ULL * 80;
+            html += "<p><small>Downlink duty cycle: " + String(rs.dutyUsedMs / 1000.0f, 1) +
+                    " s of 360 s in the last hour (JOIN_ACC " + String(rs.joinUsedMs / 1000.0f, 1) + " s); responses RX1 " +
+                    String(rs.txRx1) + ", RX2 " + String(rs.txRx2) + "</small>";
+            if (high)
+            {
+                html += " <span style='color:#c0392b;'>above 80 % &ndash; only join answers once the data share is used "
+                        "up</span>";
+            }
+            html += "</p>";
+        }
+        if (gen2 == 0)
+        {
+            html += "<p>No generation 2 sensors added yet.</p>";
+        }
+        else
+        {
+            html += "<table><tr><th>Name</th><th>DevID</th><th>Key</th><th>Reported</th>"
+                    "<th>Last heard</th><th>Counters</th><th>Actions</th></tr>";
+        }
+    }
+    else if (part < 3 + entries + gen2)
+    {
+        const Gen2Sensor &g = view.gen2[part - 3 - entries];
+        html.reserve(1536);
+        // The label key is the root secret: only its first 4 hex digits,
+        // enough to tell which label was entered
+        char id[9], key[16];
+        snprintf(id, sizeof(id), "%08lX", (unsigned long)g.devId);
+        snprintf(key, sizeof(key), "%02X%02X&hellip;", g.label[0], g.label[1]);
+        html += "<tr><td>" + htmlEscape(g.name) + "</td><td><code>" + String(id) + "</code></td>";
+        html += "<td><code>" + String(key) + "</code></td><td>";
+        if (g.hasFw)
+        {
+            html += "HW " + String(g.hwType) + ", FW " + String(g.fwMajor) + "." + String(g.fwMinor) + "." +
+                    String(g.fwPatch);
+            if (g.bootState != 0xFF && g.bootState != 0)
+            {
+                html += "<br><small>" + bootStateText(g.bootState) + "</small>";
+            }
+            html += "<br>";
+        }
+        if (g.seen)
+        {
+            html += "<small>" + String(g.rssi) + " dBm, SNR " + String(g.snr, 1) +
+                    " dB, " + String(g.freqError / 1000.0f, 1) + " kHz</small>";
+            if (g.temperature != INT16_MIN)
+            {
+                html += "<br>" + String(g.temperature / 100.0f, 2) + " &deg;C";
+            }
+            if (g.humidity != 0xFFFF)
+            {
+                html += ", " + String(g.humidity / 100.0f, 1) + " %";
+            }
+            if (g.batteryMv != 0xFFFF)
+            {
+                html += ", " + String(g.batteryMv) + " mV";
+            }
+        }
+        else
+        {
+            html += "&mdash;";
+        }
+        html += "</td><td>" + formatRelativeMillis(view.nowMillis, g.lastSeenMs, g.seen);
+        if (g.seen)
+        {
+            html += "<br><small>devNonce " + String(g.lastJoinDevNonce) + "<br>";
+            html += g.sessionUp ? "session up, FCnt " + String(g.lastFcnt) : String("no session yet");
+            if (g.sessionUp && !Gen2Config::inSync(g.configVersion, g.cfgVersion))
+            {
+                html += "<br><span style='color:#e67e22;'>config v" + String(g.cfgVersion) +
+                        " waiting for the sensor</span>";
+            }
+            if (g.downlinkRssi != INT8_MIN)
+            {
+                html += "<br>downlink " + String(g.downlinkRssi) + " dBm at the sensor";
+            }
+            html += "</small>";
+        }
+        html += "</td><td><small>JOIN_REQ " + String(g.joinRequests) + "<br>MIC failed " +
+                String(g.micFailures);
+        if (g.micFailures > 0 && g.joinRequests == 0)
+        {
+            html += " <span style='color:#c0392b;'>(wrong key, or paired with another gateway?)</span>";
+        }
+        html += "<br>replayed " + String(g.replayedJoins) + "<br>UP " + String(g.upFrames) + ", w/o session " +
+                String(g.upWithoutSession) + "<br>JOIN_ACC " + String(g.joinAccepts) + ", REJOIN " +
+                String(g.rejoins) + "<br>DOWN RX1 " + String(g.downRx1) + ", RX2 " + String(g.downRx2) +
+                ", not sent " + String(g.downNotSent) + "</small></td>";
+        html += "<td><a class='btn' href='/sensors/gen2?devId=" + String(id) + "'>Details</a> ";
+        html += "<form method='post' action='/sensors/delete2' style='display:inline' "
+                "onsubmit='return confirm(\"Delete this generation 2 sensor?\")'><input type='hidden' "
+                "name='devId' value='" + String(id) + "'><button type='submit' class='btn-delete'>Delete</button>"
+                "</form></td></tr>";
+    }
+    else if (part == 3 + entries + gen2)
+    {
+        html.reserve(3072);
+        if (gen2 > 0)
+        {
+            html += "</table>";
+        }
+        html += "<p><a class='btn' href='/sensors/add2'>Add Generation 2 Sensor</a></p>";
+
+        html += "<h3>Waiting to be added</h3>";
+        if (view.waitingCount == 0)
+        {
+            html += "<p><small>No unknown generation 2 sensors heard (a sensor appears here after two "
+                    "consistent join requests).</small></p>";
+        }
+        else
+        {
+            html += "<table><tr><th>DevID</th><th>HW / FW</th><th>RSSI</th><th>Requests</th><th>Last heard</th>"
+                    "<th></th></tr>";
+            for (size_t i = 0; i < view.waitingCount; i++)
+            {
+                const WaitingEntry &w = view.waiting[i];
+                char id[9];
+                snprintf(id, sizeof(id), "%08lX", (unsigned long)w.devId);
+                html += "<tr><td><code>" + String(id) + "</code></td><td>HW " + String(w.hwType) + ", FW " +
+                        String(w.fwMajor) + "." + String(w.fwMinor) + "." + String(w.fwPatch) + "</td><td>" +
+                        String(w.rssi) + " dBm</td><td>" + String(w.frames) + "</td><td>" +
+                        formatRelativeMillis(view.nowMillis, w.lastSeenMs, true) + "</td>";
+                html += "<td><a class='btn' href='/sensors/add2?devId=" + String(id) + "'>Add</a></td></tr>";
+            }
+            html += "</table><p><small>Join requests are not authenticated until the label key is entered: "
+                    "compare the DevID with the label.</small></p>";
+        }
+        html += "</div>";
+    }
+    else if (part == 4 + entries + gen2)
+    {
+        html.reserve(3840);
+        addHtmlFooter(html);
+    }
     return html;
 }
 

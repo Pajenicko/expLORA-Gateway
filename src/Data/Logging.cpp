@@ -26,10 +26,8 @@
 
 // Initialization of static variables
 LogLevel Logger::currentLevel = LogLevel::INFO;
-LogEntry *Logger::logBuffer = nullptr;
-size_t Logger::logBufferSize = LOG_BUFFER_SIZE;
-size_t Logger::logIndex = 0;
-size_t Logger::logCount = 0;
+LogRing Logger::ring;
+uint8_t *Logger::ringBuffer = nullptr;
 std::mutex Logger::logMutex;
 bool Logger::initialized = false;
 
@@ -41,7 +39,7 @@ void Logger::setTimeInitialized(bool initialized)
 }
 
 // Logger initialization
-bool Logger::init(size_t bufferSize)
+bool Logger::init(size_t ringBytes)
 {
     // If already initialized, first free the memory
     if (initialized)
@@ -49,34 +47,22 @@ bool Logger::init(size_t bufferSize)
         deinit();
     }
 
-    logBufferSize = bufferSize;
-
-    logBuffer = new LogEntry[logBufferSize];
-    Serial.printf("Logger: Allocated %u bytes in RAM for logs\n", sizeof(LogEntry) * logBufferSize);
-
-    // Check if memory allocation was successful
-    if (logBuffer == nullptr)
+    ringBuffer = static_cast<uint8_t *>(malloc(ringBytes));
+    if (ringBuffer == nullptr)
     {
         Serial.println("Logger: Failed to allocate memory for logs");
         return false;
     }
-
-    // Reset indexes and log count
-    logIndex = 0;
-    logCount = 0;
-    initialized = true;
-
-    // Pre-reserve capacity for messages to keep heap usage stable over time
-    for (size_t i = 0; i < logBufferSize; ++i)
+    Serial.printf("Logger: Allocated %u bytes in RAM for logs\n", (unsigned)ringBytes);
     {
-        logBuffer[i].message.reserve(LOG_MESSAGE_CAPACITY);
-        logBuffer[i].formattedTime.reserve(LOG_TIME_CAPACITY);
+        std::lock_guard<std::mutex> lock(logMutex);
+        ring.init(ringBuffer, ringBytes);
     }
+    initialized = true;
 
     // First log after initialization - use char[] instead of String concat
     char initMsg[64];
-    snprintf(initMsg, sizeof(initMsg), "Logging system initialized with %u entries",
-             logBufferSize);
+    snprintf(initMsg, sizeof(initMsg), "Logging system initialized with a %u B ring", (unsigned)ringBytes);
     info(initMsg);
 
     return true;
@@ -90,11 +76,9 @@ void Logger::deinit()
 
     std::lock_guard<std::mutex> lock(logMutex);
 
-    if (logBuffer != nullptr)
-    {
-        delete[] logBuffer;
-        logBuffer = nullptr;
-    }
+    ring.init(nullptr, 0);
+    free(ringBuffer);
+    ringBuffer = nullptr;
 
     initialized = false;
 }
@@ -112,23 +96,25 @@ LogLevel Logger::getLogLevel()
     return currentLevel;
 }
 
-// Get timestamp
-String Logger::getTimeStamp()
+// Local time of an entry
+LogRing::Time Logger::getTime()
 {
-    char timeBuffer[32]; // per call: logged from several tasks
-
+    LogRing::Time t;
     if (timeInitialized)
     {
         struct tm timeinfo;
-        if (getLocalTime(&timeinfo, 0))
+        if (getLocalTime(&timeinfo, 0) && timeinfo.tm_year >= 100 && timeinfo.tm_year <= 355)
         {
-            strftime(timeBuffer, sizeof(timeBuffer), "%Y-%m-%d %H:%M:%S", &timeinfo);
-            return String(timeBuffer);
+            t.valid = true;
+            t.year = (uint16_t)(timeinfo.tm_year + 1900);
+            t.month = (uint8_t)(timeinfo.tm_mon + 1);
+            t.day = (uint8_t)timeinfo.tm_mday;
+            t.hour = (uint8_t)timeinfo.tm_hour;
+            t.minute = (uint8_t)timeinfo.tm_min;
+            t.second = (uint8_t)timeinfo.tm_sec;
         }
     }
-
-    // Time not set - use simple static string
-    return String("[Time not set]");
+    return t;
 }
 
 // Add log with specified level
@@ -140,8 +126,9 @@ void Logger::log(LogLevel level, const String &message)
     }
 
     // Get timestamp only once
-    String timeStamp = getTimeStamp();
-    // String timeStamp = "[Time not set]";
+    LogRing::Time t = getTime();
+    char timeStamp[LogRing::TIME_TEXT];
+    LogRing::formatTime(t, timeStamp);
 
     // Print to serial port
     Serial.print(timeStamp);
@@ -152,37 +139,17 @@ void Logger::log(LogLevel level, const String &message)
 
     std::lock_guard<std::mutex> lock(logMutex);
 
-    if (logBuffer != nullptr)
+    // Store a capped version (the last 3 chars become an ellipsis)
+    if ((size_t)message.length() > LOG_MESSAGE_CAPACITY)
     {
-        logBuffer[logIndex].timestamp = millis();
-        logBuffer[logIndex].level = level;
-        // Store a capped version to ensure we never exceed reserved capacity
-        if ((size_t)message.length() > LOG_MESSAGE_CAPACITY)
-        {
-            // Keep the last 3 chars for ellipsis
-            String tmp = message.substring(0, LOG_MESSAGE_CAPACITY - 3);
-            tmp += F("...");
-            logBuffer[logIndex].message = tmp;
-        }
-        else
-        {
-            logBuffer[logIndex].message = message;
-        }
-        // Formatted time is small; still ensure it won't exceed reserved capacity
-        if ((size_t)timeStamp.length() > LOG_TIME_CAPACITY)
-        {
-            logBuffer[logIndex].formattedTime = timeStamp.substring(0, LOG_TIME_CAPACITY);
-        }
-        else
-        {
-            logBuffer[logIndex].formattedTime = timeStamp;
-        }
-
-        logIndex = (logIndex + 1) % logBufferSize;
-        if (logCount < logBufferSize)
-        {
-            logCount++;
-        }
+        // On the heap: logged from tasks with small stacks too
+        String capped = message.substring(0, LOG_MESSAGE_CAPACITY - 3);
+        capped += F("...");
+        ring.push((uint8_t)level, t, capped.c_str(), capped.length());
+    }
+    else
+    {
+        ring.push((uint8_t)level, t, message.c_str(), message.length());
     }
 }
 
@@ -214,12 +181,21 @@ void Logger::verbose(const String &message)
 
 bool Logger::copyNewest(size_t n, LogEntry &out)
 {
-    std::lock_guard<std::mutex> lock(logMutex);
-    if (logBuffer == nullptr || n >= logCount)
+    uint8_t level;
+    char time[LogRing::TIME_TEXT];
+    char msg[LOG_MESSAGE_CAPACITY + 1];
+    size_t len;
     {
-        return false;
+        std::lock_guard<std::mutex> lock(logMutex);
+        if (!ring.get(n, level, time, msg, sizeof(msg), len))
+        {
+            return false;
+        }
     }
-    out = logBuffer[(logIndex + logBufferSize - 1 - n) % logBufferSize];
+    out.level = (LogLevel)level;
+    out.formattedTime = time;
+    out.message = String();
+    out.message.concat(msg, len < sizeof(msg) ? len : sizeof(msg) - 1);
     return true;
 }
 
@@ -227,17 +203,7 @@ bool Logger::copyNewest(size_t n, LogEntry &out)
 void Logger::clearLogs()
 {
     std::lock_guard<std::mutex> lock(logMutex);
-
-    // Explicitly clear all String objects
-    for (size_t i = 0; i < logBufferSize; i++)
-    {
-        // Force String deallocation by assigning empty strings
-        logBuffer[i].message = String();
-        logBuffer[i].formattedTime = String();
-    }
-
-    logIndex = 0;
-    logCount = 0;
+    ring.clear();
 }
 
 // Convert log level from string

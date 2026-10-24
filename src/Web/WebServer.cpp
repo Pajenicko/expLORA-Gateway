@@ -20,6 +20,7 @@
  */
 
 #include "WebServer.h"
+#include "../Hardware/Liveness.h"
 #include "HTMLGenerator.h"
 #include "../Data/TimeZones.h"
 #include <WiFi.h>
@@ -37,10 +38,12 @@
 #include <NetworkClientSecure.h>
 #include "../config.h"
 #include "../Hardware/WatchdogPause.h"
+#include "../Hardware/HeapGuard.h"
 #include "../Hardware/FlashPermit.h"
 #include "../Hardware/RadioTask.h"
 #include "../Storage/OtaStore.h"
 #include <sys/time.h>
+#include <atomic>
 
 // OTA flash access under the flash write permit (a pending radio response
 // is not delayed by erasing / programming the app partition)
@@ -48,6 +51,23 @@ static bool otaBegin(size_t size)
 {
     FlashWriteGuard guard;
     return Update.begin(size);
+}
+
+// Why Update.begin() failed. Error 0 has two causes in the library: an
+// update already running, or its 4 kB sector buffer not allocated (short
+// heap; _size stays 0 then)
+static String otaBeginError()
+{
+    if (Update.getError())
+    {
+        return "Update.begin failed: " + String(Update.getError());
+    }
+    if (Update.isRunning())
+    {
+        return "Update.begin failed: another update is in progress";
+    }
+    return String("Update.begin failed: not enough memory, try again (") +
+           heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) + " B largest free block)";
 }
 
 static size_t otaWrite(uint8_t *data, size_t len)
@@ -67,9 +87,38 @@ static bool otaEnd(bool evenIfRemaining = false)
 // (declared extern in scripts/patch_asyncwebserver.py)
 extern const char EXPLORA_REJECT_ATTR[] = "explora_reject";
 
+// Counted by the patched libraries (scripts/patch_asyncwebserver.py), shown
+// in /diag/heap: connections reset at accept and requests dropped while
+// being received because the 8-bit heap was short (or deadline / size limit).
+// recvDeferred counts each delivery of incoming data that lwIP had to keep
+// because the heap was short. Atomic: accept and the deferral run on the
+// lwIP thread, the receive gate in the AsyncTCP task, /diag/heap reads them
+// from the AsyncTCP task
+std::atomic<uint32_t> exploraAcceptRefused{0};
+std::atomic<uint32_t> exploraRecvDeferred{0};
+// Events the AsyncTCP queue (64) could not take at once and kept in order
+// behind it (lwIP thread)
+std::atomic<uint32_t> exploraQueueOverflow{0};
+// Longest the overflow list got; events lost (malloc failed and no reserve
+// packet / queue gone: FIN, ERROR, SENT)
+std::atomic<uint32_t> exploraQueueOverflowHigh{0};
+std::atomic<uint32_t> exploraEventLost{0};
+std::atomic<uint32_t> exploraReceiveDropped{0};
+
+// Set on a request whose handler installs its own request->onDisconnect
+// (the uploads). The library keeps one disconnect callback per request:
+// rejectLowMemory() must not replace it, nor be replaced by it
+static const char OWN_DISCONNECT_ATTR[] = "explora_own_disconnect";
+
 // Requests whose body would be parsed into RAM are limited (the body is read
 // before the login middleware runs); firmware uploads are streamed instead
 static constexpr size_t MAX_REQUEST_BODY = 4096; // largest real form ~1 kB
+
+// Receive timeout of a logged-in upload (the library sets 3 s per
+// connection): longer than a heap shortage lasts under load (the Pro
+// recovers within ~3 s after attacks.py "6 big held"); a longer silence
+// closes the connection and the upload is aborted with an error
+static constexpr uint32_t UPLOAD_RX_TIMEOUT_S = 30;
 
 class OversizeRequestHandler : public AsyncWebHandler
 {
@@ -90,6 +139,13 @@ public:
                       request->contentType().startsWith("multipart/form-data");
         if (upload && auth.hasPassword() && auth.isAuthorized(request))
         {
+            // The patched AsyncTCP defers incoming data while the 8-bit heap
+            // is short (scripts/patch_asyncwebserver.py, _tcp_recv); deferred
+            // data does not refresh the client's rx timestamp, so the
+            // library's 3 s rx timeout would reset an upload during a short
+            // heap. A logged-in upload gets UPLOAD_RX_TIMEOUT_S instead (set
+            // in the AsyncTCP task, which also runs the timeout check)
+            request->client()->setRxTimeout(UPLOAD_RX_TIMEOUT_S);
             return false;
         }
         // The library would still receive the whole body before answering:
@@ -543,7 +599,163 @@ void WebPortal::restart()
     init();
 }
 
+// Sensor changes are refused up front while sensors.json was loaded only
+// in part (SensorManager::savesBlocked): nothing is changed in RAM, so a
+// delete does not look done and come back after the restart, and the other
+// failure messages (list full, serial in use) stay accurate
+static bool rejectBlockedSave(SensorManager &sm, AsyncWebServerRequest *request)
+{
+    if (!sm.savesBlocked())
+    {
+        return false;
+    }
+    request->send(503, "text/plain",
+                  "Not saved: the sensor configuration was loaded only in part at boot (not enough memory) - "
+                  "saving would drop sensors. Restart the gateway.");
+    return true;
+}
+
 // Process HTTP requests
+
+// Heavy responses (pages, /api) running now, and the refusals. Only the
+// AsyncTCP task touches them: handlers and the disconnect callback. A slot
+// is freed by the request's onDisconnect - or after HEAVY_SLOT_EXPIRY_MS:
+// every request is closed after 30 s (patch_asyncwebserver.py
+// MAX_REQUEST_LIFETIME_MS), so an older slot belongs to a request whose
+// disconnect never came (its connection's last event lost) and would hold
+// the slot until a restart
+static constexpr uint32_t HEAVY_SLOT_EXPIRY_MS = 45000;
+struct HeavySlot
+{
+    AsyncWebServerRequest *request;
+    uint32_t since;
+};
+static HeavySlot heavySlots[WEB_HEAVY_RESPONSES_MAX];
+static std::atomic<unsigned> heavyActive{0};
+static std::atomic<uint32_t> heavyRefusedBusy{0};
+static std::atomic<uint32_t> heavyRefusedLow{0};
+static std::atomic<uint32_t> heavyExpired{0};
+
+static void heavyExpire()
+{
+    unsigned active = 0;
+    for (auto &slot : heavySlots)
+    {
+        if (slot.request && millis() - slot.since >= HEAVY_SLOT_EXPIRY_MS)
+        {
+            slot.request = nullptr;
+            heavyExpired++;
+            log_e("heavy response slot expired (disconnect never came)");
+        }
+        active += slot.request != nullptr;
+    }
+    heavyActive = active;
+}
+
+// Pages and /api: refused with 503 while WEB_HEAVY_RESPONSES_MAX of them
+// run or the usable (8-bit) heap is short (HeapGuard::admit), so pages never
+// take the memory the rest of the system or an mbedTLS session (URL OTA
+// download, update check) needs. peak = the request's transient heap use,
+// block = its largest single allocation. An admitted request holds its slot
+// until its connection closes (the request and its response are destroyed
+// then) through request->onDisconnect: a handler that calls this must never
+// set its own onDisconnect (it would replace this one and leak the slot),
+// and a request that has one (OWN_DISCONNECT_ATTR, the uploads) is not
+// counted here
+static bool rejectLowMemory(AsyncWebServerRequest *request, size_t peak, size_t block)
+{
+    if (request->hasAttribute(OWN_DISCONNECT_ATTR))
+    {
+        log_e("rejectLowMemory on a request with its own onDisconnect - not counted");
+        return false;
+    }
+    heavyExpire();
+    HeapGuard::Admit admit =
+        HeapGuard::admit(HeapGuard::usable(), peak, block, heavyActive.load(), WEB_HEAVY_RESPONSES_MAX);
+    if (admit == HeapGuard::Admit::Busy)
+    {
+        heavyRefusedBusy++;
+        request->send(503, "text/plain", "Busy, try again");
+        return true;
+    }
+    if (admit == HeapGuard::Admit::LowMemory)
+    {
+        heavyRefusedLow++;
+        request->send(503, "text/plain", "Low memory, try again");
+        return true;
+    }
+    for (auto &slot : heavySlots)
+    {
+        if (!slot.request)
+        {
+            slot.request = request;
+            slot.since = millis();
+            break;
+        }
+    }
+    heavyActive++;
+    request->onDisconnect([request]() {
+        for (auto &slot : heavySlots)
+        {
+            if (slot.request == request)
+            {
+                slot.request = nullptr;
+                heavyActive--;
+                break;
+            }
+        }
+    });
+    return false;
+}
+
+// Page built as one String and sent with send()
+static size_t stringPagePeak(size_t pageSize)
+{
+    return HeapGuard::stringPagePeak(pageSize);
+}
+
+// Page streamed piece by piece (chunked): only the piece being sent is in
+// RAM, never the whole page nor send()'s copy of it. piece(i) for i in
+// 0 .. parts - 1 runs in the AsyncTCP task when the connection has room; it
+// may return an empty piece. It must work on data copied beforehand (no
+// lock held across pieces)
+static void sendStreamed(AsyncWebServerRequest *request, size_t parts, std::function<String(size_t)> piece,
+                         bool noStore = false, int code = 200)
+{
+    struct Stream
+    {
+        std::function<String(size_t)> piece;
+        size_t parts;
+        String pending;
+        size_t offset = 0;
+        size_t part = 0;
+    };
+    auto state = std::make_shared<Stream>();
+    state->piece = std::move(piece);
+    state->parts = parts;
+    AsyncWebServerResponse *response = request->beginChunkedResponse(
+        "text/html", [state](uint8_t *buffer, size_t maxLen, size_t) -> size_t
+        {
+            while (state->offset >= state->pending.length())
+            {
+                if (state->part >= state->parts)
+                {
+                    return 0;
+                }
+                state->offset = 0;
+                state->pending = state->piece(state->part++);
+            }
+            size_t n = std::min(maxLen, state->pending.length() - state->offset);
+            memcpy(buffer, state->pending.c_str() + state->offset, n);
+            state->offset += n;
+            return n; });
+    response->setCode(code);
+    if (noStore)
+    {
+        response->addHeader("Cache-Control", "no-store");
+    }
+    request->send(response);
+}
 
 // Root page
 void WebPortal::handleRoot(AsyncWebServerRequest *request)
@@ -558,6 +770,10 @@ void WebPortal::handleRoot(AsyncWebServerRequest *request)
 
     // Get list of sensors
     std::vector<SensorData> sensorsList = sensorManager.getActiveSensors();
+
+    // ~4 kB plus a table row (~250 bytes) per sensor
+    size_t pageSize = 4096 + 250 * sensorsList.size();
+    if (rejectLowMemory(request, stringPagePeak(pageSize), pageSize)) return;
 
     // Generate HTML
     String html = HTMLGenerator::generateHomePage(sensorsList);
@@ -590,6 +806,8 @@ void WebPortal::handleConfig(AsyncWebServerRequest *request)
         request->redirect("/network");
         return;
     }
+
+    if (rejectLowMemory(request, stringPagePeak(8192), 8192)) return;
 
     String currentIP = isAPMode ? uplink->getApIP().toString() : uplink->getLocalIP().toString();
 
@@ -666,24 +884,43 @@ void WebPortal::handleConfigPost(AsyncWebServerRequest *request)
     // Through ConfigManager: both stores (file and Preferences) and atomic,
     // so nothing (the timezone) is overridden by a stale copy at boot
     logger.info("New WiFi configuration - SSID: " + newSsid);
-    String oldZoneName, oldZonePosix, oldZoneNamePosix;
+    bool saved;
     {
+        FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
         std::lock_guard<std::recursive_mutex> guard(configManager.mutex());
-        oldZoneName = configManager.timezoneName;
-        oldZonePosix = configManager.timezone;
-        oldZoneNamePosix = configManager.timezoneNamePosix;
+        String oldSsid = configManager.wifiSSID, oldPassword = configManager.wifiPassword;
+        bool oldConfigMode = configManager.configMode;
+        bool oldWifiEnabled = configManager.wifiEnabled;
+        unsigned long oldWifiAttempt = configManager.lastWifiAttempt;
+        String oldZoneName = configManager.timezoneName;
+        String oldZonePosix = configManager.timezone;
+        String oldZoneNamePosix = configManager.timezoneNamePosix;
         if (zone >= 0)
         {
             configManager.setTimezoneFields(zone);
         }
+        // New credentials are meant to be used: a switched-off WiFi would
+        // ignore them after the restart
+        configManager.wifiEnabled = true;
+        saved = configManager.setWiFiConfig(newSsid, newPassword);
+        if (!saved)
+        {
+            // Not applied: the running gateway keeps its network and zone.
+            // One store may hold the new values: write the old ones to both,
+            // so they agree (as ConfigManager::setTimezone does)
+            configManager.wifiSSID = oldSsid;
+            configManager.wifiPassword = oldPassword;
+            configManager.configMode = oldConfigMode;
+            configManager.wifiEnabled = oldWifiEnabled;
+            configManager.lastWifiAttempt = oldWifiAttempt;
+            configManager.timezoneName = oldZoneName;
+            configManager.timezone = oldZonePosix;
+            configManager.timezoneNamePosix = oldZoneNamePosix;
+            configManager.save();
+        }
     }
-    if (!configManager.setWiFiConfig(newSsid, newPassword))
+    if (!saved)
     {
-        // Not applied: the running gateway keeps its zone
-        std::lock_guard<std::recursive_mutex> guard(configManager.mutex());
-        configManager.timezoneName = oldZoneName;
-        configManager.timezone = oldZonePosix;
-        configManager.timezoneNamePosix = oldZoneNamePosix;
         request->send(500, "text/plain", "Failed to save configuration");
         return;
     }
@@ -707,9 +944,10 @@ void WebPortal::handleConfigPost(AsyncWebServerRequest *request)
 
 // Time zone from the network page: saved here, applied by the loop at once
 // (no restart). setenv() may rewrite the TZ string in place while a
-// localtime_r() reads it, so the switch happens in the loop task, where the
-// clock is read (log stamps, rain reset); a page rendered at that very moment
-// may still show the previous zone.
+// localtime_r() reads it; the switch happens in the loop task (rain reset,
+// most log stamps), but the clock is also read in this task (log stamps, the
+// network page clock) and by Uplink, so a local time computed at that very
+// moment may be wrong for that one call.
 void WebPortal::handleTimezonePost(AsyncWebServerRequest *request)
 {
     logger.debug("HTTP request: POST /timezone");
@@ -747,21 +985,34 @@ void WebPortal::handleSensors(AsyncWebServerRequest *request)
     logger.debug("HTTP request: GET /sensors");
     if (guardAPOnly(request)) return;
 
-    // Get list of sensors
-    std::vector<ActiveSensorEntry> sensorsList = sensorManager.getActiveSensorEntries();
-    std::vector<Gen2Sensor> gen2List = sensorManager.getGen2Sensors();
-    WaitingEntry waiting[8];
-    size_t waitingCount = sensorManager.getWaitingList(waiting, 8);
-
-    // Generate HTML
-    String html = HTMLGenerator::generateSensorsPage(sensorsList, gen2List, waiting, waitingCount);
-    for (Gen2Sensor &g : gen2List)
+    // Copied once (each list under its own lock), then streamed one row per
+    // piece: no lock across the callbacks, rows of one moment
+    auto view = std::make_shared<SensorsPageView>();
+    view->entries = sensorManager.getActiveSensorEntries();
+    view->gen2 = sensorManager.getGen2Sensors();
+    view->waitingCount = sensorManager.getWaitingList(view->waiting, 8);
+    view->nowMillis = millis();
+    // No key outlives this handler: the page shows only the first two bytes
+    // of a label key and no generation 1 key
+    for (Gen2Sensor &g : view->gen2)
     {
+        uint8_t shown[2] = {g.label[0], g.label[1]};
         g.wipeKeys();
+        g.label[0] = shown[0];
+        g.label[1] = shown[1];
+    }
+    for (ActiveSensorEntry &e : view->entries)
+    {
+        e.data.deviceKey = 0;
     }
 
-    // Send response (key fingerprints: never cached)
-    sendNoStore(request, 200, "text/html", html);
+    // Peak on top of the copy: one piece (a row ~1.5 kB, header / footer /
+    // waiting list < 4 kB) + the send buffer + the lwIP in-flight copy
+    if (rejectLowMemory(request, HeapGuard::STREAMED_PAGE_PEAK, HeapGuard::STREAMED_PAGE_BLOCK)) return;
+
+    // Key fingerprints: never cached
+    sendStreamed(request, HTMLGenerator::sensorsPageParts(*view),
+                 [view](size_t part) { return HTMLGenerator::generateSensorsPagePart(*view, part); }, true);
 }
 
 // Sensor add page
@@ -893,6 +1144,7 @@ void WebPortal::handleSensorAddPost(AsyncWebServerRequest *request)
 {
     logger.debug("HTTP request: POST /sensors/add");
     if (guardAPOnly(request)) return;
+    if (rejectBlockedSave(sensorManager, request)) return;
 
     SensorForm form;
     String error = parseSensorForm(request, form);
@@ -916,7 +1168,8 @@ void WebPortal::handleSensorAddPost(AsyncWebServerRequest *request)
     }
     if (index < 0)
     {
-        request->send(500, "text/plain", "Failed to add sensor (sensor list full, or the flash write failed - see Logs)");
+        request->send(500, "text/plain",
+                      "Failed to add sensor (sensor list full, or the flash write failed - see Logs)");
         return;
     }
 
@@ -937,6 +1190,7 @@ void WebPortal::handleSensorEdit(AsyncWebServerRequest *request)
     if (request->hasParam("index"))
     {
         int index = request->getParam("index")->value().toInt();
+        if (rejectLowMemory(request, stringPagePeak(8192), 8192)) return;
 
         SensorData sensor;
         if (sensorManager.getSensorCopy(index, sensor))
@@ -959,6 +1213,7 @@ void WebPortal::handleSensorEditPost(AsyncWebServerRequest *request)
 {
     logger.debug("HTTP request: POST /sensors/update");
     if (guardAPOnly(request)) return;
+    if (rejectBlockedSave(sensorManager, request)) return;
 
     int index = request->hasParam("index", true) ? request->getParam("index", true)->value().toInt() : -1;
     SensorData before;
@@ -1005,6 +1260,7 @@ void WebPortal::handleSensorDelete(AsyncWebServerRequest *request)
 {
     logger.debug("HTTP request: GET /sensors/delete");
     if (guardAPOnly(request)) return;
+    if (rejectBlockedSave(sensorManager, request)) return;
 
     // Check index parameter
     if (request->hasParam("index"))
@@ -1059,6 +1315,7 @@ void WebPortal::handleGen2AddPost(AsyncWebServerRequest *request)
 {
     logger.debug("HTTP request: POST /sensors/add2");
     if (guardAPOnly(request)) return;
+    if (rejectBlockedSave(sensorManager, request)) return;
     auto param = [request](const char *name)
     {
         String value = request->hasParam(name, true) ? request->getParam(name, true)->value() : String();
@@ -1096,6 +1353,11 @@ void WebPortal::handleGen2AddPost(AsyncWebServerRequest *request)
         request->send(409, "text/plain", "A generation 2 sensor with this DevID already exists");
         return;
     }
+    if (index == -4)
+    {
+        request->send(503, "text/plain", "Failed to add the sensor: not enough memory - try again later");
+        return;
+    }
     if (index < 0)
     {
         request->send(500, "text/plain",
@@ -1116,6 +1378,7 @@ void WebPortal::handleGen2Delete(AsyncWebServerRequest *request)
 {
     logger.debug("HTTP request: POST /sensors/delete2");
     if (guardAPOnly(request)) return;
+    if (rejectBlockedSave(sensorManager, request)) return;
     uint32_t devId = 0;
     if (gen2DevIdParam(request, true, devId))
     {
@@ -1129,6 +1392,25 @@ void WebPortal::handleGen2Delete(AsyncWebServerRequest *request)
 
 void WebPortal::sendGen2Detail(AsyncWebServerRequest *request, uint32_t devId, const String &message, int code)
 {
+    // After a POST the action is done and its result goes out without the
+    // admission check of GET /sensors/gen2. Built as one String (~9 kB) and
+    // streamed from it: send() copied it into the response, and with a
+    // fragmented heap (Pro after attacks.py, largest block ~15 kB) that copy
+    // failed - the answer was the status code with an empty body. Without
+    // room even for the String and the send buffers, the message alone
+    if (HeapGuard::admit(HeapGuard::usable(), 9000 + HeapGuard::STREAMED_PAGE_PEAK, 9000, 0, 1) !=
+        HeapGuard::Admit::Ok)
+    {
+        if (message.length() > 0)
+        {
+            request->send(code, "text/plain", message + " (low memory: reload the page for details)");
+        }
+        else
+        {
+            request->send(503, "text/plain", "Low memory, try again");
+        }
+        return;
+    }
     // The page copy lives only for the generation (one sensor, ~600 bytes)
     std::unique_ptr<Gen2Sensor> g(new (std::nothrow) Gen2Sensor());
     if (!g || !sensorManager.getGen2Sensor(devId, *g))
@@ -1158,9 +1440,9 @@ void WebPortal::sendGen2Detail(AsyncWebServerRequest *request, uint32_t devId, c
         ota->now.us = esp_timer_get_time();
         ota->now.uptimeS = (uint32_t)(ota->now.us / 1000000); // uptime deadlines (Resume of a battery hold)
     }
-    String html = HTMLGenerator::generateGen2DetailPage(*g, message, ota.get());
+    auto page = std::make_shared<String>(HTMLGenerator::generateGen2DetailPage(*g, message, ota.get()));
     g->wipeKeys();
-    sendNoStore(request, code, "text/html", html);
+    sendStreamed(request, 1, [page](size_t) { return std::move(*page); }, true, code);
 }
 
 void WebPortal::handleGen2Detail(AsyncWebServerRequest *request)
@@ -1173,6 +1455,9 @@ void WebPortal::handleGen2Detail(AsyncWebServerRequest *request)
         request->send(400, "text/plain", "DevID missing");
         return;
     }
+    // Only the plain view: after a POST the action is done, its result page
+    // is sent whatever the heap
+    if (rejectLowMemory(request, stringPagePeak(9000), 9000)) return;
     sendGen2Detail(request, devId, "");
 }
 
@@ -1180,6 +1465,7 @@ void WebPortal::handleGen2Config(AsyncWebServerRequest *request)
 {
     logger.debug("HTTP request: POST /sensors/gen2/config");
     if (guardAPOnly(request)) return;
+    if (rejectBlockedSave(sensorManager, request)) return;
     uint32_t devId = 0;
     if (!gen2DevIdParam(request, true, devId))
     {
@@ -1233,10 +1519,10 @@ void WebPortal::handleGen2Config(AsyncWebServerRequest *request)
         return;
     }
     int result = sensorManager.setGen2Config(devId, v);
-    const char *msg = result == 1   ? "Saved - waiting for the sensor (sent with its next uplink)"
-                      : result == 0 ? "Nothing changed"
-                                    : "Not saved: flash write failed (see Logs)";
-    sendGen2Detail(request, devId, msg, result >= 0 ? 200 : 500);
+    String msg = result == 1   ? String("Saved - waiting for the sensor (sent with its next uplink)")
+                 : result == 0 ? String("Nothing changed")
+                               : String("Not saved: flash write failed (see Logs)");
+    sendGen2Detail(request, devId, msg.c_str(), result >= 0 ? 200 : 500);
 }
 
 void WebPortal::handleGen2Status(AsyncWebServerRequest *request)
@@ -1291,18 +1577,21 @@ void WebPortal::handleGen2Ota(AsyncWebServerRequest *request)
 void WebPortal::handleOtaImageChunk(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data,
                                     size_t len, bool final)
 {
-    // Upload data arrives before the middleware runs - check the login here
-    if (!auth.isAuthorized(request) || !auth.hasPassword())
+    // Upload data arrives before the middleware runs - the login is
+    // checked when a request takes the upload (index 0), never again per
+    // chunk: a failed check there (sessionToken() allocates) would skip a
+    // chunk and leave a hole in the image. Data of a request that does not
+    // own the upload is ignored (its completion answers 401 / 409)
+    if (imgUploadOwner != request)
     {
-        return;
-    }
-    if (imgUploadOwner != nullptr && imgUploadOwner != request)
-    {
-        return; // one upload at a time; the other request gets 409
-    }
-    if (index > 0 && imgUploadOwner == nullptr)
-    {
-        return;
+        if (index > 0 || imgUploadOwner != nullptr)
+        {
+            return; // one upload at a time; the other request gets 409
+        }
+        if (!auth.hasPassword() || !auth.isAuthorized(request))
+        {
+            return;
+        }
     }
     if (index == 0)
     {
@@ -1323,6 +1612,9 @@ void WebPortal::handleOtaImageChunk(AsyncWebServerRequest *request, String filen
         imgUploadSawFile = true;
         imgUploadError = "";
         imgUploadMessage = "";
+        // Own disconnect callback: this request must never pass through
+        // rejectLowMemory(), which would replace it (one callback per request)
+        request->setAttribute(OWN_DISCONNECT_ATTR, true);
         request->onDisconnect([this, request]() {
             if (imgUploadOwner == request)
             {
@@ -1456,6 +1748,7 @@ void WebPortal::handleGen2ResetNonce(AsyncWebServerRequest *request)
 {
     logger.debug("HTTP request: POST /sensors/gen2/resetnonce");
     if (guardAPOnly(request)) return;
+    if (rejectBlockedSave(sensorManager, request)) return;
     uint32_t devId = 0;
     if (!gen2DevIdParam(request, true, devId))
     {
@@ -1473,7 +1766,7 @@ void WebPortal::handleLogs(AsyncWebServerRequest *request)
     logger.debug("HTTP request: GET /logs");
     if (guardAPOnly(request)) return;
 
-    // Streamed piece by piece: the whole page (up to ~50 kB with 150 entries)
+    // Streamed piece by piece: the whole page (the full log ring as HTML)
     // never sits in RAM at once, nor twice (send() would copy it)
     struct Stream
     {
@@ -1534,8 +1827,9 @@ void WebPortal::handleLogsClear(AsyncWebServerRequest *request)
     // Clear logs
     logger.clearLogs();
 
-    logger.info("Memory after log clear - Free heap: " + String(ESP.getFreeHeap()) +
-                " bytes, Largest block: " + String(ESP.getMaxAllocHeap()) + " bytes");
+    HeapGuard::Heap heap = HeapGuard::usable();
+    logger.info("Memory after log clear - 8-bit heap: free " + String(heap.free) + " B, largest block " +
+                String(heap.largest) + " B");
 
     // Redirect back to logs page
     request->redirect("/logs");
@@ -1581,7 +1875,8 @@ void WebPortal::handleMqtt(AsyncWebServerRequest *request)
         configManager.mqttTls,
         configManager.mqttPrefix,
         configManager.mqttHAEnabled,
-        configManager.mqttHAPrefix
+        configManager.mqttHAPrefix,
+        mqttManager ? mqttManager->statusText() : String("Disabled")
     );
 
     // Send response
@@ -1662,14 +1957,9 @@ void WebPortal::handleAPI(AsyncWebServerRequest *request)
 {
     logger.debug("HTTP request: GET /api");
     if (guardAPOnly(request)) return;
-    // Public endpoint: keep its peak (~20 kB with 20 sensors: list copy, JSON
-    // document, response buffer) from eating the heap others need; 40 kB
-    // still lets it run next to an MQTT TLS session on the Pro
-    if (ESP.getFreeHeap() < 40000 || ESP.getMaxAllocHeap() < 12000)
-    {
-        request->send(503, "text/plain", "Low memory, try again");
-        return;
-    }
+    // Public endpoint: peak ~20 kB with 20 sensors (list copy, JSON
+    // document, response buffer)
+    if (rejectLowMemory(request, 20000, 12000)) return;
 
     // Check format parameter
     String format = request->hasParam("format") ? request->getParam("format")->value() : "html";
@@ -1834,6 +2124,9 @@ void WebPortal::handleNotFound(AsyncWebServerRequest *request)
 // Diagnostics endpoint: heap and system info 
 void WebPortal::handleDiagHeap(AsyncWebServerRequest *request)
 {
+    heavyExpire(); // AsyncTCP task like the admissions: heavyActive up to date
+    // internal = ESP.getFreeHeap() / getMaxAllocHeap(): MALLOC_CAP_INTERNAL,
+    // on the Pro incl. ~33 kB of 32-bit-only IRAM malloc never gets
     size_t freeHeap = ESP.getFreeHeap();
     size_t maxAlloc = ESP.getMaxAllocHeap();
 #ifdef BOARD_HAS_PSRAM
@@ -1849,11 +2142,48 @@ void WebPortal::handleDiagHeap(AsyncWebServerRequest *request)
 
     AsyncResponseStream *res = request->beginResponseStream("application/json");
     res->print("{");
-    res->print("\"freeHeap\":"); res->print((unsigned long)freeHeap); res->print(",");
-    res->print("\"maxAllocHeap\":"); res->print((unsigned long)maxAlloc); res->print(",");
+    // Every figure is labelled with its heap: *Internal = MALLOC_CAP_INTERNAL
+    // (incl. 32-bit-only IRAM), *8bit = MALLOC_CAP_8BIT (what malloc, String
+    // and lwIP use; the web guards), tls* = internal 8-bit (mbedTLS)
+    res->print("\"freeHeapInternal\":"); res->print((unsigned long)freeHeap); res->print(",");
+    res->print("\"maxAllocHeapInternal\":"); res->print((unsigned long)maxAlloc); res->print(",");
     res->print("\"free8bit\":"); res->print((unsigned long)free8); res->print(",");
     res->print("\"largest8bit\":"); res->print((unsigned long)largest8); res->print(",");
-    res->print("\"fragmentation\":"); res->print(frag, 4); res->print(",");
+    res->print("\"fragmentation8bit\":"); res->print(frag, 4); res->print(",");
+    // Lowest 8-bit free heap since boot (e.g. the peak of a TLS session)
+    res->print("\"min8bit\":"); res->print((unsigned long)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT)); res->print(",");
+    // TLS (HTTPS, MQTT TLS): the internal 8-bit heap against the thresholds
+    HeapGuard::Heap tls = HeapGuard::tlsHeap();
+    res->printf("\"tls\":{\"free\":%lu,\"largest\":%lu,\"needFree\":%lu,\"needBlock\":%lu,\"fits\":%s},",
+                (unsigned long)tls.free, (unsigned long)tls.largest, (unsigned long)HeapGuard::TLS_MIN_FREE,
+                (unsigned long)HeapGuard::TLS_MIN_BLOCK, HeapGuard::tlsFits(tls) ? "true" : "false");
+    // Heavy responses (pages, /api): running now, limit, 503s since boot;
+    // connections reset at accept / requests dropped while received (8-bit
+    // heap short, deadline, too many large ones) by the patched libraries
+    res->printf("\"web\":{\"heavyActive\":%u,\"heavyMax\":%u,\"refusedBusy\":%lu,\"refusedLow\":%lu,"
+                "\"acceptRefused\":%lu,\"recvDeferred\":%lu,\"receiveDropped\":%lu,\"queueOverflow\":%lu,"
+                "\"queueOverflowHigh\":%lu,\"eventLost\":%lu,\"heavyExpired\":%lu},",
+                heavyActive.load(), (unsigned)WEB_HEAVY_RESPONSES_MAX, (unsigned long)heavyRefusedBusy.load(),
+                (unsigned long)heavyRefusedLow.load(), (unsigned long)exploraAcceptRefused.load(),
+                (unsigned long)exploraRecvDeferred.load(), (unsigned long)exploraReceiveDropped.load(),
+                (unsigned long)exploraQueueOverflow.load(), (unsigned long)exploraQueueOverflowHigh.load(),
+                (unsigned long)exploraEventLost.load(), (unsigned long)heavyExpired.load());
+    // Heartbeats of the lwIP thread and the radio task (Hardware/Liveness):
+    // time since they last advanced, the longest so far, refused probe posts
+    Liveness::Status live = Liveness::status();
+    res->printf("\"liveness\":{\"tcpipAgeMs\":%lu,\"tcpipMaxAgeMs\":%lu,\"tcpipBusyPosts\":%lu,"
+                "\"radioAgeMs\":%lu,\"radioMaxAgeMs\":%lu},",
+                (unsigned long)live.tcpipAgeMs, (unsigned long)live.tcpipMaxAgeMs, (unsigned long)live.tcpipBusyPosts,
+                (unsigned long)live.radioAgeMs, (unsigned long)live.radioMaxAgeMs);
+    // MQTT connection and why it is not connected
+    if (mqttManager)
+    {
+        res->printf("\"mqtt\":{\"status\":\"%s\",\"tls\":%s},",
+                    MQTTManager::statusName(mqttManager->status()), mqttManager->usesTls() ? "true" : "false");
+    }
+    // Restarts in a row because the heap stayed fragmented (main.cpp)
+    extern uint32_t heapFragRestarts;
+    res->print("\"fragRestarts\":"); res->print((unsigned long)heapFragRestarts); res->print(",");
     res->print("\"psramTotal\":"); res->print((unsigned long)psramSize); res->print(",");
     res->print("\"psramFree\":"); res->print((unsigned long)psramFree); res->print(",");
     res->print("\"uptimeMs\":"); res->print((unsigned long)millis()); res->print(",");
@@ -1888,6 +2218,8 @@ void WebPortal::handleDiagHeap(AsyncWebServerRequest *request)
     res->printf(",\"otaRadio\":{\"sent\":%lu,\"usedMs\":%lu,\"budgetMs\":%lu,\"maxLateUs\":%ld},",
                 (unsigned long)rs.otaSent, (unsigned long)rs.otaUsedMs, 172800UL, (long)rs.otaMaxLateUs);
     res->print("\"wifiStatus\":"); res->print((int)WiFi.status()); res->print(",");
+    res->print("\"wifiDriver\":"); res->print(uplink->wifiDriverRunning() ? "true" : "false"); res->print(",");
+    res->print("\"wifiOff\":"); res->print(uplink->wifiSwitchedOff() ? "true" : "false"); res->print(",");
     res->print("\"apMode\":"); res->print(isAPMode ? "true" : "false"); res->print(",");
     res->print("\"uplink\":\""); res->print(uplink->getActiveName()); res->print("\",");
     res->print("\"ip\":\""); res->print(uplink->getLocalIP().toString()); res->print("\"");
@@ -1912,8 +2244,14 @@ void WebPortal::handleDiagNetwork(AsyncWebServerRequest *request)
     doc["power"] = powerSource->getName();
 #endif
     JsonObject wifi = doc.createNestedObject("wifi");
-    wifi["connected"] = WiFi.STA.hasIP();
-    wifi["ip"] = WiFi.STA.localIP().toString();
+#if defined(HAS_WIFI_SWITCH)
+    wifi["enabled"] = configManager.wifiEnabled;
+    wifi["switchedOff"] = uplink->wifiSwitchedOff();
+#endif
+    wifi["driver"] = uplink->wifiDriverRunning();
+    wifi["ap"] = uplink->isApActive();
+    wifi["connected"] = uplink->stationHasIP();
+    wifi["ip"] = uplink->getStationIP().toString();
 #if defined(HAS_ETHERNET)
     JsonObject eth = doc.createNestedObject("ethernet");
     eth["link"] = uplink->ethernetLinkUp();
@@ -1941,7 +2279,46 @@ void WebPortal::handleDiagNetwork(AsyncWebServerRequest *request)
 // access point (e.g. LTE-only installs or a wrong static address)
 void WebPortal::handleNetwork(AsyncWebServerRequest *request)
 {
-    request->send(200, "text/html", HTMLGenerator::generateNetworkPage(configManager, wifiSSID, wifiPassword, isAPMode));
+    logger.debug("HTTP request: GET /network");
+    // Streamed: peak = one piece (<= ~4 kB) + the response's send buffer
+    // + the lwIP in-flight copy (each <= TCP_SND_BUF, 5.7 kB) + the settings
+    // copy, instead of ~35 kB for the page built as one String and copied
+    // by send()
+    if (rejectLowMemory(request, HeapGuard::STREAMED_PAGE_PEAK, HeapGuard::STREAMED_PAGE_BLOCK)) return;
+
+    // Settings copied once under the mutex: the pieces are generated in later
+    // callbacks, which must not hold the lock across them nor mix the values
+    // of two saves
+    auto view = std::make_shared<NetworkPageView>();
+#if defined(HAS_WIFI_SWITCH)
+    {
+        // Requested over WiFi = not to the Ethernet address
+        IPAddress eth = uplink->getEthernetIP();
+        view->ethAddress = eth ? eth.toString() : String();
+        view->viaWifi = !eth || request->client()->localIP() != eth;
+    }
+#endif
+    {
+        std::lock_guard<std::recursive_mutex> guard(configManager.mutex());
+        NetworkPageView &v = *view;
+        v.apMode = isAPMode;
+        v.ssid = wifiSSID;
+        v.hasWifiPassword = wifiPassword.length() > 0;
+        v.timezone = configManager.timezone;
+        v.timezoneName = configManager.timezoneName;
+        v.ethStatic = configManager.ethStatic;
+        v.ethIp = configManager.ethIp;
+        v.ethMask = configManager.ethMask;
+        v.ethGateway = configManager.ethGateway;
+        v.ethDns1 = configManager.ethDns1;
+        v.ethDns2 = configManager.ethDns2;
+        v.wifiEnabled = configManager.wifiEnabled;
+        v.lteEnabled = configManager.lteEnabled;
+        v.lteApn = configManager.lteApn;
+        v.hasLtePin = configManager.ltePin.length() > 0;
+    }
+    sendStreamed(request, HTMLGenerator::NETWORK_PAGE_PARTS,
+                 [view](size_t part) { return HTMLGenerator::generateNetworkPagePart(*view, part); });
 }
 
 #if defined(HAS_ETHERNET) || defined(HAS_LTE)
@@ -1972,6 +2349,18 @@ void WebPortal::handleNetworkPost(AsyncWebServerRequest *request)
         }
         logger.info("Ethernet configuration updated - " +
                     String(useStatic ? "static " + configManager.ethIp : String("DHCP")));
+    }
+#endif
+#if defined(HAS_WIFI_SWITCH)
+    else if (section == "wifi")
+    {
+        bool enabled = request->hasParam("wifiEnabled", true);
+        if (!configManager.setWifiEnabled(enabled))
+        {
+            request->send(500, "text/plain", "Failed to save configuration");
+            return;
+        }
+        logger.info(String("WiFi ") + (enabled ? "enabled" : "disabled") + " - restarting");
     }
 #endif
 #if defined(HAS_LTE)
@@ -2015,6 +2404,11 @@ void WebPortal::handleNetworkPost(AsyncWebServerRequest *request)
     {
         String ip = HTMLGenerator::htmlEscape(configManager.ethIp);
         html += " Ethernet address: <a href='http://" + ip + "/network'>" + ip + "</a>";
+    }
+    else if (section == "wifi" && !configManager.wifiEnabled && uplink->getEthernetIP())
+    {
+        String ip = uplink->getEthernetIP().toString();
+        html += " WiFi will be off - reconnect over Ethernet: <a href='http://" + ip + "/network'>" + ip + "</a>";
     }
 #endif
     html += "</p></body></html>";
@@ -2068,22 +2462,20 @@ private:
     size_t limit;
 };
 
-// One TLS session needs ~35-40 kB in total (16 kB record buffers each way);
-// its largest single allocation is ~17 kB
-static constexpr uint32_t TLS_MIN_FREE_HEAP = 48000;
-static constexpr uint32_t TLS_MIN_FREE_BLOCK = 24000;
-
-// Why an HTTPS request cannot start, empty if it can
+// Why an HTTPS request cannot start, empty if it can. TLS needs
+// HeapGuard::TLS_MIN_FREE / TLS_MIN_BLOCK of the internal heap (see there)
 static String httpsBlocker()
 {
     if (time(nullptr) < 1700000000)
     {
         return "The clock is not synchronized yet (needed to check certificates)";
     }
-    if (ESP.getFreeHeap() < TLS_MIN_FREE_HEAP || ESP.getMaxAllocHeap() < TLS_MIN_FREE_BLOCK)
+    HeapGuard::Heap heap = HeapGuard::tlsHeap();
+    if (!HeapGuard::tlsFits(heap))
     {
-        return "Not enough free memory for HTTPS (" + String(ESP.getFreeHeap()) + " B free, largest block " +
-               String(ESP.getMaxAllocHeap()) + " B)";
+        return "Not enough free memory for HTTPS: needs " + String(HeapGuard::TLS_MIN_FREE) +
+               " B free with a block of " + String(HeapGuard::TLS_MIN_BLOCK) + " B, has " + String(heap.free) +
+               " B free, largest block " + String(heap.largest) + " B";
     }
     return "";
 }
@@ -2146,6 +2538,7 @@ void WebPortal::runUpdateCheck()
     }
     if (blocker.length() > 0)
     {
+        logger.warning("Update check not started: " + blocker);
         result = "{\"error\":\"" + blocker + "\"}";
     }
     else
@@ -2210,8 +2603,9 @@ void WebPortal::handleFirmwareUpdate(AsyncWebServerRequest *request)
     }
     // Fail now rather than answer "started" and give up in the loop task
     String blocker = httpsBlocker();
-    if (blocker.length() > 0 && !(mqttManager && mqttManager->isConnected() && mqttManager->usesTls()))
+    if (blocker.length() > 0 && !(mqttManager && mqttManager->tlsSessionUp()))
     {
+        logger.warning("Firmware download not started: " + blocker);
         request->send(503, "application/json", "{\"error\":\"" + blocker + "\"}");
         return;
     }
@@ -2272,17 +2666,26 @@ void WebPortal::runUrlOta(const String &url)
         return;
     }
 
+    // Download buffer only for the download (not kept in static RAM)
+    constexpr size_t BUF_SIZE = 2048;
+    std::unique_ptr<uint8_t[]> buf(new (std::nothrow) uint8_t[BUF_SIZE]);
+    if (!buf)
+    {
+        logger.error("Firmware download: not enough memory for the download buffer");
+        http.end();
+        return;
+    }
+
     // The filesystem stays mounted: OTA writes only the other app slot, and
     // unmounting would race with the other task's file writes
     if (!otaBegin((size_t)contentLength))
     {
-        logger.error("Update.begin failed: " + String(Update.getError()));
+        logger.error(otaBeginError());
         http.end();
         return;
     }
 
     NetworkClient *stream = http.getStreamPtr();
-    static uint8_t buf[2048];
     size_t written = 0;
     int lastPct = -1;
     unsigned long started = millis();
@@ -2313,17 +2716,17 @@ void WebPortal::runUrlOta(const String &url)
             delay(5);
             continue;
         }
-        size_t chunk = min(avail, min(sizeof(buf), (size_t)contentLength - written));
-        int r = stream->readBytes(buf, chunk);
+        size_t chunk = min(avail, min(BUF_SIZE, (size_t)contentLength - written));
+        int r = stream->readBytes(buf.get(), chunk);
         if (r <= 0)
         {
             continue;
         }
-        if (written == 0 && !firmwareImageMatches(buf, r, error))
+        if (written == 0 && !firmwareImageMatches(buf.get(), r, error))
         {
             break;
         }
-        if (otaWrite(buf, r) != (size_t)r)
+        if (otaWrite(buf.get(), r) != (size_t)r)
         {
             error = "flash write failed";
             break;
@@ -2416,20 +2819,21 @@ void WebPortal::handleFirmwareUploadComplete(AsyncWebServerRequest *request)
 // Upload chunk callback
 void WebPortal::handleFirmwareUploadChunk(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final)
 {
-    // Upload data arrives before the middleware runs - check the login here
-    if (!auth.isAuthorized(request) || !auth.hasPassword())
+    // Upload data arrives before the middleware runs - the login is
+    // checked when a request takes the upload (index 0), never again per
+    // chunk: a failed check there (sessionToken() allocates) would skip a
+    // chunk and leave a hole in the image. One upload at a time: data of
+    // any other request is ignored (its completion answers 401 / 409)
+    if (otaUploadOwner != request)
     {
-        return;
-    }
-    // One upload at a time: data of any other request is ignored (its
-    // completion callback answers 409)
-    if (otaUploadOwner != nullptr && otaUploadOwner != request)
-    {
-        return;
-    }
-    if (index > 0 && otaUploadOwner == nullptr)
-    {
-        return;
+        if (index > 0 || otaUploadOwner != nullptr)
+        {
+            return;
+        }
+        if (!auth.hasPassword() || !auth.isAuthorized(request))
+        {
+            return;
+        }
     }
     if (index == 0 && guardAPOnly(request))
     {
@@ -2471,6 +2875,9 @@ void WebPortal::handleFirmwareUploadChunk(AsyncWebServerRequest *request, String
         // Client disconnecting mid-upload: no completion callback follows
         otaUploadOwner = request;
         otaUploadSawFile = true;
+        // Own disconnect callback: this request must never pass through
+        // rejectLowMemory(), which would replace it (one callback per request)
+        request->setAttribute(OWN_DISCONNECT_ATTR, true);
         request->onDisconnect([this, request]()
                               {
             // Only the request that owns the upload may abort it
@@ -2517,7 +2924,7 @@ void WebPortal::handleFirmwareUploadChunk(AsyncWebServerRequest *request, String
         if (!otaBegin((size_t)UPDATE_SIZE_UNKNOWN))
         {
             otaUploadHasError = true;
-            otaUploadErrorMsg = "Update.begin failed: " + String(Update.getError());
+            otaUploadErrorMsg = otaBeginError();
             return;
         }
         otaUploadActive = true;
