@@ -364,7 +364,7 @@ inline const char *confirmText(Confirm c)
     case Confirm::OtherSession:
         return "only the login session that installed the image can confirm it";
     case Confirm::SignedOnly:
-        return "\"Signed images only\" is on - unsigned images are refused";
+        return "\"Signed images only\" is on (Firmware page, Advanced mode) - unsigned images are refused";
     }
     return "?";
 }

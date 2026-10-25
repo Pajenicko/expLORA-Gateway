@@ -20,6 +20,7 @@
  */
 
 #include "MQTTManager.h"
+#include "HaDiscovery.h"
 #include <new>
 #include "../Hardware/WatchdogPause.h"
 #include <ArduinoJson.h>
@@ -317,28 +318,19 @@ void MQTTManager::process()
 // Publish discovery configuration for sensors
 void MQTTManager::publishDiscovery()
 {
-    if (!cfg.haEnabled) {
-        return; // Skip discovery if HA is disabled
-    }
-
-    // Skip if not connected
-    if (!mqttClient.connected())
+    if (!cfg.haEnabled || !mqttClient.connected())
     {
         return;
     }
-
     logger.info("Publishing Home Assistant discovery information...");
-
     publishGatewayDiscovery();
-
-    // Get all active sensors
-    std::vector<SensorData> sensors = sensorManager.getActiveSensors();
-
-    for (const auto &sensor : sensors)
+    // Generation 1 and 2 (a generation 2 sensor that never reported has no
+    // entities yet)
+    const std::vector<SensorData> sensors = sensorManager.getReadings();
+    for (const SensorData &sensor : sensors)
     {
         publishSensorDiscovery(sensor);
     }
-
     logger.info("Home Assistant discovery completed for " + String(sensors.size()) + " sensors");
     lastDiscoveryUpdate = millis();
 }
@@ -356,101 +348,62 @@ bool MQTTManager::publishRetained(const String &topic, const String &payload)
 }
 
 // Discovery config of every value a sensor provides
+// Device of a sensor for HaDiscovery (strings held by the caller)
+struct HaDevice
+{
+    String id, model, sw;
+    HaDiscovery::Device d;
+    HaDevice(const MQTTManager::Settings &cfg, const SensorData &sensor) : id(sensor.idString())
+    {
+        if (sensor.gen2)
+        {
+            model = "Gen 2 HW" + String(sensor.hwType);
+            if (sensor.fwVersion)
+            {
+                sw = String(sensor.fwVersion >> 16) + "." + String((sensor.fwVersion >> 8) & 0xFF) + "." +
+                     String(sensor.fwVersion & 0xFF);
+            }
+        }
+        else
+        {
+            model = sensor.typeName();
+        }
+        d.prefix = cfg.prefix.c_str();
+        d.haPrefix = cfg.haPrefix.c_str();
+        d.id = id.c_str();
+        d.name = sensor.name.c_str();
+        d.model = model.c_str();
+        d.sw = sw.length() ? sw.c_str() : nullptr;
+    }
+};
+
+// Discovery config of every quantity a sensor provides (HaDiscovery.h)
 void MQTTManager::publishSensorDiscovery(const SensorData &sensor)
 {
-    // Base state topic for this sensor
-    String baseTopic = String(cfg.prefix) + "/" + formatSN(sensor.serialNumber);
-
-    // Publish discovery for each supported value type based on sensor type
-    if (sensor.hasTemperature())
+    const HaDevice dev(cfg, sensor);
+    std::unique_ptr<char[]> buf(new (std::nothrow) char[HA_PAYLOAD_MAX]);
+    if (!buf)
     {
-        String topic = buildDiscoveryTopic(sensor, "temperature");
-        String payload = buildDiscoveryJson(sensor, "temperature", baseTopic + "/temperature");
-        publishRetained(topic, payload); // Retained message
-        logger.debug("Published temperature discovery for " + sensor.name);
+        logger.warning("MQTT discovery of " + sensor.name + " skipped: no memory");
+        return;
     }
-
-    if (sensor.hasHumidity())
+    const uint16_t q = sensor.qMask();
+    for (int i = 0; i < Qty::COUNT; i++)
     {
-        String topic = buildDiscoveryTopic(sensor, "humidity");
-        String payload = buildDiscoveryJson(sensor, "humidity", baseTopic + "/humidity");
-        publishRetained(topic, payload);
-        logger.debug("Published humidity discovery for " + sensor.name);
+        if (!(q & Qty::mask((Qty::Id)i)))
+        {
+            continue;
+        }
+        char topic[128];
+        HaDiscovery::topic(topic, sizeof(topic), dev.d, (Qty::Id)i);
+        if (HaDiscovery::payload(buf.get(), HA_PAYLOAD_MAX, dev.d, (Qty::Id)i) == 0)
+        {
+            logger.warning(String("MQTT discovery payload too large: ") + topic);
+            continue;
+        }
+        publishRetained(topic, buf.get());
     }
-
-    if (sensor.hasPressure())
-    {
-        String topic = buildDiscoveryTopic(sensor, "pressure");
-        String payload = buildDiscoveryJson(sensor, "pressure", baseTopic + "/pressure");
-        publishRetained(topic, payload);
-        logger.debug("Published pressure discovery for " + sensor.name);
-    }
-
-    if (sensor.hasPPM())
-    {
-        String topic = buildDiscoveryTopic(sensor, "co2");
-        String payload = buildDiscoveryJson(sensor, "co2", baseTopic + "/co2");
-        publishRetained(topic, payload);
-        logger.debug("Published CO2 discovery for " + sensor.name);
-    }
-
-    if (sensor.hasLux())
-    {
-        String topic = buildDiscoveryTopic(sensor, "illuminance");
-        String payload = buildDiscoveryJson(sensor, "illuminance", baseTopic + "/illuminance");
-        publishRetained(topic, payload);
-        logger.debug("Published illuminance discovery for " + sensor.name);
-    }
-
-    if (sensor.hasWindSpeed())
-    {
-        String topic = buildDiscoveryTopic(sensor, "wind_speed");
-        String payload = buildDiscoveryJson(sensor, "wind_speed", baseTopic + "/wind_speed");
-        publishRetained(topic, payload);
-        logger.debug("Published wind speed discovery for " + sensor.name);
-    }
-
-    if (sensor.hasWindDirection())
-    {
-        String topic = buildDiscoveryTopic(sensor, "wind_direction");
-        String payload = buildDiscoveryJson(sensor, "wind_direction", baseTopic + "/wind_direction");
-        publishRetained(topic, payload);
-        logger.debug("Published wind direction discovery for " + sensor.name);
-    }
-
-    if (sensor.hasRainAmount())
-    {
-        String topic = buildDiscoveryTopic(sensor, "rain_amount");
-        String payload = buildDiscoveryJson(sensor, "rain_amount", baseTopic + "/rain_amount");
-        publishRetained(topic, payload);
-        logger.debug("Published rain amount discovery for " + sensor.name);
-
-        // Also for daily rain total
-        topic = buildDiscoveryTopic(sensor, "daily_rain");
-        payload = buildDiscoveryJson(sensor, "daily_rain", baseTopic + "/daily_rain");
-        publishRetained(topic, payload);
-        logger.debug("Published daily rain discovery for " + sensor.name);
-    }
-
-    if (sensor.hasRainRate())
-    {
-        String topic = buildDiscoveryTopic(sensor, "rain_rate");
-        String payload = buildDiscoveryJson(sensor, "rain_rate", baseTopic + "/rain_rate");
-        publishRetained(topic, payload);
-        logger.debug("Published rain rate discovery for " + sensor.name);
-    }
-
-    // Battery voltage - available for all sensors
-    String topic = buildDiscoveryTopic(sensor, "battery");
-    String payload = buildDiscoveryJson(sensor, "battery", baseTopic + "/battery");
-    publishRetained(topic, payload);
-    logger.debug("Published battery discovery for " + sensor.name);
-
-    // RSSI (signal strength) - available for all sensors
-    topic = buildDiscoveryTopic(sensor, "rssi");
-    payload = buildDiscoveryJson(sensor, "rssi", baseTopic + "/rssi");
-    publishRetained(topic, payload);
-    logger.debug("Published RSSI discovery for " + sensor.name);
+    logger.debug("Published discovery for " + sensor.name);
 }
 
 String MQTTManager::gatewayTopic(const char *key) const
@@ -570,283 +523,104 @@ void MQTTManager::publishGatewayState(bool force)
 }
 
 // Create discovery topic for sensor
-String MQTTManager::buildDiscoveryTopic(const SensorData &sensor, const String &valueType)
-{
-    String deviceClass = valueType;
 
-    // Map value type to Home Assistant device class
-    // https://www.home-assistant.io/integrations/sensor/#device-class
-    if (valueType == "co2")
-        deviceClass = "carbon_dioxide";
-    else if (valueType == "daily_rain")
-        deviceClass = "precipitation";
-    else if (valueType == "rain_amount")
-        deviceClass = "precipitation";
-    else if (valueType == "rain_rate")
-        deviceClass = "precipitation_intensity";
-    else if (valueType == "wind_speed")
-        deviceClass = "wind_speed";
-    else if (valueType == "wind_direction")
-        deviceClass = "wind_direction";
-
-    // Create discovery topic
-    return String(cfg.haPrefix) + "/sensor/" +
-           String(cfg.prefix) + "_" + formatSN(sensor.serialNumber) + "_" + valueType + "/config";
-}
 
 // Helper function to capitalize first letter
-String MQTTManager::capitalizeFirst(const String &input)
-{
-    if (input.length() == 0)
-        return input;
-    String result = input;
-    result.setCharAt(0, toupper(input.charAt(0)));
-    return result;
-}
+
 
 // Create configuration JSON for Home Assistant discovery
-String MQTTManager::buildDiscoveryJson(const SensorData &sensor, const String &valueType, const String &stateTopic)
-{
-    // Create JSON document for discovery payload
-    DynamicJsonDocument doc(1024);
 
-    // Entity name
-    // doc["name"] = sensor.name + " " + capitalizeFirst(valueType);
-
-    // Use the name from the sensor if it ends with the value type
-    if (sensor.name.endsWith(capitalizeFirst(valueType)))
-    {
-        doc["name"] = sensor.name;
-    }
-    else
-    {
-        doc["name"] = capitalizeFirst(valueType); // Just the value type
-    }
-
-    // State topic
-    doc["state_topic"] = stateTopic;
-
-    // Value template - just use raw value
-    doc["value_template"] = "{{ value }}";
-
-    // Unique ID
-    doc["unique_id"] = String(cfg.prefix) + "_" + formatSN(sensor.serialNumber) + "_" + valueType;
-
-    // Availability topic - use LWT (Last Will and Testament)
-    doc["availability_topic"] = String(cfg.prefix) + "/status";
-    doc["payload_available"] = "online";
-    doc["payload_not_available"] = "offline";
-
-    // Set measurement units based on value type
-    if (valueType == "temperature")
-    {
-        doc["device_class"] = "temperature";
-        doc["unit_of_measurement"] = "°C";
-        doc["suggested_display_precision"] = 1;
-    }
-    else if (valueType == "humidity")
-    {
-        doc["device_class"] = "humidity";
-        doc["unit_of_measurement"] = "%";
-        doc["suggested_display_precision"] = 1;
-    }
-    else if (valueType == "pressure")
-    {
-        doc["device_class"] = "pressure";
-        doc["unit_of_measurement"] = "hPa";
-        doc["suggested_display_precision"] = 1;
-    }
-    else if (valueType == "co2")
-    {
-        doc["device_class"] = "carbon_dioxide";
-        doc["unit_of_measurement"] = "ppm";
-    }
-    else if (valueType == "illuminance")
-    {
-        doc["device_class"] = "illuminance";
-        doc["unit_of_measurement"] = "lx";
-        doc["suggested_display_precision"] = 1;
-    }
-    else if (valueType == "wind_speed")
-    {
-        doc["device_class"] = "wind_speed";
-        doc["unit_of_measurement"] = "m/s";
-        doc["suggested_display_precision"] = 1;
-    }
-    else if (valueType == "wind_direction")
-    {
-        doc["device_class"] = "wind_direction";
-        doc["unit_of_measurement"] = "°";
-    }
-    else if (valueType == "rain_amount")
-    {
-        doc["device_class"] = "precipitation";
-        doc["unit_of_measurement"] = "mm";
-        doc["suggested_display_precision"] = 1;
-    }
-    else if (valueType == "daily_rain")
-    {
-        doc["device_class"] = "precipitation";
-        doc["unit_of_measurement"] = "mm";
-        doc["suggested_display_precision"] = 1;
-        doc["name"] = sensor.name + " Daily Rain Total";
-    }
-    else if (valueType == "rain_rate")
-    {
-        doc["device_class"] = "precipitation_intensity";
-        doc["unit_of_measurement"] = "mm/h";
-        doc["suggested_display_precision"] = 1;
-    }
-    else if (valueType == "battery")
-    {
-        doc["device_class"] = "voltage";
-        doc["unit_of_measurement"] = "V";
-        doc["suggested_display_precision"] = 2;
-    }
-    else if (valueType == "rssi")
-    {
-        doc["device_class"] = "signal_strength";
-        doc["unit_of_measurement"] = "dBm";
-    }
-
-    // Device information
-    JsonObject device = doc.createNestedObject("device");
-    device["identifiers"] = formatSN(sensor.serialNumber);
-    device["name"] = sensor.name;
-    device["model"] = sensor.getTypeInfo().name;
-    device["manufacturer"] = "expLORA";
-
-    // Serialize JSON to string
-    String payload;
-    serializeJson(doc, payload);
-    return payload;
-}
 
 // Helper function to capitalize first letter
-String capitalizeFirst(const String &input)
-{
-    if (input.length() == 0)
-        return input;
-    String result = input;
-    result.setCharAt(0, toupper(input.charAt(0)));
-    return result;
-}
 
+
+// Publish sensor data
 // Publish sensor data
 void MQTTManager::publishSensorData(int sensorIndex)
 {
-    // Skip if not connected
+    SensorData copy;
+    if (sensorManager.getSensorCopy(sensorIndex, copy))
+    {
+        publishState(copy);
+    }
+}
+
+// Every current value of a sensor: <prefix>/<ID>/<quantity>
+void MQTTManager::publishState(const SensorData &sensor)
+{
     if (!mqttClient.connected() || !cfg.enabled)
     {
         return;
     }
-
-    SensorData copy;
-    if (!sensorManager.getSensorCopy(sensorIndex, copy))
+    const HaDevice dev(cfg, sensor);
+    // A generation 2 reading that failed (invalid-value sentinel) is sent
+    // as "None", which Home Assistant shows as unknown, instead of leaving
+    // the last number; a quantity never reported gets no state
+    const uint16_t q = sensor.qValid(), bad = sensor.gen2 ? sensor.gen2QBad : 0;
+    for (int i = 0; i < Qty::COUNT; i++)
     {
-        return;
+        const uint16_t m = Qty::mask((Qty::Id)i);
+        if (!((q | bad) & m))
+        {
+            continue;
+        }
+        char topic[96], value[24];
+        HaDiscovery::stateTopic(topic, sizeof(topic), dev.d, (Qty::Id)i);
+        if (q & m)
+        {
+            HaDiscovery::stateValue(value, sizeof(value), (Qty::Id)i, sensor.value((Qty::Id)i));
+        }
+        mqttClient.publish(topic, (q & m) ? value : HaDiscovery::STATE_NONE);
     }
-    const SensorData *sensor = &copy;
-
-    // Base topic for this sensor
-    String baseTopic = String(cfg.prefix) + "/" + formatSN(sensor->serialNumber);
-
-    // Publish each value based on sensor type
-    if (sensor->hasTemperature())
-    {
-        mqttClient.publish((baseTopic + "/temperature").c_str(),
-                           String(sensor->temperature, 2).c_str());
-    }
-
-    if (sensor->hasHumidity())
-    {
-        mqttClient.publish((baseTopic + "/humidity").c_str(),
-                           String(sensor->humidity, 2).c_str());
-    }
-
-    if (sensor->hasPressure())
-    {
-        mqttClient.publish((baseTopic + "/pressure").c_str(),
-                           String(sensor->pressure, 2).c_str());
-    }
-
-    if (sensor->hasPPM())
-    {
-        mqttClient.publish((baseTopic + "/co2").c_str(),
-                           String(int(sensor->ppm)).c_str());
-    }
-
-    if (sensor->hasLux())
-    {
-        mqttClient.publish((baseTopic + "/illuminance").c_str(),
-                           String(sensor->lux, 1).c_str());
-    }
-
-    if (sensor->hasWindSpeed())
-    {
-        mqttClient.publish((baseTopic + "/wind_speed").c_str(),
-                           String(sensor->windSpeed, 1).c_str());
-    }
-
-    if (sensor->hasWindDirection())
-    {
-        mqttClient.publish((baseTopic + "/wind_direction").c_str(),
-                           String(sensor->windDirection).c_str());
-    }
-
-    if (sensor->hasRainAmount())
-    {
-        mqttClient.publish((baseTopic + "/rain_amount").c_str(),
-                           String(sensor->rainAmount, 1).c_str());
-        mqttClient.publish((baseTopic + "/daily_rain").c_str(),
-                           String(sensor->dailyRainTotal, 1).c_str());
-    }
-
-    if (sensor->hasRainRate())
-    {
-        mqttClient.publish((baseTopic + "/rain_rate").c_str(),
-                           String(sensor->rainRate, 1).c_str());
-    }
-
-    // Battery voltage - available for all sensors
-    mqttClient.publish((baseTopic + "/battery").c_str(),
-                       String(sensor->batteryVoltage, 2).c_str());
-
-    // RSSI - available for all sensors
-    mqttClient.publish((baseTopic + "/rssi").c_str(),
-                       String(sensor->rssi).c_str());
-
-    logger.debug("Published MQTT data for sensor: " + sensor->name);
+    logger.debug("Published MQTT data for sensor: " + sensor.name);
 }
 
 // Web handlers run in the async server task; PubSubClient is used only from
 // the loop task, so they queue the work here and process() does it
 static constexpr size_t MAX_PENDING_OPS = 32;
 
-void MQTTManager::requestSensorDiscovery(uint32_t serialNumber)
+void MQTTManager::queue(const PendingOp &op)
 {
     std::lock_guard<std::mutex> lock(pendingMutex);
+    // One op per sensor and kind in a row: when the sensor's last queued op
+    // is of the same kind, this one is merged into it (a publish takes the
+    // readings of its moment; discovery or removal again is the same), so
+    // repeated saves while the broker is away cannot fill the queue
+    for (auto p = pending.rbegin(); p != pending.rend(); ++p)
+    {
+        if (p->id == op.id && p->gen2 == op.gen2)
+        {
+            if (p->type != op.type)
+            {
+                break;
+            }
+            p->discover = p->discover || op.discover;
+            return;
+        }
+    }
     if (pending.size() < MAX_PENDING_OPS)
     {
-        pending.push_back({PendingOp::Discovery, serialNumber});
+        pending.push_back(op);
     }
     else
     {
-        logger.warning("MQTT queue full - discovery for " + formatSN(serialNumber) + " dropped");
+        logger.warning("MQTT queue full - an operation for " + formatHex(op.id, op.gen2 ? 8 : 6) + " dropped");
     }
 }
 
-void MQTTManager::requestSensorRemoval(uint32_t serialNumber)
+void MQTTManager::requestSensorDiscovery(uint32_t serialNumber)
 {
-    std::lock_guard<std::mutex> lock(pendingMutex);
-    if (pending.size() < MAX_PENDING_OPS)
-    {
-        pending.push_back({PendingOp::Removal, serialNumber});
-    }
-    else
-    {
-        logger.warning("MQTT queue full - removal for " + formatSN(serialNumber) + " dropped");
-    }
+    queue({PendingOp::Discovery, false, false, serialNumber});
+}
+
+void MQTTManager::requestSensorRemoval(uint32_t id, bool gen2)
+{
+    queue({PendingOp::Removal, gen2, false, id});
+}
+
+void MQTTManager::requestGen2Publish(uint32_t devId, bool discover)
+{
+    queue({PendingOp::Gen2Publish, true, discover, devId});
 }
 
 void MQTTManager::requestReinit()
@@ -892,19 +666,35 @@ void MQTTManager::processPending()
     {
         if (op.type == PendingOp::Removal)
         {
-            removeDiscoveryForSensor(op.serialNumber);
+            removeDiscoveryForSensor(formatHex(op.id, op.gen2 ? 8 : 6));
+            continue;
+        }
+        if (op.type == PendingOp::Gen2Publish)
+        {
+            // Readings of a generation 2 uplink (the decode runs in this
+            // task, PubSubClient is used only here); discovery first when
+            // the reported quantities grew or the sensor was renamed
+            SensorData row;
+            if (sensorManager.getGen2Reading(op.id, row))
+            {
+                if (op.discover && cfg.haEnabled)
+                {
+                    publishSensorDiscovery(row);
+                }
+                publishState(row);
+            }
             continue;
         }
         if (!cfg.haEnabled)
         {
             continue;
         }
-        for (const SensorData &sensor : sensorManager.getActiveSensors())
+        for (const SensorData &s : sensorManager.getActiveSensors())
         {
-            if (sensor.serialNumber == op.serialNumber)
+            if (s.serialNumber == op.id)
             {
-                logger.info("Publishing MQTT discovery for sensor: " + sensor.name);
-                publishSensorDiscovery(sensor);
+                logger.info("Publishing MQTT discovery for sensor: " + s.name);
+                publishSensorDiscovery(s);
             }
         }
     }
@@ -1020,31 +810,21 @@ String MQTTManager::statusText() const
 }
 
 // Remove discovery for deleted sensor
-void MQTTManager::removeDiscoveryForSensor(uint32_t serialNumber)
+void MQTTManager::removeDiscoveryForSensor(const String &id)
 {
-    if (!cfg.haEnabled) {
-        return; // Do not send discovery if HA is disabled
-    }
-
-    if (!mqttClient.connected())
+    if (!cfg.haEnabled || !mqttClient.connected())
     {
         return;
     }
-
-    logger.info("Removing MQTT discovery for sensor with SN: " + formatSN(serialNumber));
-
-    // Create discovery topics for all possible value types
-    String baseDiscoveryTopic = String(cfg.haPrefix) + "/sensor/" + String(cfg.prefix) + "_" +
-                                formatSN(serialNumber) + "_";
-
-    // Remove discovery for all possible types
-    String types[] = {"temperature", "humidity", "pressure", "co2", "illuminance",
-                      "battery", "rssi", "wind_speed", "wind_direction",
-                      "rain_amount", "daily_rain", "rain_rate"};
-
-    for (const auto &type : types)
+    logger.info("Removing MQTT discovery for sensor " + id);
+    HaDiscovery::Device d;
+    d.prefix = cfg.prefix.c_str();
+    d.haPrefix = cfg.haPrefix.c_str();
+    d.id = id.c_str();
+    for (int i = 0; i < Qty::COUNT; i++)
     {
-        String topic = baseDiscoveryTopic + type + "/config";
-        mqttClient.publish(topic.c_str(), "", true); // Empty payload deletes discovery
+        char topic[128];
+        HaDiscovery::topic(topic, sizeof(topic), d, (Qty::Id)i);
+        mqttClient.publish(topic, "", true); // an empty retained payload deletes the entity
     }
 }

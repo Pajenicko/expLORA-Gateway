@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <string>
 #include "../../src/Data/SensorsJsonBudget.h"
+#include "../../src/Data/SensorTypeIds.h"
 
 using SensorsJson::MAX_GEN1;
 using SensorsJson::MAX_GEN2;
@@ -96,6 +97,14 @@ static std::string buildFull(size_t extra, size_t arrayLen, bool &overflowed)
         o[std::string("ackRetries")] = 15;
         o[std::string("ackBackoff")] = 15;
         o[std::string("cfgVersion")] = 65535;
+        o[std::string("q")] = 65535;
+        const char *cal[] = {"temperatureCorrection", "humidityCorrection", "pressureCorrection", "ppmCorrection",
+                             "luxCorrection", "windSpeedCorrection", "windDirectionCorrection",
+                             "rainAmountCorrection", "rainRateCorrection", "altitude"};
+        for (const char *c : cal)
+        {
+            o[std::string(c)] = -1.5f; // worst case: every correction set
+        }
         o[std::string("fw")] = "255.255." + std::to_string(200 + i);
         o[std::string("hw")] = 65535;
         o[std::string("bootState")] = 7;
@@ -142,7 +151,7 @@ static void test_full_configuration_fits_write_and_read(void)
 static void test_file_with_extra_members_loads(void)
 {
     bool overflowed = true;
-    std::string file = buildFull(6, 8, overflowed); // 23 / 24 members, arrays of 8
+    std::string file = buildFull(4, 8, overflowed); // 21 / 33 members, arrays of 8
     TEST_ASSERT_FALSE(overflowed);
     size_t factor = 0;
     TEST_ASSERT_TRUE(load(file, factor) == SensorsJson::Load::Ok);
@@ -183,6 +192,32 @@ static void test_cut_file_is_damage(void)
     TEST_ASSERT_TRUE(load(file, factor) == SensorsJson::Load::Damage);
 }
 
+// A file with entries of removed types (SHT40 0x05, DIY_TEMP 0x51) and an
+// out-of-range type loads; the loader keeps only the supported ones, read
+// the way SensorManager::parseSensorsLocked reads them (as<uint8_t>(): 0
+// when out of range, never truncated to another type)
+static void test_removed_types_are_dropped(void)
+{
+    const std::string file = "{\"sensors\":[{\"deviceType\":1,\"serialNumber\":1},{\"deviceType\":5,"
+                             "\"serialNumber\":535578},{\"deviceType\":81,\"serialNumber\":3},{\"deviceType\":3,"
+                             "\"serialNumber\":4},{\"deviceType\":257,\"serialNumber\":5}],\"gen2\":[]}";
+    std::unique_ptr<DynamicJsonDocument> doc;
+    size_t factor = 0;
+    TEST_ASSERT_TRUE(SensorsJson::parse(file.data(), file.size(), doc, factor) == SensorsJson::Load::Ok);
+    unsigned kept = 0;
+    uint32_t sum = 0;
+    for (JsonObject o : (*doc)["sensors"].as<JsonArray>())
+    {
+        if (SensorTypeIds::supportedType(o["deviceType"].as<uint8_t>()))
+        {
+            kept++;
+            sum += o["serialNumber"].as<uint32_t>();
+        }
+    }
+    TEST_ASSERT_EQUAL_UINT32(2, kept);
+    TEST_ASSERT_EQUAL_UINT32(1 + 4, sum);
+}
+
 int main(int, char **)
 {
     UNITY_BEGIN();
@@ -191,5 +226,6 @@ int main(int, char **)
     RUN_TEST(test_larger_file_takes_the_retry);
     RUN_TEST(test_much_larger_file_is_no_memory_not_damage);
     RUN_TEST(test_cut_file_is_damage);
+    RUN_TEST(test_removed_types_are_dropped);
     return UNITY_END();
 }

@@ -405,6 +405,20 @@ void loop()
         }
     }
 
+    // Generation 2 readings decoded above: published through the MQTT queue
+    // (discovery first when the sensor reported a new quantity)
+    {
+        uint32_t devId;
+        bool discover;
+        while (sensorManager && sensorManager->takeGen2Mqtt(devId, discover))
+        {
+            if (mqttManager)
+            {
+                mqttManager->requestGen2Publish(devId, discover);
+            }
+        }
+    }
+
     // Outcomes of generation 2 responses (per-sensor downlink counters)
     TxResult txResult;
     while (sensorManager && RadioTask::takeResult(txResult))

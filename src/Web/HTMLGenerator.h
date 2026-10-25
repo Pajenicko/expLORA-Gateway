@@ -69,6 +69,13 @@ struct NetworkPageView
     bool hasLtePin = false;
 };
 
+// System page: full = also the interface, time zone and restart cards
+struct SystemView
+{
+    bool full = true;
+    String timezone, timezoneName;
+};
+
 // Sensor list page data, copied before the page is streamed (see
 // handleSensors): keys wiped, only what the page shows
 struct SensorsPageView
@@ -78,6 +85,7 @@ struct SensorsPageView
     WaitingEntry waiting[8];
     size_t waitingCount = 0;
     unsigned long nowMillis = 0; // one 'now' for every row
+    bool adv = false;            // Advanced mode (one value for every part)
 };
 
 /**
@@ -90,27 +98,42 @@ class HTMLGenerator
 {
 private:
 
-    // Add HTML opening code
-    static void addHtmlHeader(String &html, const String &title, bool isAPMode = false, bool navigation = true);
+public:
+    // Navigation entry a page belongs to (highlighted by route)
+    enum class Page : uint8_t
+    {
+        None,
+        Home,
+        Sensors,
+        Network,
+        Mqtt,
+        Firmware,
+        Logs,
+        Api,
+        System,
+        Config
+    };
 
-    // Add HTML closing code
-    static void addHtmlFooter(String &html, bool isAPMode = false);
-
-    // Add CSS for pages
-    static void addStyles(String &html);
-
-    // Add JavaScript for interactive elements
-    static void addJavaScript(String &html);
-
-    // Add navigation
-    static void addNavigation(String &html, const String &activePage);
+private:
+    // Head, header and navigation; refreshS: reload after that many seconds
+    static void addHtmlHeader(String &html, const String &title, Page page, bool isAPMode = false,
+                              bool navigation = true, uint16_t refreshS = 0);
+    // </main>, footer, the shared script
+    static void addHtmlFooter(String &html);
+    static void addNavigation(String &html, Page active, bool apMode);
 
 public:
+    // Web interface mode (ConfigManager::uiAdvanced), cached here so no
+    // configuration lock is taken while a page is generated
+    static void setAdvanced(bool advanced);
+    static bool adv();
+
     // Escape text for HTML content and quoted attributes
     static String htmlEscape(const String &text);
 
     // Generate home page
-    static String generateHomePage(const std::vector<SensorData> &sensors);
+    // sensors: SensorManager::getReadings() (generation 1 and 2)
+    static String generateHomePage(const std::vector<SensorData> &sensors, const String &mqttStatus);
 
     // Generate configuration page
     // timeZone: also the time zone select (AP setup page), nullptr = without
@@ -126,13 +149,17 @@ public:
 
     // Login and admin password pages
     static String generateLoginPage(bool hasPassword, const String &error, const String &next);
-    static String generatePasswordPage(bool hasPassword, const String &error, bool apMode);
+    // System page (/password): interface mode, time zone, admin password,
+    // restart. Without a password (first setup) or with full=false (update
+    // mode: kept light) only the password form
+    static String generatePasswordPage(bool hasPassword, const String &error, bool apMode,
+                                       const SystemView &view = SystemView());
 
     // Network page (uplink status, time zone, WiFi, ethernet and LTE
     // settings) in pieces of at most ~4 kB, streamed by the web server (see
     // handleNetwork); part 0, 1, ... until NETWORK_PAGE_PARTS, a piece may be
     // empty (a card the board does not have)
-    static constexpr size_t NETWORK_PAGE_PARTS = 9;
+    static constexpr size_t NETWORK_PAGE_PARTS = 6;
     static String generateNetworkPagePart(const NetworkPageView &view, size_t part);
 
     // Sensor list page in pieces (one per sensor row), streamed by the web
@@ -148,11 +175,12 @@ public:
     static String generateGen2DetailPage(const Gen2Sensor &sensor, const String &message,
                                          const Gen2OtaView *ota = nullptr);
 
-    // Generate sensor add page
-    static String generateSensorAddPage();
+    // Add (sensor == nullptr) or edit a generation 1 sensor
+    static String generateSensorForm(const SensorData *sensor, int index);
 
-    // Generate sensor edit page
-    static String generateSensorEditPage(const SensorData &sensor, int index);
+    // Correction fields, shared by generation 1 and 2 (form names of
+    // SensorCalibration::info); show: bit f = SensorCalibration::Field f
+    static void addCorrections(String &html, uint16_t show, const SensorCalibration::Set &cal);
 
     // Generate logs page
     // Logs page in pieces, streamed by the web server (see handleLogs)
@@ -163,20 +191,18 @@ public:
     // Generate API page
     static String generateAPIPage(const std::vector<SensorData> &sensors);
 
-    // Generate JSON for API
-    // JSON document for /api (serialized by the caller into a sized buffer)
-    static DynamicJsonDocument buildAPIJson(const std::vector<SensorData> &sensors);
+    // /api pieces (streamed per sensor): the JSON head up to "sensors":[,
+    // one sensor as JSON (ApiRow.h) or as a CSV line
+    static String apiJsonHead(bool online);
+    static String apiJsonRow(const SensorData &sensor, unsigned long nowMs);
+    static String apiCsvRow(const SensorData &sensor, unsigned long nowMs);
 
     // Generate firmware update page
     static String generateFirmwarePage(const String &updateStatus, bool signedOnly, const GatewayOta::View &gw);
+    // Small page after an action (saved, restarting): text is HTML; reloads
+    // after refreshS (to url when given)
+    static String generateNoticePage(const char *title, const String &text, uint8_t refreshS, const char *url);
     // Small page served as /firmware while an update-mode session runs
     // (no styles, navigation or forms; reloads itself every 15 s)
     static String generateUpdateProgressPage(const String &updateStatus);
-
-    // Optimized versions using buffer
-
-    // Additional helper methods
-    static String getWifiNetworkOptions(const String &currentSSID);
-    static String getSensorTypeOptions(SensorType currentType);
-    static String getLogLevelOptions(LogLevel currentLevel);
 };

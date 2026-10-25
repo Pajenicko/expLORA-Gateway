@@ -111,6 +111,10 @@ public:
     // take signed images only, whatever this says
     bool signedOnly = false;
 
+    // Web interface: Advanced (true) or Simple (default) - one setting for
+    // everyone (config.json only)
+    bool uiAdvanced = false;
+
     // Held by save()/load() and the setters (web and loop task both write);
     // readers in another task take it while copying values (MQTTManager)
     std::recursive_mutex &mutex() { return configMutex; }
@@ -167,6 +171,9 @@ public:
 
     // Set "signed images only"; false = not saved (the previous value is kept)
     bool setSignedOnly(bool on);
+
+    // Set the web interface mode; false = not saved (the previous mode is kept)
+    bool setUiAdvanced(bool advanced);
 
     // Set LTE configuration
     bool setLteConfig(bool enabled, const String &apn, const String &pin, bool saveConfig = true);

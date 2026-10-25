@@ -69,17 +69,10 @@ private:
     // Connect to MQTT broker
     bool connect();
 
-    // Create discovery topic for sensor
-    String buildDiscoveryTopic(const SensorData &sensor, const String &valueType);
-
-    // Create configuration JSON for Home Assistant discovery
-    String buildDiscoveryJson(const SensorData &sensor, const String &valueType, const String &stateTopic);
-
-    // Helper function to capitalize first letter
-    String capitalizeFirst(const String &input);
-
-    // Discovery config of one sensor
+    // Discovery config of one sensor (generation 1 or 2), its current values
+    static constexpr size_t HA_PAYLOAD_MAX = 900; // < the 1 kB PubSubClient buffer with the topic
     void publishSensorDiscovery(const SensorData &sensor);
+    void publishState(const SensorData &sensor);
     bool publishRetained(const String &topic, const String &payload);
     volatile bool haRestarted = false; // "online" on <haPrefix>/status
 
@@ -88,11 +81,15 @@ private:
     {
         enum Type : uint8_t
         {
-            Discovery,
-            Removal,
+            Discovery,   // generation 1 sensor (serial number)
+            Removal,     // its entities (serial number or DevID)
+            Gen2Publish, // readings of a generation 2 sensor, discovery first when 'discover'
         } type;
-        uint32_t serialNumber;
+        bool gen2;
+        bool discover;
+        uint32_t id; // serial number or DevID
     };
+    void queue(const PendingOp &op);
     std::mutex pendingMutex;
     std::vector<PendingOp> pending;
     bool reinitRequested = false;
@@ -123,12 +120,15 @@ public:
     // Publish sensor data
     void publishSensorData(int sensorIndex);
 
-    // Remove discovery for deleted sensor
-    void removeDiscoveryForSensor(uint32_t serialNumber);
+    // Remove the entities of a deleted sensor (its ID: 6 or 8 hex digits)
+    void removeDiscoveryForSensor(const String &id);
 
     // Thread-safe requests (any task), carried out by process()
     void requestSensorDiscovery(uint32_t serialNumber);
-    void requestSensorRemoval(uint32_t serialNumber);
+    void requestSensorRemoval(uint32_t id, bool gen2 = false);
+    // A generation 2 sensor: publish its readings; discover: send its
+    // discovery first (new quantities, renamed)
+    void requestGen2Publish(uint32_t devId, bool discover);
     // Copy of the MQTT configuration taken by init() (loop task), so the
     // strings in use - PubSubClient keeps the host pointer - never change
     // under it when the web task saves new settings

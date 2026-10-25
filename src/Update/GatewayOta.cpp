@@ -983,7 +983,8 @@ Result conclude(Writer &w, const GatewayImage::Outcome &o, uint64_t session, boo
         }
         else
         {
-            r.message = "Firmware refused: " + String(o.text) + " image - \"Signed images only\" is on";
+            r.message = "Firmware refused: " + String(o.text) +
+                        " image - \"Signed images only\" is on (Firmware page, Advanced mode)";
         }
         if (o.severe)
         {

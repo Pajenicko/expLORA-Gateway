@@ -21,6 +21,7 @@
 
 #include "SensorManager.h"
 #include "SensorCalibration.h"
+#include "CalibrationJson.h"
 #include "SensorsJsonBudget.h"
 static_assert(MAX_SENSORS == SensorsJson::MAX_GEN1, "SensorsJsonBudget.h: MAX_GEN1");
 static_assert(MAX_GEN2_SENSORS == SensorsJson::MAX_GEN2, "SensorsJsonBudget.h: MAX_GEN2");
@@ -57,23 +58,6 @@ bool SensorManager::init()
 }
 
 // Constants for pressure conversion
-#define G 9.80665   // gravitational acceleration [m/s^2]
-#define M 0.0289644 // molar mass of air [kg/mol]
-#define R 8.3144598 // universal gas constant [J/(mol·K)]
-#define L 0.0065    // temperature gradient [K/m]
-
-// Convert relative pressure to absolute pressure
-double SensorManager::relativeToAbsolutePressure(double p_rel_hpa, int altitude_m, double temp_c)
-{
-    if (altitude_m == 0)
-    {
-        return p_rel_hpa;
-    }
-    double T = temp_c + 273.15;
-    double exponent = (G * M) / (R * L);
-    return p_rel_hpa / pow(1 - (L * altitude_m) / T, exponent);
-}
-
 // Add a new sensor
 int SensorManager::addSensor(SensorType deviceType, uint32_t serialNumber, uint32_t deviceKey, const String &name)
 {
@@ -179,153 +163,30 @@ bool SensorManager::updateSensorData(int index, float temperature, float humidit
         return false;
     }
 
-    // Store original values for logging
-    float originalTemp = temperature;
-    float originalHum = humidity;
-    float originalPress = pressure;
-    float originalPPM = ppm;
-    float originalLux = lux;
-    float originalWindSpeed = windSpeed;
-    uint16_t originalWindDir = windDirection;
-    float originalRainAmount = rainAmount;
-    float originalRainRate = rainRate;
-
-    // Apply corrections to input values before updating.
-    // Delegated to SensorCalibration (covered by native unit tests).
-    // Note: applyWindDirectionCorrection fixes a latent C++ integer-promotion
-    // bug in the previous inline (uint16_t + int) % 360 path that wrapped
-    // negative offsets to ~65k° instead of e.g. 350°.
-    temperature = SensorCalibration::applyOffset(temperature, sensors[index].temperatureCorrection);
-    humidity    = SensorCalibration::applyOffset(humidity,    sensors[index].humidityCorrection);
-    pressure    = SensorCalibration::applyOffset(pressure,    sensors[index].pressureCorrection);
-    ppm         = SensorCalibration::applyOffset(ppm,         sensors[index].ppmCorrection);
-    lux         = SensorCalibration::applyOffset(lux,         sensors[index].luxCorrection);
-    windSpeed   = SensorCalibration::applyMultiplier(windSpeed, sensors[index].windSpeedCorrection);
-    windDirection = SensorCalibration::applyWindDirectionCorrection(
-        windDirection, sensors[index].windDirectionCorrection);
-    rainAmount  = SensorCalibration::applyMultiplier(rainAmount, sensors[index].rainAmountCorrection);
-    rainRate    = SensorCalibration::applyMultiplier(rainRate,   sensors[index].rainRateCorrection);
-
-    // Log if corrections were applied (only build string if debug enabled)
-    if (logger.getLogLevel() >= LogLevel::DEBUG)
+    // Corrections (SensorCalibration.h, shared with generation 2), then the
+    // altitude conversion of the corrected pressure
+    using namespace SensorCalibration;
+    const Set &cal = sensors[index].cal;
+    const float rawTemp = temperature, rawHum = humidity, rawPress = pressure;
+    temperature = apply(cal, Temperature, temperature);
+    humidity = apply(cal, Humidity, humidity);
+    pressure = apply(cal, Pressure, pressure);
+    ppm = apply(cal, Co2, ppm);
+    lux = apply(cal, Lux, lux);
+    windSpeed = apply(cal, WindSpeed, windSpeed);
+    windDirection = (uint16_t)apply(cal, WindDirection, windDirection);
+    rainAmount = apply(cal, RainAmount, rainAmount);
+    rainRate = apply(cal, RainRate, rainRate);
+    if (sensors[index].hasPressure() && cal[Altitude] > 0)
     {
-        bool correctionsApplied = false;
-        String correctionLog;
-        correctionLog.reserve(128);
-        correctionLog += "Corrections applied to ";
-        correctionLog += sensors[index].name;
-        correctionLog += ": ";
-
-        if (sensors[index].hasTemperature() && sensors[index].temperatureCorrection != 0)
-        {
-            correctionLog += "Temp ";
-            correctionLog += String(originalTemp, 2);
-            correctionLog += "→";
-            correctionLog += String(temperature, 2);
-            correctionLog += "°C, ";
-            correctionsApplied = true;
-        }
-
-        if (sensors[index].hasHumidity() && sensors[index].humidityCorrection != 0)
-        {
-            correctionLog += "Hum ";
-            correctionLog += String(originalHum, 2);
-            correctionLog += "→";
-            correctionLog += String(humidity, 2);
-            correctionLog += "%, ";
-            correctionsApplied = true;
-        }
-
-        if (sensors[index].hasPressure() && sensors[index].pressureCorrection != 0)
-        {
-            correctionLog += "Press ";
-            correctionLog += String(originalPress, 2);
-            correctionLog += "→";
-            correctionLog += String(pressure, 2);
-            correctionLog += "hPa, ";
-            correctionsApplied = true;
-        }
-
-        if (sensors[index].hasPPM() && sensors[index].ppmCorrection != 0)
-        {
-            correctionLog += "CO2 ";
-            correctionLog += String(originalPPM, 0);
-            correctionLog += "→";
-            correctionLog += String(ppm, 0);
-            correctionLog += "ppm, ";
-            correctionsApplied = true;
-        }
-
-        if (sensors[index].hasLux() && sensors[index].luxCorrection != 0)
-        {
-            correctionLog += "Lux ";
-            correctionLog += String(originalLux, 1);
-            correctionLog += "→";
-            correctionLog += String(lux, 1);
-            correctionLog += "lx, ";
-            correctionsApplied = true;
-        }
-
-        if (sensors[index].hasWindSpeed() && sensors[index].windSpeedCorrection != 1.0f)
-        {
-            correctionLog += "Wind ";
-            correctionLog += String(originalWindSpeed, 1);
-            correctionLog += "→";
-            correctionLog += String(windSpeed, 1);
-            correctionLog += "m/s, ";
-            correctionsApplied = true;
-        }
-
-        if (sensors[index].hasWindDirection() && sensors[index].windDirectionCorrection != 0)
-        {
-            correctionLog += "Dir ";
-            correctionLog += String(originalWindDir);
-            correctionLog += "→";
-            correctionLog += String(windDirection);
-            correctionLog += "°, ";
-            correctionsApplied = true;
-        }
-
-        if (sensors[index].hasRainAmount() && sensors[index].rainAmountCorrection != 1.0f)
-        {
-            correctionLog += "Rain ";
-            correctionLog += String(originalRainAmount, 1);
-            correctionLog += "→";
-            correctionLog += String(rainAmount, 1);
-            correctionLog += "mm, ";
-            correctionsApplied = true;
-        }
-
-        if (sensors[index].hasRainRate() && sensors[index].rainRateCorrection != 1.0f)
-        {
-            correctionLog += "Rate ";
-            correctionLog += String(originalRainRate, 1);
-            correctionLog += "→";
-            correctionLog += String(rainRate, 1);
-            correctionLog += "mm/h, ";
-            correctionsApplied = true;
-        }
-
-        if (correctionsApplied)
-        {
-            // Remove trailing ", " if present
-            if (correctionLog.endsWith(", "))
-            {
-                correctionLog.remove(correctionLog.length() - 2);
-            }
-            logger.debug(correctionLog);
-        }
+        pressure = pressureAtAltitude(pressure, (int)cal[Altitude], temperature);
     }
-
-    // Adjust pressure for altitude
-    // Only adjust if the sensor has pressure capability and altitude is set
-    if (sensors[index].hasPressure() && sensors[index].altitude > 0)
+    if (logger.getLogLevel() >= LogLevel::DEBUG &&
+        (rawTemp != temperature || rawHum != humidity || rawPress != pressure))
     {
-        float adjustedPressure = relativeToAbsolutePressure(pressure, sensors[index].altitude, temperature);
-        logger.debug("Adjusted pressure from " + String(pressure, 2) + " hPa to " +
-                     String(adjustedPressure, 2) + " hPa at altitude " +
-                     String(sensors[index].altitude) + " m");
-        pressure = adjustedPressure;
+        logger.debug("Corrected " + sensors[index].name + ": " + String(rawTemp, 2) + " -> " + String(temperature, 2) +
+                     " degC, " + String(rawHum, 2) + " -> " + String(humidity, 2) + " %, " + String(rawPress, 2) +
+                     " -> " + String(pressure, 2) + " hPa");
     }
 
     // Update only relevant values according to sensor type
@@ -563,11 +424,7 @@ bool SensorManager::forwardSensorData(const SensorData &sensor)
 // Update sensor configuration
 bool SensorManager::updateSensorConfig(int index, const String &name, SensorType deviceType,
                                        uint32_t serialNumber, uint32_t deviceKey,
-                                       const String &customUrl, int altitude,
-                                       float tempCorr, float humCorr, float pressCorr,
-                                       float ppmCorr, float luxCorr,
-                                       float windSpeedCorr, int windDirCorr,
-                                       float rainAmountCorr, float rainRateCorr)
+                                       const String &customUrl, const SensorCalibration::Set &cal)
 {
     std::unique_lock<std::mutex> lock(sensorMutex);
 
@@ -602,18 +459,7 @@ bool SensorManager::updateSensorConfig(int index, const String &name, SensorType
     sensors[index].serialNumber = serialNumber;
     sensors[index].deviceKey = deviceKey;
     sensors[index].customUrl = customUrl;
-    sensors[index].altitude = altitude;
-
-    // Update correction values
-    sensors[index].temperatureCorrection = tempCorr;
-    sensors[index].humidityCorrection = humCorr;
-    sensors[index].pressureCorrection = pressCorr;
-    sensors[index].ppmCorrection = ppmCorr;
-    sensors[index].luxCorrection = luxCorr;
-    sensors[index].windSpeedCorrection = windSpeedCorr;
-    sensors[index].windDirectionCorrection = windDirCorr;
-    sensors[index].rainAmountCorrection = rainAmountCorr;
-    sensors[index].rainRateCorrection = rainRateCorr;
+    sensors[index].cal = cal;
 
     logger.info("Updated configuration for sensor: " + name + " (SN: " + formatSN(serialNumber) + ")");
     return saveAndUnlock(lock);
@@ -711,6 +557,127 @@ std::vector<SensorData> SensorManager::getActiveSensors() const
         }
     }
     return result;
+}
+
+// A generation 2 sensor as a readings row (SensorData::gen2)
+static void gen2Row(const Gen2Sensor &g, SensorData &out)
+{
+    out = SensorData();
+    out.configured = true;
+    out.gen2 = true;
+    out.serialNumber = g.devId;
+    out.name = g.name;
+    out.gen2Q = g.qMask;
+    out.gen2QNow = g.qNow;
+    out.gen2QBad = g.qBad;
+    out.hwType = g.hwType;
+    out.fwVersion = g.hasFw ? g.fwVersion() : 0;
+    out.temperature = g.value[Qty::Temperature];
+    out.humidity = g.value[Qty::Humidity];
+    out.pressure = g.value[Qty::Pressure];
+    out.ppm = g.value[Qty::Co2];
+    out.lux = g.value[Qty::Lux];
+    out.batteryVoltage = g.value[Qty::Battery];
+    out.rssi = (int)g.value[Qty::Rssi];
+    out.lastSeen = g.seen ? (g.lastSeenMs ? g.lastSeenMs : 1) : 0;
+}
+
+std::vector<SensorData> SensorManager::getReadings() const
+{
+    std::vector<SensorData> rows;
+    std::lock_guard<std::mutex> lock(sensorMutex);
+    rows.reserve(readingCountLocked()); // one allocation, one moment
+    for (size_t i = 0; i < sensorCount; i++)
+    {
+        if (sensors[i].configured)
+        {
+            rows.push_back(sensors[i]);
+        }
+    }
+    for (size_t i = 0; i < gen2Count; i++)
+    {
+        if (gen2[i].configured)
+        {
+            rows.emplace_back();
+            gen2Row(gen2[i], rows.back());
+        }
+    }
+    return rows;
+}
+
+size_t SensorManager::readingCountLocked() const
+{
+    size_t n = 0;
+    for (size_t i = 0; i < sensorCount; i++)
+    {
+        n += sensors[i].configured;
+    }
+    for (size_t i = 0; i < gen2Count; i++)
+    {
+        n += gen2[i].configured;
+    }
+    return n;
+}
+
+// Heap of a String copy (text, terminator, allocation header), 0 when empty
+static size_t textBytes(const String &s)
+{
+    return s.length() ? s.length() + 1 + 16 : 0;
+}
+
+size_t SensorManager::readingCount(size_t *bytes) const
+{
+    std::lock_guard<std::mutex> lock(sensorMutex);
+    const size_t n = readingCountLocked();
+    if (bytes != nullptr)
+    {
+        size_t b = n * sizeof(SensorData);
+        for (size_t i = 0; i < sensorCount; i++)
+        {
+            if (sensors[i].configured)
+            {
+                b += textBytes(sensors[i].name) + textBytes(sensors[i].customUrl);
+            }
+        }
+        for (size_t i = 0; i < gen2Count; i++)
+        {
+            if (gen2[i].configured)
+            {
+                b += textBytes(gen2[i].name);
+            }
+        }
+        *bytes = b;
+    }
+    return n;
+}
+
+bool SensorManager::getGen2Reading(uint32_t devId, SensorData &out) const
+{
+    std::lock_guard<std::mutex> lock(sensorMutex);
+    const int i = findGen2Locked(devId);
+    if (i < 0)
+    {
+        return false;
+    }
+    gen2Row(gen2[i], out);
+    return true;
+}
+
+bool SensorManager::takeGen2Mqtt(uint32_t &devId, bool &discover)
+{
+    std::lock_guard<std::mutex> lock(sensorMutex);
+    for (size_t i = 0; i < gen2Count; i++)
+    {
+        Gen2Sensor &g = gen2[i];
+        if (g.configured && (g.mqttDue || g.mqttDiscover))
+        {
+            devId = g.devId;
+            discover = g.mqttDiscover;
+            g.mqttDue = g.mqttDiscover = false;
+            return true;
+        }
+    }
+    return false;
 }
 
 bool SensorManager::getSensorCopy(int index, SensorData &out) const
@@ -862,7 +829,7 @@ bool SensorManager::snapshotLocked(String &json)
             sensor["deviceKey"] = sensors[i].deviceKey;
             sensor["name"] = sensors[i].name;
             sensor["customUrl"] = sensors[i].customUrl;
-            sensor["altitude"] = sensors[i].altitude;
+            sensor["altitude"] = (int)sensors[i].cal[SensorCalibration::Altitude];
 
             // Also save daily rain total and time of last reset
             if (sensors[i].hasRainAmount())
@@ -871,15 +838,9 @@ bool SensorManager::snapshotLocked(String &json)
                 sensor["lastRainReset"] = sensors[i].lastRainReset;
             }
 
-            sensor["temperatureCorrection"] = sensors[i].temperatureCorrection;
-            sensor["humidityCorrection"] = sensors[i].humidityCorrection;
-            sensor["pressureCorrection"] = sensors[i].pressureCorrection;
-            sensor["ppmCorrection"] = sensors[i].ppmCorrection;
-            sensor["luxCorrection"] = sensors[i].luxCorrection;
-            sensor["windSpeedCorrection"] = sensors[i].windSpeedCorrection;
-            sensor["windDirectionCorrection"] = sensors[i].windDirectionCorrection;
-            sensor["rainAmountCorrection"] = sensors[i].rainAmountCorrection;
-            sensor["rainRateCorrection"] = sensors[i].rainRateCorrection;
+            // Every correction (the file format of earlier versions)
+            SensorCalibration::writeJson(sensor, sensors[i].cal, false, SensorCalibration::Temperature,
+                                         SensorCalibration::Altitude);
         }
     }
     // Generation 2 sensors in their own array: firmware without protocol v2
@@ -911,6 +872,11 @@ bool SensorManager::snapshotLocked(String &json)
             obj["ackRetries"] = g.config.ackRetries;
             obj["ackBackoff"] = g.config.ackBackoffS;
             obj["cfgVersion"] = g.cfgVersion;
+            if (g.qMask)
+            {
+                obj["q"] = g.qMask;
+            }
+            SensorCalibration::writeJson(obj, g.cal, true); // only what corrects something
             if (g.hasFw)
             {
                 char fw[12];
@@ -1165,6 +1131,15 @@ int SensorManager::parseSensorsLocked(const String &fileContent, const char *pat
     JsonArray sensorArray = doc["sensors"].as<JsonArray>();
     for (JsonObject sensorObj : sensorArray)
     {
+        // A removed type (SHT40, DIY_TEMP, ...) is dropped: never loaded,
+        // so the next regular save leaves it out of the file
+        const uint8_t typeValue = sensorObj["deviceType"].as<uint8_t>(); // 0 when out of range
+        if (!SensorTypeIds::supportedType(typeValue))
+        {
+            logger.warning("Dropped sensor " + formatSN(sensorObj["serialNumber"] | 0u) + ": type 0x" +
+                           String(typeValue, HEX) + " is no longer supported");
+            continue;
+        }
         if (sensorCount < MAX_SENSORS && !sensors.ensure(sensorCount))
         {
             partialLoad = true;
@@ -1173,7 +1148,6 @@ int SensorManager::parseSensorsLocked(const String &fileContent, const char *pat
         }
         if (sensorCount < MAX_SENSORS)
         {
-            uint8_t typeValue = sensorObj["deviceType"];
             SensorType deviceType = static_cast<SensorType>(typeValue);
             uint32_t serialNumber = sensorObj["serialNumber"];
             uint32_t deviceKey = sensorObj["deviceKey"];
@@ -1216,51 +1190,8 @@ int SensorManager::parseSensorsLocked(const String &fileContent, const char *pat
                 sensors[sensorCount].lastRainReset = 0;
             }
 
-            if (sensorObj.containsKey("altitude"))
-            {
-                sensors[sensorCount].altitude = sensorObj["altitude"].as<int>();
-            }
-            else
-            {
-                sensors[sensorCount].altitude = 0;
-            }
-
-            if (sensorObj.containsKey("temperatureCorrection"))
-            {
-                sensors[sensorCount].temperatureCorrection = sensorObj["temperatureCorrection"].as<float>();
-            }
-            if (sensorObj.containsKey("humidityCorrection"))
-            {
-                sensors[sensorCount].humidityCorrection = sensorObj["humidityCorrection"].as<float>();
-            }
-            if (sensorObj.containsKey("pressureCorrection"))
-            {
-                sensors[sensorCount].pressureCorrection = sensorObj["pressureCorrection"].as<float>();
-            }
-            if (sensorObj.containsKey("ppmCorrection"))
-            {
-                sensors[sensorCount].ppmCorrection = sensorObj["ppmCorrection"].as<float>();
-            }
-            if (sensorObj.containsKey("luxCorrection"))
-            {
-                sensors[sensorCount].luxCorrection = sensorObj["luxCorrection"].as<float>();
-            }
-            if (sensorObj.containsKey("windSpeedCorrection"))
-            {
-                sensors[sensorCount].windSpeedCorrection = sensorObj["windSpeedCorrection"].as<float>();
-            }
-            if (sensorObj.containsKey("windDirectionCorrection"))
-            {
-                sensors[sensorCount].windDirectionCorrection = sensorObj["windDirectionCorrection"].as<int>();
-            }
-            if (sensorObj.containsKey("rainAmountCorrection"))
-            {
-                sensors[sensorCount].rainAmountCorrection = sensorObj["rainAmountCorrection"].as<float>();
-            }
-            if (sensorObj.containsKey("rainRateCorrection"))
-            {
-                sensors[sensorCount].rainRateCorrection = sensorObj["rainRateCorrection"].as<float>();
-            }
+            sensors[sensorCount].cal = SensorCalibration::Set();
+            SensorCalibration::readJson(sensorObj, sensors[sensorCount].cal);
             sensorCount++;
         }
         else
@@ -1309,6 +1240,8 @@ int SensorManager::parseSensorsLocked(const String &fileContent, const char *pat
         g.config.ackRetries = obj["ackRetries"] | g.config.ackRetries;
         g.config.ackBackoffS = obj["ackBackoff"] | g.config.ackBackoffS;
         g.cfgVersion = obj["cfgVersion"] | g.cfgVersion;
+        g.qMask = obj["q"] | 0u;
+        SensorCalibration::readJson(obj, g.cal);
         if (!Gen2Config::validVersion(g.cfgVersion))
         {
             g.cfgVersion = 1;
@@ -1666,6 +1599,7 @@ bool SensorManager::handleGen2Frame(const RadioPacket &packet, const ep::FrameIn
             }
             g.hasFw = true;
             scheduleGen2SaveLocked(nowMs); // the firmware version survives a gateway restart
+            g.mqttDiscover = true;         // Home Assistant: the device's model / sw_version
         }
         g.hwType = jr.hwType;
         g.fwMajor = jr.fwMajor;
@@ -1772,10 +1706,12 @@ bool SensorManager::handleGen2Frame(const RadioPacket &packet, const ep::FrameIn
         g.lastFcnt = fcnt32;
         g.configVersion = info.fctrl & ep::kFctrlCfgMask; // version the sensor runs
         const uint8_t bootStateBefore = g.bootState;
+        const uint16_t qBefore = g.qMask;
         g.upDownlinkRssi = Gen2Link::NONE;
         g.upDownlinkSnr = Gen2Link::NONE;
         OtaJob::Up ou;
-        const bool confirmed = Gen2Response::decodeUp(g, payload, payloadLen, nowMs, &ou);
+        bool values = false;
+        const bool confirmed = Gen2Response::decodeUp(g, payload, payloadLen, nowMs, &ou, &values);
         // Link history (spec 4.3): only while the sensor runs the desired
         // configuration, so the TX power of the sample is known
         if (Gen2Config::inSync(g.configVersion, g.cfgVersion))
@@ -1783,6 +1719,14 @@ bool SensorManager::handleGen2Frame(const RadioPacket &packet, const ep::FrameIn
             g.link.add(gen2LinkNowS(), packet.rssi, (int)floorf(packet.snr), g.upDownlinkRssi, g.upDownlinkSnr,
                        g.effectiveTxPower(), g.linkLostPending);
             g.linkLostPending = 0;
+        }
+        // MQTT only for an UP with readings (a status report or OTA status
+        // alone would re-send the same values)
+        g.mqttDue = g.mqttDue || values;
+        if (g.qMask != qBefore)
+        {
+            scheduleGen2SaveLocked(nowMs); // the reported quantities are kept ("q")
+            g.mqttDiscover = true;         // Home Assistant learns the new entities
         }
         if (g.bootState != bootStateBefore)
         {
@@ -1891,6 +1835,13 @@ bool SensorManager::getGen2Sensor(uint32_t devId, Gen2Sensor &out) const
 
 int SensorManager::setGen2Config(uint32_t devId, const Gen2Config::Values &values)
 {
+    const int r = setGen2Edit(devId, nullptr, nullptr, &values);
+    return r > 0 ? 1 : r;
+}
+
+int SensorManager::setGen2Edit(uint32_t devId, const String *name, const SensorCalibration::Set *cal,
+                               const Gen2Config::Values *config)
+{
     std::unique_lock<std::mutex> lock(sensorMutex);
     int i = findGen2Locked(devId);
     if (i < 0)
@@ -1898,43 +1849,78 @@ int SensorManager::setGen2Config(uint32_t devId, const Gen2Config::Values &value
         return -1;
     }
     Gen2Sensor &g = gen2[i];
-    Gen2Config::Values v = values;
+    const String oldName = g.name;
+    const SensorCalibration::Set oldCal = g.cal;
+    const Gen2Config::Values oldConfig = g.config;
+    int changed = 0;
+    if (name != nullptr && g.name != *name)
+    {
+        changed |= GEN2_EDIT_NAME;
+        g.name = *name;
+    }
+    if (cal != nullptr && memcmp(g.cal.v, cal->v, sizeof(cal->v)) != 0)
+    {
+        changed |= GEN2_EDIT_CAL;
+        g.cal = *cal;
+    }
+    Gen2Config::Values v = config != nullptr ? *config : g.config;
     Gen2Config::clamp(v);
-    if (v == g.config)
+    if (config != nullptr && !(v == g.config))
+    {
+        changed |= GEN2_EDIT_CONFIG;
+        g.config = v;
+        g.cfgVersion = Gen2Config::nextVersion(g.cfgVersion, g.configVersion);
+        // The reported power belongs to the old configuration (spec 4.3);
+        // after a power change, or when a reported power is forgotten, the
+        // next UP brings a fresh status report
+        if (v.txPowerDbm != oldConfig.txPowerDbm || g.reportedTx != INT8_MAX)
+        {
+            g.statusRequested = true;
+        }
+        g.reportedTx = INT8_MAX;
+    }
+    if (changed == 0)
     {
         return 0;
     }
-    Gen2Config::Values old = g.config;
-    g.config = v;
-    g.cfgVersion = Gen2Config::nextVersion(g.cfgVersion, g.configVersion);
-    // The reported power belongs to the old configuration (spec 4.3); after a
-    // power change, or when a reported power is forgotten, the next UP brings
-    // a fresh status report
-    if (v.txPowerDbm != old.txPowerDbm || g.reportedTx != INT8_MAX)
+    char line[160];
+    if (changed & GEN2_EDIT_CONFIG)
     {
-        g.statusRequested = true;
+        snprintf(line, sizeof(line),
+                 "Generation 2 sensor %s: configuration v%u (interval %u s, TX %d dBm) - sent with the next uplink",
+                 g.name.c_str(), (unsigned)g.cfgVersion, (unsigned)v.intervalS, (int)v.txPowerDbm);
     }
-    g.reportedTx = INT8_MAX;
-    logger.info("Generation 2 sensor " + g.name + ": configuration v" + String(g.cfgVersion) + " (interval " +
-                String(v.intervalS) + " s, TX " + String(v.txPowerDbm) + " dBm) - sent with the next uplink");
-    if (saveAndUnlock(lock))
+    else
     {
-        return 1;
+        snprintf(line, sizeof(line), "Generation 2 sensor %s: name / corrections saved (from the next uplink)",
+                 g.name.c_str());
+    }
+    logger.info(line);
+    if (saveAndUnlock(lock)) // one sensors.json write for all of it
+    {
+        return changed;
     }
     // Not on flash: take the values back so the UI does not show a state
-    // that a restart would lose. loop() may already have sent them under
-    // the raised version, so the old values get yet another version: a
-    // number is never reused for different content (spec 4.2).
+    // that a restart would lose
     lock.lock();
     i = findGen2Locked(devId);
     if (i >= 0)
     {
-        gen2[i].config = old;
-        gen2[i].cfgVersion = Gen2Config::nextVersion(gen2[i].cfgVersion, gen2[i].configVersion);
-        if (gen2[i].reportedTx != INT8_MAX)
+        Gen2Sensor &r = gen2[i];
+        r.name = oldName;
+        r.cal = oldCal;
+        if (changed & GEN2_EDIT_CONFIG)
         {
-            gen2[i].statusRequested = true;
-            gen2[i].reportedTx = INT8_MAX;
+            // loop() may already have sent the new configuration under the
+            // raised version, so the old values get yet another version: a
+            // number is never reused for different content (spec 4.2)
+            r.config = oldConfig;
+            r.cfgVersion = Gen2Config::nextVersion(r.cfgVersion, r.configVersion);
+            if (r.reportedTx != INT8_MAX)
+            {
+                r.statusRequested = true;
+                r.reportedTx = INT8_MAX;
+            }
         }
     }
     return -2;

@@ -125,9 +125,12 @@ private:
     void handleLogout(AsyncWebServerRequest *request);
     void handlePassword(AsyncWebServerRequest *request);
     void handlePasswordPost(AsyncWebServerRequest *request);
+    void handleSystemMode(AsyncWebServerRequest *request);
 
     // Setup routes for web server
     void setupRoutes();
+    using Handler = void (WebPortal::*)(AsyncWebServerRequest *);
+    void route(const char *uri, WebRequestMethodComposite method, Handler handler);
     // First setup (AP, no WiFi configured, no uplink): redirect to /config, true
     bool guardAPOnly(AsyncWebServerRequest *request);
 
@@ -156,6 +159,7 @@ private:
     void handleGen2Delete(AsyncWebServerRequest *request);
     void handleGen2Detail(AsyncWebServerRequest *request);
     void handleGen2Config(AsyncWebServerRequest *request);
+    void handleGen2Edit(AsyncWebServerRequest *request);
     void handleGen2Status(AsyncWebServerRequest *request);
     void handleGen2ResetNonce(AsyncWebServerRequest *request);
     void sendGen2Detail(AsyncWebServerRequest *request, uint32_t devId, const String &message, int code = 200);
@@ -169,9 +173,8 @@ private:
     void handleLogLevel(AsyncWebServerRequest *request);
     void handleAPI(AsyncWebServerRequest *request);
     void handleNetwork(AsyncWebServerRequest *request);
-#if defined(HAS_ETHERNET) || defined(HAS_LTE)
     void handleNetworkPost(AsyncWebServerRequest *request);
-#endif
+    bool saveWifi(const String &ssid, const String &password, bool enabled, int zone);
     void handleDiagNetwork(AsyncWebServerRequest *request);
     void handleMqtt(AsyncWebServerRequest *request);
     void handleMqttPost(AsyncWebServerRequest *request);

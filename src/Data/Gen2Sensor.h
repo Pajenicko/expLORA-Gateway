@@ -26,6 +26,8 @@
 #include "../Protocol/Gen2Link.h"
 #include "../Protocol/Gen2Session.h"
 #include "../Protocol/OtaJob.h"
+#include "Quantity.h"
+#include "SensorCalibration.h"
 
 #ifndef MAX_GEN2_SENSORS
 #define MAX_GEN2_SENSORS 10 // RAM budget of the Pro (no PSRAM); separate from MAX_SENSORS
@@ -66,6 +68,11 @@ struct Gen2Sensor
     uint32_t otaWatchFw = 0, otaWatchCrc = 0;
     OtaJob::Deadline otaAbort;
 
+    // Quantities the sensor has reported (Home Assistant entities, the
+    // correction fields; Qty::mask) and its corrections (generation 1 key names)
+    uint16_t qMask = 0;
+    SensorCalibration::Set cal;
+
     // Desired configuration (sent in JOIN_ACC and, on a version mismatch, in a DOWN)
     Gen2Config::Values config;
     uint8_t cfgVersion = 1;    // 1-15, raised on every change of config
@@ -101,10 +108,17 @@ struct Gen2Sensor
     uint32_t downRx1 = 0, downRx2 = 0, downNotSent = 0;
     uint8_t lastDownOutcome = 0xFF; // RadioTask::TxOutcome of the last response, 0xFF none
     bool sessionUp = false;         // an UP verified under the current session
-    // Last values reported in an UP (ep::kInvalid* when absent)
-    int16_t temperature = INT16_MIN; // 0.01 degC
-    uint16_t humidity = 0xFFFF;      // 0.01 %RH
-    uint16_t batteryMv = 0xFFFF;
+    // Last readings, corrected (lastUp keeps the raw TLVs); valid for the
+    // quantities in qNow (reported since this start, the last report not
+    // an invalid-value sentinel); qBad: the last report was the sentinel
+    // (Gen2Values::apply)
+    float value[Qty::COUNT] = {};
+    uint16_t qNow = 0;
+    uint16_t qBad = 0;
+    // MQTT (RAM): an UP with readings to publish; discovery again (the
+    // reported quantities grew, a new firmware / HW type from a JOIN);
+    // taken by SensorManager::takeGen2Mqtt
+    bool mqttDue = false, mqttDiscover = false;
     int8_t downlinkRssi = INT8_MIN;  // dBm of the last downlink the sensor received
     // Link history (spec 4.3): last 20 UPs - RSSI/SNR, reported downlink RSSI/SNR, TX power, losses
     Gen2Link::History link;

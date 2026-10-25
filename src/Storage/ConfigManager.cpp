@@ -177,6 +177,7 @@ bool ConfigManager::loadFromFS()
     mqttPrefix = doc["mqttPrefix"] | MQTT_DEFAULT_PREFIX;
     mqttHAPrefix = doc["mqttHAPrefix"] | HA_DISCOVERY_DEFAULT_PREFIX;
     mqttHAEnabled = doc["mqttHAEnabled"] | HA_DISCOVERY_DEFAULT_ENABLED;
+    uiAdvanced = doc["uiAdvanced"] | false;
 
     logger.debug("Loaded config - SSID: " + wifiSSID +
                  ", Password length: " + String(wifiPassword.length()) +
@@ -213,6 +214,7 @@ bool ConfigManager::saveToFS()
     doc["mqttPrefix"] = mqttPrefix;
     doc["mqttHAEnabled"] = mqttHAEnabled;
     doc["mqttHAPrefix"] = mqttHAPrefix;
+    doc["uiAdvanced"] = uiAdvanced;
     if (doc.overflowed())
     {
         logger.error("Configuration does not fit the JSON document - not saved");
@@ -425,6 +427,21 @@ bool ConfigManager::setSignedOnly(bool on)
         return false;
     }
     signedOnly = on;
+    return true;
+}
+
+bool ConfigManager::setUiAdvanced(bool advanced)
+{
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
+    // Only in config.json: RAM keeps the old mode when the file is not written
+    const bool old = uiAdvanced;
+    uiAdvanced = advanced;
+    if (!saveToFS())
+    {
+        uiAdvanced = old;
+        return false;
+    }
     return true;
 }
 
@@ -685,6 +702,7 @@ void ConfigManager::resetToDefaults()
 {
     wifiSSID = "";
     wifiPassword = "";
+    uiAdvanced = false;
     configMode = true;
     lastWifiAttempt = 0;
     logLevel = LogLevel::INFO;

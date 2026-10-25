@@ -22,6 +22,8 @@
 #include "WebServer.h"
 #include "../Hardware/Liveness.h"
 #include "HTMLGenerator.h"
+#include "WebAssets.h"
+#include "ApiRow.h"
 #include "../Data/TimeZones.h"
 #include <WiFi.h>
 #include "../Network/Uplink.h"
@@ -152,10 +154,14 @@ WebPortal::WebPortal(SensorManager &sensors, Logger &log, String &ssid, String &
 
 // Modify the init function to create the task
 static unsigned heavyResponsesRunning(); // the heavy response slots, below
+static bool rejectLowMemory(AsyncWebServerRequest *request, size_t peak, size_t block);
+static size_t stringPagePeak(size_t pageSize);
 
 bool WebPortal::init()
 {
     logger.info("Initializing web portal");
+
+    HTMLGenerator::setAdvanced(configManager.uiAdvanced);
 
     // Captive portal while the AP runs without local network access (see Uplink)
     if (uplink->isCaptive())
@@ -200,8 +206,23 @@ bool WebPortal::init()
     return true;
 }
 
+// Asset from flash (no copy), cached for a year: its URL changes with its
+// content (WebAssets::TOKEN)
+static void sendAsset(AsyncWebServerRequest *request, const char *type, const char *data, size_t len)
+{
+    AsyncWebServerResponse *response = request->beginResponse(200, type, (const uint8_t *)data, len);
+    response->addHeader("Cache-Control", "public, max-age=31536000, immutable");
+    request->send(response);
+}
+
+// One route to a handler of this class: a single lambda type for every
+// route (std::bind per route cost ~100 B of code each)
+void WebPortal::route(const char *uri, WebRequestMethodComposite method, Handler handler)
+{
+    server.on(uri, method, [this, handler](AsyncWebServerRequest *request) { (this->*handler)(request); });
+}
+
 // Setup routes for web server
-// Modify WebPortal::setupRoutes() in WebServer.cpp
 void WebPortal::setupRoutes()
 {
     if (routesRegistered)
@@ -215,71 +236,76 @@ void WebPortal::setupRoutes()
     server.addHandler(new OversizeRequestHandler(auth));
     server.addMiddleware([this](AsyncWebServerRequest *request, ArMiddlewareNext next)
                          { requireLogin(request, next); });
-    server.on("/login", HTTP_GET, std::bind(&WebPortal::handleLogin, this, std::placeholders::_1));
-    server.on("/login", HTTP_POST, std::bind(&WebPortal::handleLoginPost, this, std::placeholders::_1));
-    server.on("/logout", HTTP_GET, std::bind(&WebPortal::handleLogout, this, std::placeholders::_1));
-    server.on("/password", HTTP_GET, std::bind(&WebPortal::handlePassword, this, std::placeholders::_1));
-    server.on("/password", HTTP_POST, std::bind(&WebPortal::handlePasswordPost, this, std::placeholders::_1));
+    route("/login", HTTP_GET, &WebPortal::handleLogin);
+    route("/login", HTTP_POST, &WebPortal::handleLoginPost);
+    route("/logout", HTTP_GET, &WebPortal::handleLogout);
+    route("/password", HTTP_GET, &WebPortal::handlePassword);
+    route("/password", HTTP_POST, &WebPortal::handlePasswordPost);
+    route("/system/mode", HTTP_POST, &WebPortal::handleSystemMode);
 
-    server.on("/", HTTP_GET, std::bind(&WebPortal::handleRoot, this, std::placeholders::_1));
-    server.on("/config", HTTP_GET, std::bind(&WebPortal::handleConfig, this, std::placeholders::_1));
-    server.on("/config", HTTP_POST, std::bind(&WebPortal::handleConfigPost, this, std::placeholders::_1));
-    server.on("/timezone", HTTP_POST, std::bind(&WebPortal::handleTimezonePost, this, std::placeholders::_1));
+    route("/", HTTP_GET, &WebPortal::handleRoot);
+    // Shared stylesheet and script (public, cached; the pages link them
+    // with the version token)
+    server.on("/a.css", HTTP_GET, [](AsyncWebServerRequest *request)
+              { sendAsset(request, "text/css", WebAssets::CSS, sizeof(WebAssets::CSS) - 1); });
+    server.on("/a.js", HTTP_GET, [](AsyncWebServerRequest *request)
+              { sendAsset(request, "text/javascript", WebAssets::JS, sizeof(WebAssets::JS) - 1); });
+    route("/config", HTTP_GET, &WebPortal::handleConfig);
+    route("/config", HTTP_POST, &WebPortal::handleConfigPost);
+    route("/timezone", HTTP_POST, &WebPortal::handleTimezonePost);
 
     // Sensor management
-    server.on("/sensors/add", HTTP_GET, std::bind(&WebPortal::handleSensorAdd, this, std::placeholders::_1));
-    server.on("/sensors/add", HTTP_POST, std::bind(&WebPortal::handleSensorAddPost, this, std::placeholders::_1));
-    server.on("/sensors/edit", HTTP_GET, std::bind(&WebPortal::handleSensorEdit, this, std::placeholders::_1));
-    server.on("/sensors/update", HTTP_POST, std::bind(&WebPortal::handleSensorEditPost, this, std::placeholders::_1));
-    server.on("/sensors/delete", HTTP_GET, std::bind(&WebPortal::handleSensorDelete, this, std::placeholders::_1));
-    server.on("/sensors/add2", HTTP_GET, std::bind(&WebPortal::handleGen2Add, this, std::placeholders::_1));
-    server.on("/sensors/add2", HTTP_POST, std::bind(&WebPortal::handleGen2AddPost, this, std::placeholders::_1));
-    server.on("/sensors/delete2", HTTP_POST, std::bind(&WebPortal::handleGen2Delete, this, std::placeholders::_1));
-    server.on("/sensors/gen2/config", HTTP_POST, std::bind(&WebPortal::handleGen2Config, this, std::placeholders::_1));
-    server.on("/sensors/gen2/status", HTTP_POST, std::bind(&WebPortal::handleGen2Status, this, std::placeholders::_1));
-    server.on("/sensors/gen2/resetnonce", HTTP_POST,
-              std::bind(&WebPortal::handleGen2ResetNonce, this, std::placeholders::_1));
-    server.on("/sensors/gen2/ota", HTTP_POST, std::bind(&WebPortal::handleGen2Ota, this, std::placeholders::_1));
-    server.on("/sensors/gen2", HTTP_GET, std::bind(&WebPortal::handleGen2Detail, this, std::placeholders::_1));
+    route("/sensors/add", HTTP_GET, &WebPortal::handleSensorAdd);
+    route("/sensors/add", HTTP_POST, &WebPortal::handleSensorAddPost);
+    route("/sensors/edit", HTTP_GET, &WebPortal::handleSensorEdit);
+    route("/sensors/update", HTTP_POST, &WebPortal::handleSensorEditPost);
+    route("/sensors/delete", HTTP_GET, &WebPortal::handleSensorDelete);
+    route("/sensors/add2", HTTP_GET, &WebPortal::handleGen2Add);
+    route("/sensors/add2", HTTP_POST, &WebPortal::handleGen2AddPost);
+    route("/sensors/delete2", HTTP_POST, &WebPortal::handleGen2Delete);
+    route("/sensors/gen2/config", HTTP_POST, &WebPortal::handleGen2Config);
+    route("/sensors/gen2/edit", HTTP_POST, &WebPortal::handleGen2Edit);
+    route("/sensors/gen2/status", HTTP_POST, &WebPortal::handleGen2Status);
+    route("/sensors/gen2/resetnonce", HTTP_POST, &WebPortal::handleGen2ResetNonce);
+    route("/sensors/gen2/ota", HTTP_POST, &WebPortal::handleGen2Ota);
+    route("/sensors/gen2", HTTP_GET, &WebPortal::handleGen2Detail);
     // OTA image store (sensor images, uploaded streamed to LittleFS)
     server.on(
         "/ota/upload", HTTP_POST, [this](AsyncWebServerRequest *request) { this->handleOtaImageComplete(request); },
         [this](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
             this->handleOtaImageChunk(request, filename, index, data, len, final);
         });
-    server.on("/ota/delete", HTTP_POST, std::bind(&WebPortal::handleOtaImageDelete, this, std::placeholders::_1));
-    server.on("/sensors", HTTP_GET, std::bind(&WebPortal::handleSensors, this, std::placeholders::_1));
+    route("/ota/delete", HTTP_POST, &WebPortal::handleOtaImageDelete);
+    route("/sensors", HTTP_GET, &WebPortal::handleSensors);
 
     // Logs
-    server.on("/logs/clear", HTTP_GET, std::bind(&WebPortal::handleLogsClear, this, std::placeholders::_1));
-    server.on("/logs/level", HTTP_POST, std::bind(&WebPortal::handleLogLevel, this, std::placeholders::_1));
-    server.on("/logs", HTTP_GET, std::bind(&WebPortal::handleLogs, this, std::placeholders::_1));
+    route("/logs/clear", HTTP_GET, &WebPortal::handleLogsClear);
+    route("/logs/level", HTTP_POST, &WebPortal::handleLogLevel);
+    route("/logs", HTTP_GET, &WebPortal::handleLogs);
 
-    // Network (WiFi settings post to /config, shared with the AP setup page)
-    server.on("/network", HTTP_GET, std::bind(&WebPortal::handleNetwork, this, std::placeholders::_1));
-#if defined(HAS_ETHERNET) || defined(HAS_LTE)
-    server.on("/network", HTTP_POST, std::bind(&WebPortal::handleNetworkPost, this, std::placeholders::_1));
-#endif
+    // Network (the AP setup page posts its WiFi form to /config)
+    route("/network", HTTP_GET, &WebPortal::handleNetwork);
+    route("/network", HTTP_POST, &WebPortal::handleNetworkPost);
 
     // MQTT
-    server.on("/mqtt", HTTP_GET, std::bind(&WebPortal::handleMqtt, this, std::placeholders::_1));
-    server.on("/mqtt", HTTP_POST, std::bind(&WebPortal::handleMqttPost, this, std::placeholders::_1));
+    route("/mqtt", HTTP_GET, &WebPortal::handleMqtt);
+    route("/mqtt", HTTP_POST, &WebPortal::handleMqttPost);
 
     // API
-    server.on("/api", HTTP_GET, std::bind(&WebPortal::handleAPI, this, std::placeholders::_1));
+    route("/api", HTTP_GET, &WebPortal::handleAPI);
 
     // Diagnostics
-    server.on("/diag/heap", HTTP_GET, std::bind(&WebPortal::handleDiagHeap, this, std::placeholders::_1));
-    server.on("/diag/network", HTTP_GET, std::bind(&WebPortal::handleDiagNetwork, this, std::placeholders::_1));
+    route("/diag/heap", HTTP_GET, &WebPortal::handleDiagHeap);
+    route("/diag/network", HTTP_GET, &WebPortal::handleDiagNetwork);
 
     // Firmware update endpoints
-    server.on("/firmware/version", HTTP_GET, std::bind(&WebPortal::handleFirmwareVersion, this, std::placeholders::_1));
-    server.on("/firmware/check", HTTP_GET, std::bind(&WebPortal::handleFirmwareCheck, this, std::placeholders::_1));
-    server.on("/firmware/update", HTTP_POST, std::bind(&WebPortal::handleFirmwareUpdate, this, std::placeholders::_1));
-    server.on("/firmware", HTTP_GET, std::bind(&WebPortal::handleFirmwarePage, this, std::placeholders::_1));
-    server.on("/firmware/signed", HTTP_POST, std::bind(&WebPortal::handleSignedOnlyPost, this, std::placeholders::_1));
+    route("/firmware/version", HTTP_GET, &WebPortal::handleFirmwareVersion);
+    route("/firmware/check", HTTP_GET, &WebPortal::handleFirmwareCheck);
+    route("/firmware/update", HTTP_POST, &WebPortal::handleFirmwareUpdate);
+    route("/firmware", HTTP_GET, &WebPortal::handleFirmwarePage);
+    route("/firmware/signed", HTTP_POST, &WebPortal::handleSignedOnlyPost);
     // Before POST /firmware (that handler also matches "/firmware/...")
-    server.on("/firmware/confirm", HTTP_POST, std::bind(&WebPortal::handleFirmwareConfirm, this, std::placeholders::_1));
+    route("/firmware/confirm", HTTP_POST, &WebPortal::handleFirmwareConfirm);
     server.on("/firmware", HTTP_POST,
         [this](AsyncWebServerRequest *request) { this->handleFirmwareUploadComplete(request); },
         [this](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
@@ -288,7 +314,7 @@ void WebPortal::setupRoutes()
     );
 
     // Reboot
-    server.on("/reboot", HTTP_GET, std::bind(&WebPortal::handleReboot, this, std::placeholders::_1));
+    route("/reboot", HTTP_GET, &WebPortal::handleReboot);
 
     // Unknown pages (404)
     server.onNotFound(std::bind(&WebPortal::handleNotFound, this, std::placeholders::_1));
@@ -298,7 +324,8 @@ void WebPortal::setupRoutes()
 }
 
 // Paths reachable without a login: the login page itself, the read-only
-// sensor data API and the version probe
+// sensor data API, the version probe and the shared assets (the login,
+// update progress and access point setup pages use them)
 // (GET only: POST /firmware/version would otherwise reach the /firmware
 // upload handler by prefix match)
 static bool isPublicPath(AsyncWebServerRequest *request)
@@ -308,7 +335,8 @@ static bool isPublicPath(AsyncWebServerRequest *request)
     {
         return request->method() == HTTP_GET || request->method() == HTTP_POST;
     }
-    return request->method() == HTTP_GET && (url == "/api" || url == "/firmware/version");
+    return request->method() == HTTP_GET &&
+           (url == "/api" || url == "/firmware/version" || url == "/a.css" || url == "/a.js");
 }
 
 // Light pages that stay available during an update-mode session: the
@@ -328,7 +356,7 @@ static bool availableInUpdateMode(AsyncWebServerRequest *request)
     return request->method() == HTTP_GET &&
            (url == "/login" || url == "/logout" || url == "/password" || url == "/firmware" ||
             url == "/firmware/check" || url == "/firmware/version" || url == "/diag/heap" ||
-            url == "/diag/network");
+            url == "/diag/network" || url == "/a.css" || url == "/a.js");
 }
 
 // 503 during an update-mode session. Logged-in clients learn why; the
@@ -466,9 +494,48 @@ void WebPortal::handleLogout(AsyncWebServerRequest *request)
     request->send(response);
 }
 
+// System page: during an update-mode session only the password form (light)
+static SystemView systemView(ConfigManager &config)
+{
+    SystemView v;
+    v.full = !UpdateMode::active();
+    std::lock_guard<std::recursive_mutex> guard(config.mutex());
+    v.timezone = config.timezone;
+    v.timezoneName = config.timezoneName;
+    return v;
+}
+
+// The page with the time zone list (~5.5 kB)
+static constexpr size_t SYSTEM_PAGE_SIZE = 6144;
+
 void WebPortal::handlePassword(AsyncWebServerRequest *request)
 {
-    request->send(200, "text/html", HTMLGenerator::generatePasswordPage(auth.hasPassword(), "", isAPMode));
+    const SystemView view = systemView(configManager);
+    // During an update-mode session only the light password form (~2 kB),
+    // sent like the firmware page's status page: the admission for the full
+    // page would refuse it on the session's TLS reserve
+    if (view.full && rejectLowMemory(request, stringPagePeak(SYSTEM_PAGE_SIZE), SYSTEM_PAGE_SIZE)) return;
+    request->send(200, "text/html", HTMLGenerator::generatePasswordPage(auth.hasPassword(), "", isAPMode, view));
+}
+
+// Interface mode (Simple / Advanced), the same for everyone
+void WebPortal::handleSystemMode(AsyncWebServerRequest *request)
+{
+    const String mode = request->hasParam("mode", true) ? request->getParam("mode", true)->value() : String();
+    if (mode != "simple" && mode != "advanced")
+    {
+        request->send(400, "text/plain", "Unknown mode");
+        return;
+    }
+    const bool advanced = mode == "advanced";
+    if (!configManager.setUiAdvanced(advanced))
+    {
+        request->send(500, "text/plain", "Failed to save configuration");
+        return;
+    }
+    HTMLGenerator::setAdvanced(advanced);
+    logger.info(String("Web interface: ") + (advanced ? "Advanced" : "Simple") + " mode");
+    request->redirect("/password");
 }
 
 void WebPortal::handlePasswordPost(AsyncWebServerRequest *request)
@@ -480,7 +547,8 @@ void WebPortal::handlePasswordPost(AsyncWebServerRequest *request)
     String error = auth.changePassword(request, param("current"), param("password"), param("confirm"));
     if (error.length() > 0)
     {
-        request->send(400, "text/html", HTMLGenerator::generatePasswordPage(auth.hasPassword(), error, isAPMode));
+        request->send(400, "text/html",
+                      HTMLGenerator::generatePasswordPage(auth.hasPassword(), error, isAPMode, systemView(configManager)));
         return;
     }
     // All sessions ended with the change - continue with a new one
@@ -734,10 +802,17 @@ static size_t stringPagePeak(size_t pageSize)
     return HeapGuard::stringPagePeak(pageSize);
 }
 
-// /firmware (HTMLGenerator::generateFirmwarePage): 12.9 kB measured on the
-// Pro with the card of an image waiting for its confirmation, ~0.5 kB more
-// with the update-mode card; rounded up
-static constexpr size_t FIRMWARE_PAGE_SIZE = 14000;
+// /firmware (HTMLGenerator::generateFirmwarePage): measured 4.2 kB (Simple)
+// and 4.95 kB (Advanced) on the Pro, ~0.6 kB more with the card of an image
+// waiting for its confirmation and the update-mode card; rounded up
+static constexpr size_t FIRMWARE_PAGE_SIZE = 6144;
+
+// Generation 2 detail: Advanced measured 6.2 kB without an OTA job (the
+// job table, retry form and image list add up to ~2.5 kB); Simple 1.5 kB
+static size_t gen2PageSize()
+{
+    return HTMLGenerator::adv() ? 9000 : 3072;
+}
 
 // Page streamed piece by piece (chunked): only the piece being sent is in
 // RAM, never the whole page nor send()'s copy of it. piece(i) for i in
@@ -793,18 +868,19 @@ void WebPortal::handleRoot(AsyncWebServerRequest *request)
         return;
     }
 
-    // Get list of sensors
-    std::vector<SensorData> sensorsList = sensorManager.getActiveSensors();
-
-    // ~4 kB plus a table row (~250 bytes) per sensor
-    size_t pageSize = 4096 + 250 * sensorsList.size();
-    if (rejectLowMemory(request, stringPagePeak(pageSize), pageSize)) return;
-
-    // Generate HTML
-    String html = HTMLGenerator::generateHomePage(sensorsList);
-
-    // Send response
-    request->send(200, "text/html", html);
+    // Page: ~1.3 kB plus ~0.2 kB per sensor row (measured 1.25 kB with
+    // three sensors); the readings copy ~0.4 kB per sensor plus its texts
+    size_t rowsBytes = 0;
+    const size_t n = sensorManager.readingCount(&rowsBytes);
+    const size_t pageSize = 1536 + 256 * n;
+    if (rejectLowMemory(request, stringPagePeak(pageSize) + rowsBytes, pageSize)) return;
+    std::vector<SensorData> rows = sensorManager.getReadings();
+    for (SensorData &s : rows)
+    {
+        s.deviceKey = 0;
+    }
+    request->send(200, "text/html",
+                  HTMLGenerator::generateHomePage(rows, mqttManager ? mqttManager->statusText() : String("disabled")));
 }
 
 // Only the very first setup (no WiFi configured and no other uplink) is
@@ -832,7 +908,8 @@ void WebPortal::handleConfig(AsyncWebServerRequest *request)
         return;
     }
 
-    if (rejectLowMemory(request, stringPagePeak(8192), 8192)) return;
+    // The access point setup page with the time zone list: ~5.2 kB
+    if (rejectLowMemory(request, stringPagePeak(6144), 6144)) return;
 
     String currentIP = isAPMode ? uplink->getApIP().toString() : uplink->getLocalIP().toString();
 
@@ -841,6 +918,73 @@ void WebPortal::handleConfig(AsyncWebServerRequest *request)
 
     // Send response
     request->send(200, "text/html", html);
+}
+
+// WiFi credentials: SSID 1..32 characters (IEEE 802.11 limit); password
+// empty (open network), an 8..63 character passphrase or a 64 hex digit
+// pre-shared key (WPA2-PSK). "" or the error
+static String wifiError(const String &ssid, const String &password)
+{
+    if (ssid.length() == 0)
+    {
+        return "SSID cannot be empty";
+    }
+    if (ssid.length() > 32)
+    {
+        return "SSID too long (max 32 characters)";
+    }
+    bool hexKey = password.length() == 64;
+    for (size_t i = 0; hexKey && i < password.length(); i++)
+    {
+        hexKey = isHexadecimalDigit(password[i]);
+    }
+    if (password.length() > 0 && password.length() < 8)
+    {
+        return "Password must be at least 8 characters or left empty for open networks";
+    }
+    if (password.length() > 63 && !hexKey)
+    {
+        return "Password too long (max 63 characters, or a 64 hex digit key)";
+    }
+    return "";
+}
+
+// WiFi settings (and the zone, TimeZones::KEEP = unchanged) saved for the
+// restart. Through ConfigManager: both stores (file and Preferences) and
+// atomic, so nothing (the timezone) is overridden by a stale copy at boot.
+// false: not saved, the running values are kept in both stores
+bool WebPortal::saveWifi(const String &newSsid, const String &newPassword, bool enabled, int zone)
+{
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
+    std::lock_guard<std::recursive_mutex> guard(configManager.mutex());
+    String oldSsid = configManager.wifiSSID, oldPassword = configManager.wifiPassword;
+    bool oldConfigMode = configManager.configMode;
+    bool oldWifiEnabled = configManager.wifiEnabled;
+    unsigned long oldWifiAttempt = configManager.lastWifiAttempt;
+    String oldZoneName = configManager.timezoneName;
+    String oldZonePosix = configManager.timezone;
+    String oldZoneNamePosix = configManager.timezoneNamePosix;
+    if (zone >= 0)
+    {
+        configManager.setTimezoneFields(zone);
+    }
+    configManager.wifiEnabled = enabled;
+    if (configManager.setWiFiConfig(newSsid, newPassword))
+    {
+        return true;
+    }
+    // One store may hold the new values: write the old ones to both, so
+    // they agree (as ConfigManager::setTimezone does)
+    configManager.wifiSSID = oldSsid;
+    configManager.wifiPassword = oldPassword;
+    configManager.configMode = oldConfigMode;
+    configManager.wifiEnabled = oldWifiEnabled;
+    configManager.lastWifiAttempt = oldWifiAttempt;
+    configManager.timezoneName = oldZoneName;
+    configManager.timezone = oldZonePosix;
+    configManager.timezoneNamePosix = oldZoneNamePosix;
+    configManager.save();
+    return false;
 }
 
 // Process WiFi configuration form
@@ -864,32 +1008,10 @@ void WebPortal::handleConfigPost(AsyncWebServerRequest *request)
         newPassword = wifiPassword;
     }
 
-    // Validate SSID: 1..32 chars (IEEE 802.11 limit)
-    if (newSsid.length() == 0)
+    String error = wifiError(newSsid, newPassword);
+    if (error.length() > 0)
     {
-        request->send(400, "text/plain", "SSID cannot be empty");
-        return;
-    }
-    if (newSsid.length() > 32)
-    {
-        request->send(400, "text/plain", "SSID too long (max 32 characters)");
-        return;
-    }
-    // Validate password: empty (open network), an 8..63 character passphrase
-    // or a 64 hex digit pre-shared key (WPA2-PSK)
-    bool hexKey = newPassword.length() == 64;
-    for (size_t i = 0; hexKey && i < newPassword.length(); i++)
-    {
-        hexKey = isHexadecimalDigit(newPassword[i]);
-    }
-    if (newPassword.length() > 0 && newPassword.length() < 8)
-    {
-        request->send(400, "text/plain", "Password must be at least 8 characters or left empty for open networks");
-        return;
-    }
-    if (newPassword.length() > 63 && !hexKey)
-    {
-        request->send(400, "text/plain", "Password too long (max 63 characters, or a 64 hex digit key)");
+        request->send(400, "text/plain", error);
         return;
     }
 
@@ -906,59 +1028,18 @@ void WebPortal::handleConfigPost(AsyncWebServerRequest *request)
         return;
     }
 
-    // Through ConfigManager: both stores (file and Preferences) and atomic,
-    // so nothing (the timezone) is overridden by a stale copy at boot
     logger.info("New WiFi configuration - SSID: " + newSsid);
-    bool saved;
-    {
-        FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
-        std::lock_guard<std::recursive_mutex> guard(configManager.mutex());
-        String oldSsid = configManager.wifiSSID, oldPassword = configManager.wifiPassword;
-        bool oldConfigMode = configManager.configMode;
-        bool oldWifiEnabled = configManager.wifiEnabled;
-        unsigned long oldWifiAttempt = configManager.lastWifiAttempt;
-        String oldZoneName = configManager.timezoneName;
-        String oldZonePosix = configManager.timezone;
-        String oldZoneNamePosix = configManager.timezoneNamePosix;
-        if (zone >= 0)
-        {
-            configManager.setTimezoneFields(zone);
-        }
-        // New credentials are meant to be used: a switched-off WiFi would
-        // ignore them after the restart
-        configManager.wifiEnabled = true;
-        saved = configManager.setWiFiConfig(newSsid, newPassword);
-        if (!saved)
-        {
-            // Not applied: the running gateway keeps its network and zone.
-            // One store may hold the new values: write the old ones to both,
-            // so they agree (as ConfigManager::setTimezone does)
-            configManager.wifiSSID = oldSsid;
-            configManager.wifiPassword = oldPassword;
-            configManager.configMode = oldConfigMode;
-            configManager.wifiEnabled = oldWifiEnabled;
-            configManager.lastWifiAttempt = oldWifiAttempt;
-            configManager.timezoneName = oldZoneName;
-            configManager.timezone = oldZonePosix;
-            configManager.timezoneNamePosix = oldZoneNamePosix;
-            configManager.save();
-        }
-    }
-    if (!saved)
+    // New credentials are meant to be used: a switched-off WiFi would ignore
+    // them after the restart
+    if (!saveWifi(newSsid, newPassword, true, zone))
     {
         request->send(500, "text/plain", "Failed to save configuration");
         return;
     }
 
-    // Build confirmation page
-    String html = "<!DOCTYPE html><html><head>";
-    html += "<meta http-equiv='refresh' content='10;url=/'>";
-    html += "<title>Configuration Saved</title></head>";
-    html += "<body><h1>Configuration Saved</h1>";
-    html += "<p>New WiFi settings have been saved. The device will restart in a few seconds.</p>";
-    html += "</body></html>";
-
-    request->send(200, "text/html", html);
+    request->send(200, "text/html",
+                  HTMLGenerator::generateNoticePage("Saved", "The WiFi settings are saved - the gateway restarts.",
+                                                    10, "/"));
 
     // Defer the restart so the async server can finish flushing the response.
     // handleClient() (called from the main loop) will trigger ESP.restart()
@@ -967,7 +1048,7 @@ void WebPortal::handleConfigPost(AsyncWebServerRequest *request)
     restartRequested = true;
 }
 
-// Time zone from the network page: saved here, applied by the loop at once
+// Time zone from the System page: saved here, applied by the loop at once
 // (no restart). setenv() may rewrite the TZ string in place while a
 // localtime_r() reads it; the switch happens in the loop task (rain reset,
 // most log stamps), but the clock is also read in this task (log stamps, the
@@ -993,7 +1074,7 @@ void WebPortal::handleTimezonePost(AsyncWebServerRequest *request)
         timezoneApplyRequested = true;
         logger.info("Time zone set to " + String(TimeZones::ZONES[zone].name));
     }
-    request->redirect("/network");
+    request->redirect("/password");
 }
 
 // Response that browsers and proxies must not store (pages with key material)
@@ -1017,6 +1098,7 @@ void WebPortal::handleSensors(AsyncWebServerRequest *request)
     view->gen2 = sensorManager.getGen2Sensors();
     view->waitingCount = sensorManager.getWaitingList(view->waiting, 8);
     view->nowMillis = millis();
+    view->adv = HTMLGenerator::adv();
     // No key outlives this handler: the page shows only the first two bytes
     // of a label key and no generation 1 key
     for (Gen2Sensor &g : view->gen2)
@@ -1041,16 +1123,15 @@ void WebPortal::handleSensors(AsyncWebServerRequest *request)
 }
 
 // Sensor add page
+// Add and edit form (~3 kB, measured 2.6 kB for a METEO in Advanced)
+static constexpr size_t SENSOR_FORM_SIZE = 3584;
+
 void WebPortal::handleSensorAdd(AsyncWebServerRequest *request)
 {
     logger.debug("HTTP request: GET /sensors/add");
     if (guardAPOnly(request)) return;
-
-    // Generate HTML
-    String html = HTMLGenerator::generateSensorAddPage();
-
-    // Send response
-    request->send(200, "text/html", html);
+    if (rejectLowMemory(request, stringPagePeak(SENSOR_FORM_SIZE), SENSOR_FORM_SIZE)) return;
+    request->send(200, "text/html", HTMLGenerator::generateSensorForm(nullptr, -1));
 }
 
 // Sensor form fields shared by add and edit
@@ -1061,12 +1142,39 @@ struct SensorForm
     uint32_t serialNumber;
     uint32_t deviceKey;
     String customUrl;
-    int altitude;
-    float tempCorr, humCorr, pressCorr, ppmCorr, luxCorr;
-    float windSpeedCorr;
-    int windDirCorr;
-    float rainAmountCorr, rainRateCorr;
+    SensorCalibration::Set cal;
 };
+
+// Correction fields of the form (generation 1 and 2): a field that is not
+// posted keeps its value, an empty one is reset (no correction), one posted
+// back unchanged is kept (SensorCalibration::parse); the error of the first
+// bad field, empty if all are valid
+// gen2: values rounded to 0.001 as sensors.json stores them (SensorCalibration::milli)
+static String parseCorrections(AsyncWebServerRequest *request, SensorCalibration::Set &cal, bool gen2 = false)
+{
+    for (int i = 0; i < SensorCalibration::FIELDS; i++)
+    {
+        const SensorCalibration::Field f = (SensorCalibration::Field)i;
+        const SensorCalibration::FieldInfo &fi = SensorCalibration::info(f);
+        if (!request->hasParam(fi.form, true))
+        {
+            continue;
+        }
+        String text = request->getParam(fi.form, true)->value();
+        text.trim();
+        const SensorCalibration::Parsed r = SensorCalibration::parse(text.c_str(), f, cal.v[i], cal.v[i]);
+        if (r != SensorCalibration::Parsed::Ok)
+        {
+            return String("Correction ") + fi.name +
+                   (r == SensorCalibration::Parsed::NotNumber ? ": not a number" : ": out of range");
+        }
+        if (gen2)
+        {
+            cal.v[i] = SensorCalibration::milli(cal.v[i]);
+        }
+    }
+    return "";
+}
 
 // Hex number of 1..maxDigits digits, non-zero
 static bool parseHexField(const String &text, uint8_t maxDigits, uint32_t &out)
@@ -1088,80 +1196,69 @@ static bool parseHexField(const String &text, uint8_t maxDigits, uint32_t &out)
 
 // Parse and validate the sensor form; returns an error message, empty if valid
 // keepKey: an empty key field keeps form.deviceKey (edit form)
-static String parseSensorForm(AsyncWebServerRequest *request, SensorForm &form, bool keepKey = false)
+// Parse and validate the sensor form into form (filled with the stored
+// values, or the defaults for a new sensor, by the caller); returns an error
+// message, empty if valid. A field that is not posted keeps its value (the
+// Simple edit form has no type, serial number, key or corrections of other
+// types); an empty key keeps the stored one, an empty correction is reset
+static String parseSensorForm(AsyncWebServerRequest *request, SensorForm &form, bool adding)
 {
+    auto has = [request](const char *name) { return request->hasParam(name, true); };
     auto text = [request](const char *name)
     {
         String value = request->hasParam(name, true) ? request->getParam(name, true)->value() : String();
         value.trim();
         return value;
     };
-    auto number = [&text](const char *name, float fallback, float minValue, float maxValue, bool &ok)
-    {
-        String value = text(name);
-        if (value.length() == 0)
-        {
-            return fallback;
-        }
-        float f = value.toFloat();
-        if (!isfinite(f) || f < minValue || f > maxValue)
-        {
-            ok = false;
-        }
-        return f;
-    };
-
     form.name = text("name");
     if (form.name.length() == 0 || form.name.length() > 32)
     {
         return "Name must have 1 to 32 characters";
     }
-    long type = text("deviceType").toInt();
-    if (type <= 0 || type > 255 ||
-        getSensorTypeInfo(static_cast<uint8_t>(type)).type == SensorType::UNKNOWN)
+    if (adding || has("deviceType"))
     {
-        return "Unknown device type";
+        long type = text("deviceType").toInt();
+        if (type <= 0 || type > 255 || getSensorTypeInfo(static_cast<uint8_t>(type)).type == SensorType::UNKNOWN)
+        {
+            return "Unknown device type";
+        }
+        form.deviceType = static_cast<SensorType>(type);
     }
-    form.deviceType = static_cast<SensorType>(type);
-    if (!parseHexField(text("serialNumber"), 6, form.serialNumber))
+    if ((adding || has("serialNumber")) && !parseHexField(text("serialNumber"), 6, form.serialNumber))
     {
         return "Serial number must be 1 to 6 hex digits";
     }
-    if (!(keepKey && text("deviceKey").length() == 0) && !parseHexField(text("deviceKey"), 8, form.deviceKey))
+    if ((adding || text("deviceKey").length() > 0) && !parseHexField(text("deviceKey"), 8, form.deviceKey))
     {
         return "Device key must be 1 to 8 hex digits";
     }
-    form.customUrl = text("customUrl");
-    if (form.customUrl.length() > 200 ||
-        (form.customUrl.length() > 0 && !form.customUrl.startsWith("http://") && !form.customUrl.startsWith("https://")))
+    if (has("customUrl"))
     {
-        return "Custom URL must start with http:// or https:// (max 200 characters)";
+        form.customUrl = text("customUrl");
+        if (form.customUrl.length() > 200 || (form.customUrl.length() > 0 && !form.customUrl.startsWith("http://") &&
+                                              !form.customUrl.startsWith("https://")))
+        {
+            return "Custom URL must start with http:// or https:// (max 200 characters)";
+        }
     }
+    return parseCorrections(request, form.cal);
+}
 
-    bool ok = true;
-    form.altitude = (int)number("altitude", 0, 0, 9000, ok);
-    form.tempCorr = number("tempCorr", 0, -50, 50, ok);
-    form.humCorr = number("humCorr", 0, -50, 50, ok);
-    form.pressCorr = number("pressCorr", 0, -200, 200, ok);
-    form.ppmCorr = number("ppmCorr", 0, -5000, 5000, ok);
-    form.luxCorr = number("luxCorr", 0, -100000, 100000, ok);
-    form.windSpeedCorr = number("windSpeedCorr", 1, 0, 10, ok);
-    form.windDirCorr = (int)number("windDirCorr", 0, -360, 360, ok);
-    form.rainAmountCorr = number("rainAmountCorr", 1, 0, 10, ok);
-    form.rainRateCorr = number("rainRateCorr", 1, 0, 10, ok);
-    if (!ok)
-    {
-        return "A correction value or the altitude is out of range";
-    }
-    return "";
+// The form filled with a sensor's stored values
+static void sensorFormFrom(const SensorData &s, SensorForm &form)
+{
+    form.name = s.name;
+    form.deviceType = s.deviceType;
+    form.serialNumber = s.serialNumber;
+    form.deviceKey = s.deviceKey;
+    form.customUrl = s.customUrl;
+    form.cal = s.cal;
 }
 
 static bool saveSensorForm(SensorManager &sensors, int index, const SensorForm &form)
 {
     return sensors.updateSensorConfig(index, form.name, form.deviceType, form.serialNumber, form.deviceKey,
-                                      form.customUrl, form.altitude, form.tempCorr, form.humCorr,
-                                      form.pressCorr, form.ppmCorr, form.luxCorr, form.windSpeedCorr,
-                                      form.windDirCorr, form.rainAmountCorr, form.rainRateCorr);
+                                      form.customUrl, form.cal);
 }
 
 // Process sensor add form
@@ -1172,7 +1269,8 @@ void WebPortal::handleSensorAddPost(AsyncWebServerRequest *request)
     if (rejectBlockedSave(sensorManager, request)) return;
 
     SensorForm form;
-    String error = parseSensorForm(request, form);
+    sensorFormFrom(SensorData(), form); // defaults (no corrections)
+    String error = parseSensorForm(request, form, true);
     if (error.length() > 0)
     {
         request->send(400, "text/plain", error);
@@ -1215,16 +1313,12 @@ void WebPortal::handleSensorEdit(AsyncWebServerRequest *request)
     if (request->hasParam("index"))
     {
         int index = request->getParam("index")->value().toInt();
-        if (rejectLowMemory(request, stringPagePeak(8192), 8192)) return;
-
         SensorData sensor;
         if (sensorManager.getSensorCopy(index, sensor))
         {
-            // Generate HTML
-            String html = HTMLGenerator::generateSensorEditPage(sensor, index);
-
-            // Send response
-            request->send(200, "text/html", html);
+            if (rejectLowMemory(request, stringPagePeak(SENSOR_FORM_SIZE), SENSOR_FORM_SIZE)) return;
+            sensor.deviceKey = 0; // never in the page
+            request->send(200, "text/html", HTMLGenerator::generateSensorForm(&sensor, index));
             return;
         }
     }
@@ -1254,8 +1348,8 @@ void WebPortal::handleSensorEditPost(AsyncWebServerRequest *request)
     }
 
     SensorForm form;
-    form.deviceKey = before.deviceKey;
-    String error = parseSensorForm(request, form, true);
+    sensorFormFrom(before, form);
+    String error = parseSensorForm(request, form, false);
     if (error.length() > 0)
     {
         request->send(400, "text/plain", error);
@@ -1411,6 +1505,10 @@ void WebPortal::handleGen2Delete(AsyncWebServerRequest *request)
         {
             logger.warning("Delete of a generation 2 sensor ignored or not saved");
         }
+        if (mqttManager)
+        {
+            mqttManager->requestSensorRemoval(devId, true); // its Home Assistant entities
+        }
     }
     request->redirect("/sensors");
 }
@@ -1423,7 +1521,8 @@ void WebPortal::sendGen2Detail(AsyncWebServerRequest *request, uint32_t devId, c
     // fragmented heap (Pro after attacks.py, largest block ~15 kB) that copy
     // failed - the answer was the status code with an empty body. Without
     // room even for the String and the send buffers, the message alone
-    if (HeapGuard::admit(HeapGuard::usable(), 9000 + HeapGuard::STREAMED_PAGE_PEAK, 9000, 0, 1) !=
+    const size_t pageSize = gen2PageSize();
+    if (HeapGuard::admit(HeapGuard::usable(), pageSize + HeapGuard::STREAMED_PAGE_PEAK, pageSize, 0, 1) !=
         HeapGuard::Admit::Ok)
     {
         if (message.length() > 0)
@@ -1443,8 +1542,9 @@ void WebPortal::sendGen2Detail(AsyncWebServerRequest *request, uint32_t devId, c
         request->send(404, "text/plain", "Unknown generation 2 sensor");
         return;
     }
-    // OTA part: the job, the start checks, the image store (spec 14.5)
-    std::unique_ptr<Gen2OtaView> ota(new (std::nothrow) Gen2OtaView());
+    // OTA part (Advanced only): the job, the start checks, the image store
+    // (spec 14.5)
+    std::unique_ptr<Gen2OtaView> ota(HTMLGenerator::adv() ? new (std::nothrow) Gen2OtaView() : nullptr);
     if (ota)
     {
         ota->hasJob = sensorManager.otaJobCopy(ota->job);
@@ -1487,7 +1587,7 @@ void WebPortal::handleGen2Detail(AsyncWebServerRequest *request)
     }
     // Only the plain view: after a POST the action is done, its result page
     // is sent whatever the heap
-    if (rejectLowMemory(request, stringPagePeak(9000), 9000)) return;
+    if (rejectLowMemory(request, stringPagePeak(gen2PageSize()), gen2PageSize())) return;
     sendGen2Detail(request, devId, "");
 }
 
@@ -1549,10 +1649,100 @@ void WebPortal::handleGen2Config(AsyncWebServerRequest *request)
         return;
     }
     int result = sensorManager.setGen2Config(devId, v);
+    if (result == -1)
+    {
+        request->send(404, "text/plain", "Unknown generation 2 sensor");
+        return;
+    }
     String msg = result == 1   ? String("Saved - waiting for the sensor (sent with its next uplink)")
                  : result == 0 ? String("Nothing changed")
                                : String("Not saved: flash write failed (see Logs)");
     sendGen2Detail(request, devId, msg.c_str(), result >= 0 ? 200 : 500);
+}
+
+// Name, corrections and (Simple page) report interval; a field that is
+// not posted is kept
+void WebPortal::handleGen2Edit(AsyncWebServerRequest *request)
+{
+    logger.debug("HTTP request: POST /sensors/gen2/edit");
+    if (guardAPOnly(request)) return;
+    if (rejectBlockedSave(sensorManager, request)) return;
+    uint32_t devId = 0;
+    if (!gen2DevIdParam(request, true, devId))
+    {
+        request->send(400, "text/plain", "DevID missing");
+        return;
+    }
+    Gen2Config::Values v;
+    String name;
+    SensorCalibration::Set cal;
+    {
+        // Heap copy: Gen2Sensor is too big for the AsyncTCP stack
+        std::unique_ptr<Gen2Sensor> current(new (std::nothrow) Gen2Sensor());
+        if (!current || !sensorManager.getGen2Sensor(devId, *current))
+        {
+            request->send(404, "text/plain", "Unknown generation 2 sensor");
+            return;
+        }
+        v = current->config;
+        name = current->name;
+        cal = current->cal;
+        current->wipeKeys();
+    }
+    const String calError = parseCorrections(request, cal, true);
+    if (calError.length())
+    {
+        sendGen2Detail(request, devId, "Not saved: " + calError, 400);
+        return;
+    }
+    if (request->hasParam("name", true))
+    {
+        name = request->getParam("name", true)->value();
+        name.trim();
+        if (name.length() == 0 || name.length() > 32)
+        {
+            sendGen2Detail(request, devId, "Not saved: the name must have 1 to 32 characters", 400);
+            return;
+        }
+    }
+    bool intervalChanged = false;
+    if (request->hasParam("interval", true))
+    {
+        String text = request->getParam("interval", true)->value();
+        text.trim();
+        char *end = nullptr;
+        const long value = strtol(text.c_str(), &end, 10);
+        if (text.length() == 0 || *end != '\0' || value < Gen2Config::MIN_INTERVAL_S ||
+            value > Gen2Config::MAX_INTERVAL_S)
+        {
+            sendGen2Detail(request, devId, "Not saved: the report interval is out of range", 400);
+            return;
+        }
+        intervalChanged = (uint16_t)value != v.intervalS;
+        v.intervalS = (uint16_t)value;
+        Gen2Config::clamp(v); // a slot offset beyond a shorter interval wraps into it
+    }
+    const int changed = sensorManager.setGen2Edit(devId, &name, &cal, intervalChanged ? &v : nullptr);
+    if (changed == -1) // deleted since the page was loaded
+    {
+        request->send(404, "text/plain", "Unknown generation 2 sensor");
+        return;
+    }
+    if (changed < 0)
+    {
+        sendGen2Detail(request, devId, "Not saved: flash write failed (see Logs)", 500);
+        return;
+    }
+    if ((changed & SensorManager::GEN2_EDIT_NAME) && mqttManager)
+    {
+        // The device name in Home Assistant (corrected values come with the
+        // next uplink)
+        mqttManager->requestGen2Publish(devId, true);
+    }
+    sendGen2Detail(request, devId,
+                   (changed & SensorManager::GEN2_EDIT_CONFIG) ? "Saved - the new interval is sent with the next uplink"
+                   : changed                                   ? "Saved"
+                                                               : "Nothing changed");
 }
 
 void WebPortal::handleGen2Status(AsyncWebServerRequest *request)
@@ -1730,7 +1920,8 @@ void WebPortal::handleOtaImageChunk(AsyncWebServerRequest *request, String filen
     }
     if (!OtaImageSigned::storable(OtaImageSigned::classOf(meta.signedKey, meta.unknownKey), signedOnly))
     {
-        refuse("the image is " + sigState + " and \"Signed images only\" is on (Firmware page)", false);
+        refuse("the image is " + sigState + " and \"Signed images only\" is on (Firmware page, Advanced mode)",
+               false);
         OtaStore::uploadAbort();
         return;
     }
@@ -1973,11 +2164,16 @@ void WebPortal::handleMqtt(AsyncWebServerRequest *request)
 }
 
 // MQTT Configuration Post Handler
+// MQTT Configuration Post Handler. A field that is not posted keeps the
+// stored value: with "Enable MQTT" off every setting is hidden (only the
+// switch changes); the checkboxes count only when their part of the form
+// was posted (marker f: the settings, adv: the Advanced ones)
 void WebPortal::handleMqttPost(AsyncWebServerRequest *request)
 {
     logger.debug("HTTP request: POST /mqtt");
     if (guardAPOnly(request)) return;
 
+    auto has = [request](const char *name) { return request->hasParam(name, true); };
     auto param = [request](const char *name)
     {
         String value = request->hasParam(name, true) ? request->getParam(name, true)->value() : String();
@@ -1985,43 +2181,84 @@ void WebPortal::handleMqttPost(AsyncWebServerRequest *request)
         return value;
     };
     MQTTManager::Settings settings;
-    settings.host = param("host");
-    settings.port = param("port").toInt();
-    settings.user = param("user");
-    settings.password = request->hasParam("password", true) ? request->getParam("password", true)->value() : String();
-    // Empty password = keep the stored one (it is not sent to the page);
-    // no user means no password
-    if (settings.password.length() == 0 && settings.user.length() > 0 && !request->hasParam("clearPassword", true))
     {
+        std::lock_guard<std::recursive_mutex> guard(configManager.mutex());
+        settings.host = configManager.mqttHost;
+        settings.port = configManager.mqttPort;
+        settings.user = configManager.mqttUser;
         settings.password = configManager.mqttPassword;
+        settings.tls = configManager.mqttTls;
+        settings.prefix = configManager.mqttPrefix;
+        settings.haEnabled = configManager.mqttHAEnabled;
+        settings.haPrefix = configManager.mqttHAPrefix;
     }
-    settings.enabled = request->hasParam("enabled", true);
-    settings.tls = request->hasParam("tls", true);
-    settings.prefix = param("prefix");
-    settings.haEnabled = request->hasParam("haEnabled", true);
-    settings.haPrefix = param("haPrefix");
-
-    if (settings.host.length() == 0 || settings.host.length() > 64 || settings.host.indexOf(' ') >= 0)
+    settings.enabled = has("enabled");
+    const bool fields = has("f"), advanced = has("adv");
+    if (fields || has("host"))
     {
-        request->send(400, "text/plain", "Broker host must have 1 to 64 characters without spaces");
-        return;
+        settings.host = param("host");
+        if (settings.host.length() == 0 || settings.host.length() > 64 || settings.host.indexOf(' ') >= 0)
+        {
+            request->send(400, "text/plain", "Broker host must have 1 to 64 characters without spaces");
+            return;
+        }
     }
-    if (settings.port < 1 || settings.port > 65535)
+    if (fields || has("port"))
     {
-        request->send(400, "text/plain", "Port must be 1 to 65535");
-        return;
+        settings.port = param("port").toInt();
+        if (settings.port < 1 || settings.port > 65535)
+        {
+            request->send(400, "text/plain", "Port must be 1 to 65535");
+            return;
+        }
+    }
+    if (has("user"))
+    {
+        settings.user = param("user");
+    }
+    // Empty password = keep the stored one (it is not sent to the page); no
+    // user means no password
+    const String password = has("password") ? request->getParam("password", true)->value() : String();
+    if (password.length() > 0)
+    {
+        settings.password = password;
+    }
+    else if (has("clearPassword") || settings.user.length() == 0)
+    {
+        settings.password = "";
     }
     if (settings.user.length() > 64 || settings.password.length() > 64)
     {
         request->send(400, "text/plain", "User name and password max 64 characters");
         return;
     }
-    bool prefixOk = ConfigManager::isValidMqttTopic(settings.prefix) || settings.prefix == configManager.mqttPrefix;
-    bool haPrefixOk = ConfigManager::isValidMqttTopic(settings.haPrefix) || settings.haPrefix == configManager.mqttHAPrefix;
-    if (!prefixOk || !haPrefixOk)
+    if (fields)
     {
-        request->send(400, "text/plain", "Invalid topic (1-32 characters, no #, + or /)");
-        return;
+        settings.haEnabled = has("haEnabled");
+    }
+    if (advanced)
+    {
+        settings.tls = has("tls");
+    }
+    if (has("prefix"))
+    {
+        String prefix = param("prefix");
+        if (!ConfigManager::isValidMqttTopic(prefix) && prefix != settings.prefix)
+        {
+            request->send(400, "text/plain", "Invalid topic (1-32 characters, no #, + or /)");
+            return;
+        }
+        settings.prefix = prefix;
+    }
+    if (has("haPrefix"))
+    {
+        String prefix = param("haPrefix");
+        if (!ConfigManager::isValidMqttTopic(prefix) && prefix != settings.haPrefix)
+        {
+            request->send(400, "text/plain", "Invalid topic (1-32 characters, no #, + or /)");
+            return;
+        }
+        settings.haPrefix = prefix;
     }
 
     if (!configManager.setMqttConfig(settings.host, settings.port, settings.user, settings.password,
@@ -2042,106 +2279,77 @@ void WebPortal::handleMqttPost(AsyncWebServerRequest *request)
 }
 
 // API for retrieving sensor data
+// API for retrieving sensor data
 void WebPortal::handleAPI(AsyncWebServerRequest *request)
 {
     logger.debug("HTTP request: GET /api");
     if (guardAPOnly(request)) return;
-    // Public endpoint: peak ~20 kB with 20 sensors (list copy, JSON
-    // document, response buffer)
-    if (rejectLowMemory(request, 20000, 12000)) return;
-
-    // Check format parameter
     String format = request->hasParam("format") ? request->getParam("format")->value() : "html";
-
-    // Check sensor parameter
-    String sensorParam = request->hasParam("sensor") ? request->getParam("sensor")->value() : "";
-
-    // Get list of sensors
-    std::vector<SensorData> sensorsList;
-
-    if (sensorParam.length() > 0)
+    const bool json = format.equalsIgnoreCase("json"), csv = format.equalsIgnoreCase("csv");
+    if (!json && !csv && !format.equalsIgnoreCase("html"))
     {
-        // Filter by specific sensor
-        uint32_t serialNumber = strtoul(sensorParam.c_str(), NULL, 16);
-        for (const SensorData &sensor : sensorManager.getActiveSensors())
-        {
-            if (sensor.serialNumber == serialNumber)
-            {
-                sensorsList.push_back(sensor);
-            }
-        }
-    }
-    else
-    {
-        // All sensors
-        sensorsList = sensorManager.getActiveSensors();
-    }
-
-    if (format.equalsIgnoreCase("json"))
-    {
-        // JSON format
-        // One reserve of the measured size: the stream grows byte by byte
-        // otherwise (a realloc per character of a public response)
-        DynamicJsonDocument doc = HTMLGenerator::buildAPIJson(sensorsList);
-        AsyncResponseStream *response = request->beginResponseStream("application/json", measureJson(doc) + 16);
-        serializeJson(doc, *response);
-        response->addHeader(CORS_HEADER_NAME, CORS_HEADER_VALUE);
-        request->send(response);
-    }
-    else if (format.equalsIgnoreCase("csv"))
-    {
-        // CSV format
-        AsyncResponseStream *response = request->beginResponseStream("text/csv");
-        response->print("name,type,serialNumber,lastSeen,temperature,humidity,pressure,ppm,lux,batteryVoltage,rssi\r\n");
-
-        for (const auto &sensor : sensorsList)
-        {
-            // RFC 4180 quoting; a leading = + - @ would be a spreadsheet formula
-            String name = sensor.name;
-            name.replace("\"", "\"\"");
-            if (name.length() > 0 && strchr("=+-@", name[0]))
-            {
-                name = "'" + name;
-            }
-            response->print("\"" + name + "\"");
-            response->print(",");
-            response->print(static_cast<uint8_t>(sensor.deviceType));
-            response->print(",");
-            response->print(formatSN(sensor.serialNumber));
-            response->print(",");
-            response->print(sensor.lastSeen > 0 ? String((millis() - sensor.lastSeen) / 1000) : "-1");
-            response->print(",");
-
-            response->print(sensor.hasTemperature() ? String(sensor.temperature, 2) : "");
-            response->print(",");
-            response->print(sensor.hasHumidity() ? String(sensor.humidity, 2) : "");
-            response->print(",");
-            response->print(sensor.hasPressure() ? String(sensor.pressure, 2) : "");
-            response->print(",");
-            response->print(sensor.hasPPM() ? String(sensor.ppm, 0) : "");
-            response->print(",");
-            response->print(sensor.hasLux() ? String(sensor.lux, 1) : "");
-            response->print(",");
-            response->print(String(sensor.batteryVoltage, 2));
-            response->print(",");
-            response->print(String(sensor.rssi));
-            response->print("\r\n");
-        }
-
-        response->addHeader(CORS_HEADER_NAME, CORS_HEADER_VALUE);
-        request->send(response);
-    }
-    else if (format.equalsIgnoreCase("html"))
-    {
-        // HTML format (API documentation)
-        String html = HTMLGenerator::generateAPIPage(sensorsList);
-        request->send(200, "text/html", html);
-    }
-    else
-    {
-        // Unknown format
         request->send(400, "text/plain", "Invalid format parameter. Supported formats: json, csv, html");
+        return;
     }
+    // Public endpoint: peak = the readings copy (one row ~0.4 kB plus its
+    // name and custom URL) + the response of the exact size (~0.3 kB per
+    // sensor) + one row text + the send buffer (measured 3.6 kB in all with
+    // 3 sensors)
+    size_t rowsBytes = 0;
+    const size_t n = sensorManager.readingCount(&rowsBytes);
+    const size_t body = 512 + n * 320;
+    if (rejectLowMemory(request, 4096 + rowsBytes + 2 * body, std::max(rowsBytes, body))) return;
+    std::vector<SensorData> rows = sensorManager.getReadings();
+    if (request->hasParam("sensor"))
+    {
+        // One sensor: serial number (generation 1) or DevID (generation 2),
+        // never two rows (ApiRow::select: gen=1|2, else generation 1 first)
+        const uint32_t id = strtoul(request->getParam("sensor")->value().c_str(), nullptr, 16);
+        const int gen = request->hasParam("gen") ? request->getParam("gen")->value().toInt() : 0;
+        const long k = ApiRow::select(rows, id, gen);
+        long i = 0;
+        rows.erase(std::remove_if(rows.begin(), rows.end(), [k, &i](const SensorData &) { return i++ != k; }),
+                   rows.end());
+    }
+    for (SensorData &s : rows)
+    {
+        s.deviceKey = 0;
+    }
+    if (!json && !csv)
+    {
+        request->send(200, "text/html", HTMLGenerator::generateAPIPage(rows));
+        return;
+    }
+    // One sensor at a time into a response of the exact size (measured in
+    // a first pass): no document of every sensor, no growing buffer
+    const unsigned long now = millis();
+    const String head = json ? HTMLGenerator::apiJsonHead(uplink->isOnline())
+                             : String("name,type,serialNumber,lastSeen,temperature,humidity,pressure,ppm,lux,"
+                                      "batteryVoltage,rssi\r\n");
+    auto row = [json, now](const SensorData &s) {
+        return json ? HTMLGenerator::apiJsonRow(s, now) : HTMLGenerator::apiCsvRow(s, now);
+    };
+    size_t size = head.length() + 2 + rows.size();
+    for (const SensorData &s : rows)
+    {
+        size += row(s).length();
+    }
+    AsyncResponseStream *response = request->beginResponseStream(json ? "application/json" : "text/csv", size);
+    response->print(head);
+    for (size_t i = 0; i < rows.size(); i++)
+    {
+        if (json && i > 0)
+        {
+            response->print(',');
+        }
+        response->print(row(rows[i]));
+    }
+    if (json)
+    {
+        response->print("]}");
+    }
+    response->addHeader(CORS_HEADER_NAME, CORS_HEADER_VALUE);
+    request->send(response);
 }
 
 // Restart device
@@ -2150,9 +2358,8 @@ void WebPortal::handleReboot(AsyncWebServerRequest *request)
     logger.info("HTTP request: GET /reboot - Rebooting device");
 
     request->send(200, "text/html",
-                  "<html><head><meta http-equiv='refresh' content='10;url=/'></head>"
-                  "<body><h1>Rebooting</h1>"
-                  "<p>The device is rebooting. You will be redirected in 10 seconds...</p></body></html>");
+                  HTMLGenerator::generateNoticePage("Restarting", "The gateway restarts - this page reloads in 10 s.",
+                                                    10, "/"));
 
     // Defer the restart so the async server can flush the response cleanly
     // (same pattern as handleConfigPost). The handleClient() main-loop hook
@@ -2421,8 +2628,7 @@ void WebPortal::handleNetwork(AsyncWebServerRequest *request)
                  [view](size_t part) { return HTMLGenerator::generateNetworkPagePart(*view, part); });
 }
 
-#if defined(HAS_ETHERNET) || defined(HAS_LTE)
-// One form per section (hidden field "section"), both apply after a restart
+// One form per section (hidden field "section"), all apply after a restart
 void WebPortal::handleNetworkPost(AsyncWebServerRequest *request)
 {
     auto param = [request](const char *name)
@@ -2451,23 +2657,51 @@ void WebPortal::handleNetworkPost(AsyncWebServerRequest *request)
                     String(useStatic ? "static " + configManager.ethIp : String("DHCP")));
     }
 #endif
-#if defined(HAS_WIFI_SWITCH)
     else if (section == "wifi")
     {
-        bool enabled = request->hasParam("wifiEnabled", true);
-        if (!configManager.setWifiEnabled(enabled))
+        // One card: "Use WiFi" (Pro) and the credentials; fields that are not
+        // posted (hidden while WiFi is off) keep the stored values, an empty
+        // password for the same network keeps the stored one
+#if defined(HAS_WIFI_SWITCH)
+        const bool enabled = request->hasParam("wifiEnabled", true);
+#else
+        const bool enabled = true;
+#endif
+        String ssid, password;
+        {
+            std::lock_guard<std::recursive_mutex> guard(configManager.mutex());
+            ssid = configManager.wifiSSID;
+            password = configManager.wifiPassword;
+        }
+        if (request->hasParam("ssid", true))
+        {
+            const String stored = ssid;
+            ssid = param("ssid");
+            String typed = request->hasParam("password", true) ? request->getParam("password", true)->value() : String();
+            if (typed.length() > 0 || ssid != stored)
+            {
+                password = typed; // another network without a password = an open one
+            }
+            String error = wifiError(ssid, password);
+            if (error.length() > 0)
+            {
+                request->send(400, "text/plain", error);
+                return;
+            }
+        }
+        if (!saveWifi(ssid, password, enabled, TimeZones::KEEP))
         {
             request->send(500, "text/plain", "Failed to save configuration");
             return;
         }
-        logger.info(String("WiFi ") + (enabled ? "enabled" : "disabled") + " - restarting");
+        logger.info(String("WiFi settings saved (") + (enabled ? "on" : "off") + ") - restarting");
     }
-#endif
 #if defined(HAS_LTE)
     else if (section == "lte")
     {
+        // APN and PIN are hidden (not posted) while LTE is off: kept
         bool enabled = request->hasParam("lteEnabled", true);
-        String apn = param("apn");
+        String apn = request->hasParam("apn", true) ? param("apn") : configManager.lteApn;
         String pin = param("pin");
         bool pinTyped = pin.length() > 0;
         // Empty PIN = keep the stored one, unless removal was asked for
@@ -2494,11 +2728,7 @@ void WebPortal::handleNetworkPost(AsyncWebServerRequest *request)
         return;
     }
 
-    String html = "<!DOCTYPE html><html><head>";
-    html += "<meta http-equiv='refresh' content='15;url=/network'>";
-    html += "<title>Settings Saved</title></head>";
-    html += "<body><h1>Settings Saved</h1>";
-    html += "<p>The device will restart in a few seconds.";
+    String html = "The gateway restarts in a few seconds.";
 #if defined(HAS_ETHERNET)
     if (section == "ethernet" && configManager.ethStatic)
     {
@@ -2511,13 +2741,11 @@ void WebPortal::handleNetworkPost(AsyncWebServerRequest *request)
         html += " WiFi will be off - reconnect over Ethernet: <a href='http://" + ip + "/network'>" + ip + "</a>";
     }
 #endif
-    html += "</p></body></html>";
-    request->send(200, "text/html", html);
+    request->send(200, "text/html", HTMLGenerator::generateNoticePage("Saved", html, 15, "/network"));
     // Deferred, see handleClient()
     restartAt = millis() + 1500;
     restartRequested = true;
 }
-#endif
 
 // Handle firmware version request
 void WebPortal::handleFirmwareVersion(AsyncWebServerRequest *request)
@@ -2768,10 +2996,9 @@ void WebPortal::handleFirmwareUpdate(AsyncWebServerRequest *request)
     }
     logger.info("Firmware update requested from: " + urlForLog(url));
     request->send(202, "application/json",
-                  "{\"status\":\"update-started\",\"message\":\"Downloading firmware in update mode. A verified image is "
-                  "installed and the device restarts; an unsigned image waits for your confirmation on the Firmware page "
-                  "(10 minutes). If the page stops answering (the connection may go over an interface that is switched off "
-                  "for the download), reload it in a few minutes.\"}");
+                  "{\"status\":\"update-started\",\"message\":\"Downloading in update mode. A verified image is installed "
+                  "and the gateway restarts; an unsigned one waits 10 minutes for your confirmation here. If the page "
+                  "stops answering, reload it in a few minutes.\"}");
 }
 
 // Loop task: download into the OTA slot; a verified image is activated and

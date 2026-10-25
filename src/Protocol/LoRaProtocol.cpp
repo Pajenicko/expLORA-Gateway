@@ -177,17 +177,8 @@ bool LoRaProtocol::processPacketByType(SensorType type, uint8_t *data, uint8_t l
     case SensorType::SCD40:
         return processSCD40Packet(data, len, sensorIndex, rssi);
 
-    case SensorType::VEML7700:
-        return processVEML7700Packet(data, len, sensorIndex, rssi);
-
     case SensorType::METEO:
         return processMeteoPacket(data, len, sensorIndex, rssi);
-            
-    case SensorType::DIY_TEMP: 
-        return processDIYTempPacket(data, len, sensorIndex, rssi);
-
-    case SensorType::SHT40:
-        return processSHT40Packet(data, len, sensorIndex, rssi);
 
     default:
         logger.warning("Unknown device type: 0x" + String(static_cast<uint8_t>(type), HEX));
@@ -223,58 +214,6 @@ bool LoRaProtocol::processBME280Packet(uint8_t *data, uint8_t len, int sensorInd
     return result;
 }
 
-// Process packet from SHT40 sensor
-bool LoRaProtocol::processSHT40Packet(uint8_t *data, uint8_t len, int sensorIndex, int rssi)
-{
-    SensorParsers::CommonHeader header;
-    SensorParsers::SHT40Data    payload;
-    if (!SensorParsers::parseCommonHeader(data, len, header) ||
-        !SensorParsers::parseSHT40(data, len, payload))
-    {
-        logger.warning("Packet too short for SHT40");
-        return false;
-    }
-
-    bool result = sensorManager.updateSensorData(sensorIndex,
-                                                 payload.temperature, payload.humidity, 0.0f,
-                                                 0.0f, 0.0f, header.batteryVoltage, rssi);
-
-    // Copy: the web task may edit the sensor concurrently
-    SensorData sensor;
-    if (result && sensorManager.getSensorCopy(sensorIndex, sensor))
-    {
-        logger.info(sensor.name + " data updated - Temp: " + String(sensor.temperature, 2) + "°C, Hum: " +
-                    String(sensor.humidity, 2) + "%, Batt: " + String(header.batteryVoltage, 2) + "V");
-    }
-
-    return result;
-}
-
-// Process packet from DIY temperature sensor
-bool LoRaProtocol::processDIYTempPacket(uint8_t *data, uint8_t len, int sensorIndex, int rssi) {
-    SensorParsers::CommonHeader header;
-    SensorParsers::DIYTempData  payload;
-    if (!SensorParsers::parseCommonHeader(data, len, header) ||
-        !SensorParsers::parseDIYTemp(data, len, payload))
-    {
-        logger.warning("Packet too short for DS18B20");
-        return false;
-    }
-
-    bool result = sensorManager.updateSensorData(sensorIndex,
-                                                 payload.temperature, 0.0f, 0.0f,
-                                                 0.0f, 0.0f, header.batteryVoltage, rssi);
-
-    // Copy: the web task may edit the sensor concurrently
-    SensorData sensor;
-    if (result && sensorManager.getSensorCopy(sensorIndex, sensor)) {
-        logger.info(sensor.name + " data updated - Temp: " + String(payload.temperature, 2) + "°C, Batt: " +
-                  String(header.batteryVoltage, 2) + "V");
-    }
-
-    return result;
-}
-
 // Process packet from SCD40 sensor
 bool LoRaProtocol::processSCD40Packet(uint8_t *data, uint8_t len, int sensorIndex, int rssi)
 {
@@ -297,32 +236,6 @@ bool LoRaProtocol::processSCD40Packet(uint8_t *data, uint8_t len, int sensorInde
     {
         logger.info(sensor.name + " data updated - Temp: " + String(sensor.temperature, 2) + "°C, Hum: " +
                     String(sensor.humidity, 2) + "%, CO2: " + String(sensor.ppm, 0) + " ppm, Batt: " +
-                    String(header.batteryVoltage, 2) + "V");
-    }
-
-    return result;
-}
-
-// Process packet from VEML7700 sensor
-bool LoRaProtocol::processVEML7700Packet(uint8_t *data, uint8_t len, int sensorIndex, int rssi)
-{
-    SensorParsers::CommonHeader header;
-    SensorParsers::VEML7700Data payload;
-    if (!SensorParsers::parseCommonHeader(data, len, header) ||
-        !SensorParsers::parseVEML7700(data, len, payload))
-    {
-        logger.warning("Packet too short for VEML7700");
-        return false;
-    }
-
-    bool result = sensorManager.updateSensorData(sensorIndex, 0.0f, 0.0f, 0.0f, 0.0f,
-                                                 payload.lux, header.batteryVoltage, rssi);
-
-    // Copy: the web task may edit the sensor concurrently
-    SensorData sensor;
-    if (result && sensorManager.getSensorCopy(sensorIndex, sensor))
-    {
-        logger.info(sensor.name + " data updated - Light: " + String(payload.lux, 1) + " lux, Batt: " +
                     String(header.batteryVoltage, 2) + "V");
     }
 

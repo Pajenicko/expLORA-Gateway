@@ -48,10 +48,7 @@ private:
     // Process packet according to sensor type
     bool processBME280Packet(uint8_t *data, uint8_t len, int sensorIndex, int rssi);
     bool processSCD40Packet(uint8_t *data, uint8_t len, int sensorIndex, int rssi);
-    bool processVEML7700Packet(uint8_t *data, uint8_t len, int sensorIndex, int rssi);
     bool processMeteoPacket(uint8_t *data, uint8_t len, int sensorIndex, int rssi);
-    bool processDIYTempPacket(uint8_t *data, uint8_t len, int sensorIndex, int rssi);
-    bool processSHT40Packet(uint8_t *data, uint8_t len, int sensorIndex, int rssi);
 
     int lastProcessedSensorIndex; // Index of last processed sensor
 

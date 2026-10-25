@@ -116,6 +116,26 @@ static void test_budget_full_hour(void)
 
 // --- configuration ----------------------------------------------------------
 
+// The Simple page shortens the interval: the slot offset wraps into it
+// (slot % interval), a fitting one stays
+static void test_config_slot_wraps_into_a_shorter_interval(void)
+{
+    Gen2Config::Values v;
+    v.intervalS = 600;
+    v.slotS = 450;
+    v.intervalS = 300;
+    TEST_ASSERT_FALSE(Gen2Config::clamp(v));
+    TEST_ASSERT_EQUAL_UINT16(150, v.slotS);
+    v.slotS = 450;
+    v.intervalS = 60;
+    Gen2Config::clamp(v);
+    TEST_ASSERT_EQUAL_UINT16(30, v.slotS);
+    v.slotS = 59;
+    v.intervalS = 120;
+    TEST_ASSERT_TRUE(Gen2Config::clamp(v));
+    TEST_ASSERT_EQUAL_UINT16(59, v.slotS);
+}
+
 static void test_config_version_and_clamp(void)
 {
     TEST_ASSERT_EQUAL_UINT8(2, Gen2Config::nextVersion(1, 1));
@@ -359,6 +379,7 @@ int main(int, char **)
     RUN_TEST(test_recent_rx_overlap);
     RUN_TEST(test_uplink_slot);
     RUN_TEST(test_config_version_and_clamp);
+    RUN_TEST(test_config_slot_wraps_into_a_shorter_interval);
     RUN_TEST(test_down_payload);
     RUN_TEST(test_status_boot_info);
     RUN_TEST(test_session_dual_until_first_up);

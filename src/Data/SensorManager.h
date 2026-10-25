@@ -67,6 +67,7 @@ private:
     bool waitingLogged = false;
     unsigned long lastWaitingLogMs = 0;
     int findGen2Locked(uint32_t devId) const;
+    size_t readingCountLocked() const;
     void removeGen2Locked(uint32_t devId);
     void clearLocked();
     int readSensorsFile(const char *path, String &content);
@@ -157,9 +158,7 @@ public:
     // Update sensor configuration
     bool updateSensorConfig(int index, const String &name, SensorType deviceType,
                             uint32_t serialNumber, uint32_t deviceKey,
-                            const String &customUrl, int altitude,
-                            float tempCorr, float humCorr, float pressCorr, float ppmCorr, float luxCorr,
-                            float windSpeedCorr, int windDirCorr, float rainAmountCorr, float rainRateCorr);
+                            const String &customUrl, const SensorCalibration::Set &cal);
 
     // Delete sensor
     bool deleteSensor(int index);
@@ -176,6 +175,19 @@ public:
 
     // Get list of all active sensors (configured)
     std::vector<SensorData> getActiveSensors() const;
+
+    // Readings of every sensor for the home page, /api and MQTT: the
+    // generation 1 sensors, then the generation 2 ones (light rows: no
+    // radio state, no keys)
+    std::vector<SensorData> getReadings() const;
+    // Its size for the memory checks before the copy; bytes (optional): what
+    // the copy holds - the rows and their name / custom URL texts
+    size_t readingCount(size_t *bytes = nullptr) const;
+    // One generation 2 sensor as such a row; false: unknown DevID
+    bool getGen2Reading(uint32_t devId, SensorData &out) const;
+    // A generation 2 sensor with new readings for MQTT (loop task); discover:
+    // its reported quantities grew. false: none left
+    bool takeGen2Mqtt(uint32_t &devId, bool &discover);
 
     // Get list of active sensors (configured) with real index
     std::vector<ActiveSensorEntry> getActiveSensorEntries() const;
@@ -208,6 +220,14 @@ public:
     // New desired configuration (clamped; version raised when it changed).
     // 1 changed and saved, 0 unchanged, -1 unknown DevID, -2 save failed
     int setGen2Config(uint32_t devId, const Gen2Config::Values &values);
+    // Name, corrections (applied from the next uplink) and desired
+    // configuration (clamped, version raised when it changed); nullptr
+    // keeps that part. One sensors.json write: the GEN2_EDIT_* bits of what
+    // changed (0 nothing), -1 unknown DevID, -2 save failed (nothing
+    // changed, the old values are kept)
+    static constexpr int GEN2_EDIT_NAME = 1, GEN2_EDIT_CAL = 2, GEN2_EDIT_CONFIG = 4;
+    int setGen2Edit(uint32_t devId, const String *name, const SensorCalibration::Set *cal,
+                    const Gen2Config::Values *config);
     // Ask for a status report with the next DOWN
     bool requestGen2Status(uint32_t devId);
     // Forget the stored devNonce (sensor lost its configuration store, spec 12a)
@@ -265,8 +285,6 @@ public:
     // Forward sensor data to HTTP (blocking - never call with the lock held)
     bool forwardSensorData(const SensorData &sensor);
 
-    // Convert relative pressure to absolute pressure
-    double relativeToAbsolutePressure(double p0_hpa, int altitude_m, double temp_c);
 
     // -----------------------------------------------------------------------
     // Per-sensor health tracking. Calls delegate to SensorHealth (header-only,

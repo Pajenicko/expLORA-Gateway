@@ -71,8 +71,9 @@ log buffer size) and `variants/<env>/platformio.ini`.
   is no proof of reachability, a power cycle is the recovery path), then the
   AP stops and the WiFi driver is deinitialised (~21 kB of internal RAM back)
   while Ethernet has an address; after 10 s without one the AP comes back and
-  stays until Ethernet has had an address for `AP_TIMEOUT`. Saving WiFi
-  credentials sets `wifiEnabled` again. If the AP cannot start for lack of
+  stays until Ethernet has had an address for `AP_TIMEOUT`. "Use WiFi" sits
+  in the WiFi card with the credentials (kept while it is off); the AP setup
+  page (`/config`) sets `wifiEnabled` again. If the AP cannot start for lack of
   memory (< 48 kB free), MQTT drops its TLS session for up to three AP
   start attempts (`Uplink::apStarved()`, status `heldForAp`).
   Pure rules in `src/Network/WifiPolicy.h` (native tests). `/diag/network` →
@@ -90,9 +91,20 @@ log buffer size) and `variants/<env>/platformio.ini`.
   a fresh or updated device accepts an empty password once and forces setting a
   password; session cookie (HttpOnly, SameSite=Strict, RAM, 24 h idle); lockout
   per client address + global spacing; `reset-password` on the serial console.
-  Public without login: `GET /api`, `GET /firmware/version`, `/login`.
-- **Network page** (all boards): status, WiFi form, Ethernet and LTE settings on
-  Pro; WiFi settings moved here from "WiFi Setup".
+  Public without login: `GET /api`, `GET /firmware/version`, `/login`,
+  `GET /a.css`, `GET /a.js`.
+- **Network page** (all boards): status, WiFi card (POST /network
+  section=wifi), Ethernet and LTE settings on Pro; WiFi settings moved here
+  from "WiFi Setup".
+- **2.0.0 UI** (`src/Web/WebAssets.h`, `HTMLGenerator`): one stylesheet and
+  the `data-if` toggler served as `/a.css`, `/a.js` (cached, versioned URL);
+  Simple / Advanced mode (`config.json` `uiAdvanced`, System page); one
+  sensor table for generation 1 and 2; one add/edit form; settings of a
+  switched-off feature hidden, and every handler keeps a stored value whose
+  field is not posted (`tests/integration/test_ui_keep.py`). Quantities in
+  `src/Data/Quantity.h`; `/api` rows `src/Web/ApiRow.h`; MQTT / HA discovery
+  `src/Protocol/HaDiscovery.h`; corrections `SensorCalibration::Set` for
+  both generations.
 - HTML escaping of every user/modem/log string; validation of all forms;
   stored secrets (WiFi/MQTT passwords, SIM PIN, sensor keys) are never sent to
   pages (empty field = keep).
@@ -211,8 +223,10 @@ log buffer size) and `variants/<env>/platformio.ini`.
   discovery resent when HA announces itself and daily (not hourly – LTE data).
 
 ### Sensors, storage, time
-- New sensor type **SHT40 (0x05)**: temperature + humidity (see
-  the sensor repository (expLORA-Sensors-gen2) for the test sensor firmware).
+- Sensor type SHT40 (0x05) was added here and removed again in 2.0.0
+  together with DIY_TEMP (0x51) and the unreachable VEML7700 (0x04) code: a
+  `sensors.json` entry of such a type is dropped at load (one log line) and
+  left out by the next save.
 - `sensors.json` and `config.json` written atomically (tmp + rename, recovery),
   JSON documents sized and overflow-checked; corrupt files kept as `.corrupt`.
 - Locking: sensor list, config (`ConfigManager::mutex()`), logger; cross-task

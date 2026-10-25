@@ -117,59 +117,6 @@ inline bool parseSCD40(const uint8_t *data, uint8_t len, SCD40Data &out)
 }
 
 // ---------------------------------------------------------------------------
-// SHT40 — temperature, humidity
-// ---------------------------------------------------------------------------
-
-struct SHT40Data
-{
-    float temperature; // °C (raw int16 / 100)
-    float humidity;    // %  (raw uint16 / 100)
-};
-
-// Minimum bytes to parse: 12 (indices 0..11).
-inline bool parseSHT40(const uint8_t *data, uint8_t len, SHT40Data &out)
-{
-    if (len < 12) return false;
-    out.temperature = readI16BE(data, 8)  / 100.0f;
-    out.humidity    = readU16BE(data, 10) / 100.0f;
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-// DIY temperature sensor — temperature only
-// ---------------------------------------------------------------------------
-
-struct DIYTempData
-{
-    float temperature; // °C
-};
-
-// Minimum bytes to parse: 10 (indices 0..9).
-inline bool parseDIYTemp(const uint8_t *data, uint8_t len, DIYTempData &out)
-{
-    if (len < 10) return false;
-    out.temperature = readI16BE(data, 8) / 100.0f;
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-// VEML7700 — light intensity (lux)
-// ---------------------------------------------------------------------------
-
-struct VEML7700Data
-{
-    float lux; // raw uint32 / 100
-};
-
-// Minimum bytes to parse: 12 (indices 0..11).
-inline bool parseVEML7700(const uint8_t *data, uint8_t len, VEML7700Data &out)
-{
-    if (len < 12) return false;
-    out.lux = readU32BE(data, 8) / 100.0f;
-    return true;
-}
-
-// ---------------------------------------------------------------------------
 // METEO — temp / pressure / humidity / wind / rain (extended packet adds
 // rain rate)
 //

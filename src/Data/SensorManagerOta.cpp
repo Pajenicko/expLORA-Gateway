@@ -460,7 +460,8 @@ OtaJob::Down SensorManager::otaOnUpLocked(Gen2Sensor &g, OtaJob::Up &u, unsigned
     if (!wasHeld && otaJobPtr->manualPause && otaJobPtr->why == OtaJob::Why::Unsigned)
     {
         logger.warning("OTA " + g.name + ": the sensor would need the image again - held Paused, its image is "
-                       "unsigned and \"Signed images only\" is on; abort the job, or switch the option off and resume");
+                       "unsigned and \"Signed images only\" is on; abort the job, or switch the option off "
+                       "(Firmware page, Advanced mode) and resume");
     }
     if (r.bindMismatch)
     {
@@ -538,7 +539,7 @@ void SensorManager::otaRunStart()
         OtaImageSigned::StartRule::Block)
     {
         otaLastEvent = "OTA start of " + devIdText(devId) +
-                       " refused: unsigned image - \"Signed images only\" is on (Firmware page)";
+                       " refused: unsigned image - \"Signed images only\" is on (Firmware page, Advanced mode)";
         logger.warning(otaLastEvent);
         return;
     }
@@ -966,7 +967,8 @@ SensorManager::OtaCheck SensorManager::otaCheckStart(uint32_t devId, bool reques
     {
         if (rule == OtaImageSigned::StartRule::Block)
         {
-            c.blockers += "Unsigned image - \"Signed images only\" is on (Firmware page): upload a signed image. ";
+            c.blockers +=
+                "Unsigned image - \"Signed images only\" is on (Firmware page, Advanced mode): upload a signed image. ";
         }
         else if (meta.unknownKey)
         {
@@ -1075,8 +1077,8 @@ bool SensorManager::otaAdmin(uint32_t devId, char action, String &msg)
         {
             // "Signed images only": a job with an unsigned image is not
             // resumed (it stays Paused; abort it or switch the option off)
-            msg = "Resume refused: the job's image is unsigned and \"Signed images only\" is on (Firmware page) - "
-                  "abort the job, or switch the option off and resume";
+            msg = "Resume refused: the job's image is unsigned and \"Signed images only\" is on (Firmware page, "
+                  "Advanced mode) - abort the job, or switch the option off and resume";
             otaLastEvent = "OTA " + devIdText(devId) + ": " + msg;
             logger.warning(otaLastEvent);
             return false;
@@ -1155,7 +1157,7 @@ void SensorManager::otaEnforceSignedOnly(const char *when)
     {
         otaStartPending = false;
         otaLastEvent = "OTA start of " + devIdText(pendingDev) +
-                       " dropped: unsigned image - \"Signed images only\" is on (Firmware page)";
+                       " dropped: unsigned image - \"Signed images only\" is on (Firmware page, Advanced mode)";
         logger.warning(otaLastEvent);
     }
     if (hold && otaJobPtr && otaJobPtr->devId == jobDev && otaJobPtr->crc == jobCrc &&
@@ -1164,7 +1166,7 @@ void SensorManager::otaEnforceSignedOnly(const char *when)
         otaScheduleSaveLocked(millis());
         otaLastEvent = "OTA " + devIdText(jobDev) + ": held Paused " + when +
                        " - its image is unsigned; abort the job, or switch \"Signed images only\" off (Firmware "
-                       "page) and resume";
+                       "page, Advanced mode) and resume";
         logger.warning(otaLastEvent);
     }
 }

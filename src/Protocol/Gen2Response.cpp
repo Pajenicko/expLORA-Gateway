@@ -12,6 +12,7 @@
  */
 
 #include "Gen2Response.h"
+#include "Gen2Values.h"
 #include "Gen2Crypto.h"
 #include "Gen2Downlink.h"
 
@@ -138,9 +139,14 @@ bool buildDown(Gen2Sensor &g, uint32_t upFcnt32, bool ackRequested, bool confirm
     return true;
 }
 
-bool decodeUp(Gen2Sensor &g, const uint8_t *payload, size_t len, unsigned long nowMs, OtaJob::Up *ota)
+bool decodeUp(Gen2Sensor &g, const uint8_t *payload, size_t len, unsigned long nowMs, OtaJob::Up *ota, bool *values)
 {
     bool confirmed = false;
+    bool pressure = false;  // a valid pressure in this UP (converted to the altitude below)
+    bool hasValues = false; // a measured quantity (valid or invalid) in this UP
+    g.value[Qty::Rssi] = g.rssi; // of this frame (set by the caller)
+    g.qMask |= Qty::mask(Qty::Rssi);
+    g.qNow |= Qty::mask(Qty::Rssi);
     g.lastUpLen = (uint8_t)(len < sizeof(g.lastUp) ? len : sizeof(g.lastUp));
     memcpy(g.lastUp, payload, g.lastUpLen);
     ep::TlvReader r(payload, len);
@@ -231,17 +237,17 @@ bool decodeUp(Gen2Sensor &g, const uint8_t *payload, size_t len, unsigned long n
             }
             continue;
         }
+        // Corrected here, so the pages, /api and MQTT all see it; an invalid
+        // value (sentinel) makes the quantity missing until the next value
+        const Gen2Values::Decoded d = Gen2Values::apply(g, t);
+        if (d != Gen2Values::Decoded::None)
+        {
+            hasValues = true;
+            pressure = pressure || (d == Gen2Values::Decoded::Value && t.type == ep::up::kPressure);
+            continue;
+        }
         switch (t.type)
         {
-        case ep::up::kTemperature:
-            g.temperature = (int16_t)ep::tlvU16(t);
-            break;
-        case ep::up::kHumidity:
-            g.humidity = ep::tlvU16(t);
-            break;
-        case ep::up::kBattery:
-            g.batteryMv = ep::tlvU16(t);
-            break;
         case ep::up::kDownlinkRssi:
             g.downlinkRssi = (int8_t)t.value[0];
             g.upDownlinkRssi = Gen2Link::History::clamp8(g.downlinkRssi);
@@ -257,6 +263,14 @@ bool decodeUp(Gen2Sensor &g, const uint8_t *payload, size_t len, unsigned long n
         default:
             break;
         }
+    }
+    if (pressure)
+    {
+        Gen2Values::pressureToAltitude(g);
+    }
+    if (values != nullptr)
+    {
+        *values = hasValues;
     }
     return confirmed;
 }

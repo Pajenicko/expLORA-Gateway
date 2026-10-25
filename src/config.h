@@ -138,12 +138,11 @@ inline String makeApName()
 
 // Sensor type definitions - easily extendable for additional types
 #define SENSOR_TYPE_UNKNOWN  0x00
-#define SENSOR_TYPE_BME280   0x01  // Temperature, humidity, pressure
-#define SENSOR_TYPE_SCD40    0x02  // Temperature, humidity, CO2
-#define SENSOR_TYPE_METEO    0x03  // Meteorological station
-#define SENSOR_TYPE_VEML7700 0x04  // Light sensor (LUX)
-#define SENSOR_TYPE_SHT40    0x05  // Temperature, humidity
-#define SENSOR_TYPE_DIY_TEMP 0x51  // Temperature
+#define SENSOR_TYPE_BME280   0x01  // Temperature, humidity, pressure (= SensorTypeIds::CLIMA)
+#define SENSOR_TYPE_SCD40    0x02  // Temperature, humidity, CO2 (= SensorTypeIds::CARBON)
+#define SENSOR_TYPE_METEO    0x03  // Meteorological station (= SensorTypeIds::METEO)
+// (0x04 VEML7700, 0x05 SHT40 and 0x51 DIY_TEMP were removed in 2.0.0: a
+// sensors.json entry of such a type is dropped at load, Data/SensorTypeIds.h)
 // Add additional sensor types here...
 
 // PSRAM configuration for web server

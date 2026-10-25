@@ -55,6 +55,8 @@ bool buildDown(Gen2Sensor &g, uint32_t upFcnt32, bool ackRequested, bool confirm
 // Store the reported values of a decrypted UP payload in the status; true
 // when it carried a status report or an event (confirmed UP)
 // ota (optional): the OTA facts of the UP (status report firmware / boot
-// state / flags, OTA status TLVs) for the OTA job
-bool decodeUp(Gen2Sensor &g, const uint8_t *payload, size_t len, unsigned long nowMs, OtaJob::Up *ota = nullptr);
+// state / flags, OTA status TLVs) for the OTA job; values (optional): the
+// UP carried a measured quantity (a value or an invalid-value sentinel)
+bool decodeUp(Gen2Sensor &g, const uint8_t *payload, size_t len, unsigned long nowMs, OtaJob::Up *ota = nullptr,
+              bool *values = nullptr);
 } // namespace Gen2Response

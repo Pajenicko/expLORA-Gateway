@@ -30,9 +30,10 @@ The gateway receives data from various wireless sensors via LoRa, processes the 
   - and more to come (you can also add new sensor, pull request are welcomed)
 
 - **Web Interface**:
-  - Responsive design
-  - Real-time sensor monitoring
-  - Sensor management (add, edit, delete)
+  - Small, responsive pages (light and dark scheme)
+  - Simple mode (default) and Advanced mode, see [Interface](#interface-simple-and-advanced)
+  - Real-time sensor monitoring, generation 1 and 2 sensors together
+  - Sensor management (add, edit, calibrate, delete)
   - Configuration settings
 
 - **Network Connectivity**:
@@ -48,9 +49,8 @@ The gateway receives data from various wireless sensors via LoRa, processes the 
   - Gateway diagnostics (uplink, IP address; Pro: power source, LTE signal and state)
 
 - **Data Correction**:
-  - Calibration options for sensor readings
+  - Calibration options for sensor readings (generation 1 and 2)
   - Independent corrections for each measurement type
-  - Original values logged for reference
 
 - **Logging System**:
   - Multiple log levels (ERROR, WARNING, INFO, DEBUG, VERBOSE)
@@ -189,7 +189,28 @@ version without login asks for a new password at the first login, the same way
 as a freshly flashed one. Sessions last until logout, 24 hours of inactivity or
 a restart; five wrong passwords lock the login for a minute.
 
-The sensor data API (`/api`) and `/firmware/version` stay public (read-only).
+The sensor data API (`/api`), `/firmware/version` and the shared stylesheet
+and script (`/a.css`, `/a.js`) stay public (read-only).
+
+## Interface: Simple and Advanced
+
+The System page (`/password`) switches the web interface between **Simple**
+(the default) and **Advanced**; the mode is a gateway setting, the same for
+everyone who logs in. Simple shows the sensors (add, rename, calibrate,
+delete - generation 1 and 2), the readings and the basic settings. Advanced
+adds what is needed for diagnostics: the generation 2 radio and security
+details (keys, devNonce, counters, link margins, configuration, OTA), the
+sensor serial numbers and 24 h statistics, the Logs page, MQTT TLS and the
+topics, the firmware URL update and the "Signed images only" option. Routes
+work in both modes; Simple only leaves them out of the pages and the
+navigation. The System page also holds the time zone, the admin password and
+the restart button.
+
+Settings of a switched-off feature are hidden (WiFi credentials while "Use
+WiFi" is off, LTE APN and PIN while LTE is off, MQTT settings while MQTT is
+off, static Ethernet addresses with DHCP). Hidden fields are not sent, and the
+gateway keeps their stored values - switching a feature off and on again does
+not lose its settings.
 
 **Forgotten password:** connect the gateway over USB and send `reset-password`
 on the serial console (115200 Bd). The password is cleared and has to be set
@@ -215,8 +236,8 @@ when the gateway loses its local network (Ethernet and WiFi), so it can always
 be reached for configuration; the Network page is available on the access point
 too (http://192.168.4.1/network).
 
-**Enable WiFi** (Network page, Pro only - the Lite has WiFi as its only
-uplink): with WiFi disabled the gateway runs on Ethernet (and LTE) - it never
+**Use WiFi** (WiFi card of the Network page, Pro only - the Lite has WiFi as
+its only uplink): with WiFi disabled the gateway runs on Ethernet (and LTE) - it never
 connects to a WiFi network, and once the access point is no longer needed the
 WiFi driver is stopped, which frees about 20 kB of memory. It applies after a
 restart, with or without WiFi credentials (an Ethernet-only gateway that was
@@ -229,9 +250,9 @@ So that the gateway can never be locked out, the access point still runs:
   Ethernet has had an address for 5 minutes again.
 The Network page is reachable on the access point (http://192.168.4.1/network),
 with the captive portal when there is no other way in. LTE does not count - it
-is not reachable from the local network. Saving WiFi credentials (WiFi
-Settings) switches WiFi back on. Disabling WiFi on a page opened over WiFi asks
-for confirmation, because that connection ends with the restart. There is no
+is not reachable from the local network. The SSID and password stay stored
+while WiFi is off. Disabling WiFi on a page opened over WiFi asks for
+confirmation, because that connection ends with the restart. There is no
 reset button: the only way to clear all settings is erasing the flash (NVS)
 over USB.
 
@@ -245,7 +266,7 @@ the LTE operator and signal, and the power source (PoE or USB).
 ## Time and Time Zone
 
 The clock is set over NTP once the gateway is online. The time zone is selected
-on the Network page (card "Time") from a list of named zones (`Europe/Prague`,
+on the System page (card "Time zone") from a list of named zones (`Europe/Prague`,
 `Europe/London`, `America/New_York`, ...): the zones of all European
 countries, mostly named after the capital (Vatican City has no entry of its own
 and uses `Europe/Rome`, Kosovo `Europe/Belgrade`, as in the tz database), plus
@@ -271,18 +292,23 @@ again.
 ## Adding Sensors
 
 1. Navigate to the "Sensors" page in the web interface
-2. Click "Add New Sensor"
+2. Click "Add sensor" (generation 1) or "Add gen 2 sensor"
 3. Enter the required details:
    - Name: A friendly name for the sensor
-   - Device Type: Select the appropriate sensor type
+   - Type: CLIMA, CARBON or METEO (generation 1)
    - Serial Number: The unique identifier of the sensor (in hexadecimal)
    - Device Key: The encryption key used by the sensor (in hexadecimal)
+   - Generation 2: the DevID and the key from the sensor's label; a sensor
+     that is heard but not added yet is listed under "Heard, not added yet"
 4. Optionally configure:
-   - Custom URL: For forwarding data to external services (http:// or https://;
+   - Forward to URL: For forwarding data to external services (http:// or https://;
      for https the connection is encrypted but the certificate is not checked,
      so self-signed endpoints work)
-   - Altitude: For pressure sensors, to adjust for elevation
-   - Correction values: To calibrate sensor readings
+5. "Edit" on the Sensors page: name, forward URL, corrections and the altitude
+   (pressure sensors); a generation 2 sensor also its report interval
+
+The types SHT40 (0x05) and DIY_TEMP (0x51) were removed in 2.0.0: an entry of
+such a type in `sensors.json` is dropped at start (one log line).
 
 The daily rain total of a meteo station restarts at local midnight. That needs
 the clock (NTP): without a synchronized time the total keeps adding up.
@@ -353,7 +379,14 @@ The gateway supports calibration of sensor readings through correction values:
 - **Wind Direction**: Degree offset (±)
   - Example: A correction of +10 rotates the direction 10 degrees clockwise
 
-Original (uncorrected) values are logged for reference while corrected values are stored and used for all operations.
+- **Altitude** (pressure sensors): the corrected station pressure is converted
+  to sea level
+
+Corrections are applied once, when a reading arrives: the pages, `/api`,
+MQTT and the forward URL all see the corrected values. A generation 2 sensor
+has the same corrections for the quantities it has reported (they appear
+after its first report); Advanced mode shows its raw values next to the
+corrected ones.
 
 ## MQTT Integration
 
@@ -369,17 +402,51 @@ To connect to a Home Assistant MQTT broker:
      Pro ~99 kB with WiFi, Ethernet and LTE on); if not, the MQTT page says
      why it does not connect
    - Username and Password: If your broker requires authentication
+   - TLS, the root topic and the discovery topic: Advanced mode
 4. Save the configuration
 
-The gateway will automatically generate discovery information for Home Assistant and publish sensor data to appropriate topics.
+The gateway will automatically generate discovery information for Home
+Assistant and publish sensor data to `<root topic>/<ID>/<quantity>`, where ID
+is the serial number of a generation 1 sensor (6 hex digits) or the DevID of
+a generation 2 sensor (8 hex digits). A generation 2 sensor appears as device
+model "Gen 2 HW<n>" with its firmware version; its entities follow the
+quantities it reports (temperature, humidity, pressure, CO2, light, battery,
+signal) and are announced again when it reports a new one.
+
+When a generation 2 sensor reports a failed reading (the sensor's invalid-value
+marker, e.g. a broken humidity sensor), that quantity is shown as missing on
+the pages and is `null` in `/api` until the next good reading, and its state
+topic gets `None`, which Home Assistant shows as "unknown" (never the last
+good number). A quantity the sensor does not send at all keeps its last value.
 
 ## API Usage
 
 The gateway provides a read-only REST API for sensor data (no login needed):
 
 - **List all sensors**: `/api?format=json`
-- **Get specific sensor**: `/api?sensor=XXXXXX&format=json` (where XXXXXX is the sensor's serial number in hex)
+- **Get specific sensor**: `/api?sensor=XXXXXX&format=json` (the serial number
+  in hex, or the DevID of a generation 2 sensor). It returns at most one
+  sensor: when a generation 1 serial number and a generation 2 DevID are the
+  same number, the generation 1 sensor is returned; add `&gen=2` (or
+  `&gen=1`) to choose
 - **CSV format**: Replace `json` with `csv` in the URL
+
+Generation 1 and 2 sensors have the same keys; a generation 2 sensor has
+`"typeName": "GEN2"`, `"gen": 2`, `"deviceType": 0` and its DevID as
+`serialNumber`. A value the sensor has not reported since the gateway started
+is `null` (empty in CSV); `lastSeen` is in seconds, -1 for never.
+
+### Changes for /api consumers (2.0.0)
+
+- A value without a reading is `null` in JSON (empty in CSV) instead of `0`:
+  before the sensor's first report since the gateway started (this includes
+  `batteryVoltage` and `rssi`), and while a generation 2 sensor reports a
+  failed reading. Parse the values as nullable numbers.
+- Generation 2 sensors are in the same list with `"deviceType": 0`,
+  `"typeName": "GEN2"`, `"gen": 2` and an 8-digit DevID as `serialNumber`;
+  code that expects `deviceType` 1-3 should skip or handle them. CSV gives
+  them type `0`.
+- Key names, their order and the rounding are unchanged.
 
 While the gateway checks for or downloads an update (update mode, at most
 15 minutes), `/api` answers `503` with `Retry-After: 60`; retry later.
@@ -430,7 +497,8 @@ Example API response:
 
 The logging system is a valuable troubleshooting tool:
 
-1. Navigate to the "Logs" page in the web interface
+1. Navigate to the "Logs" page in the web interface (Advanced mode; the
+   route `/logs` works in Simple mode too)
 2. Set the appropriate log level:
    - **ERROR**: Only critical issues
    - **WARNING**: Errors and warnings
