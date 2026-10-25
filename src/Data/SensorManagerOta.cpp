@@ -1182,10 +1182,14 @@ bool SensorManager::otaJobCopy(OtaJob::Job &out) const
     return otaJobPtr->state != State::None || otaJobPtr->ghost;
 }
 
-OtaJob::State SensorManager::otaJobState(bool &startPending) const
+OtaJob::State SensorManager::otaJobState(bool &startPending, OtaJob::WaitView *wait) const
 {
     std::lock_guard<std::mutex> lock(sensorMutex);
     startPending = otaStartPending;
+    if (wait)
+    {
+        *wait = otaJobPtr ? OtaJob::waitView(*otaJobPtr, otaNow()) : OtaJob::WaitView();
+    }
     return otaJobPtr ? otaJobPtr->state : State::None;
 }
 

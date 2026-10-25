@@ -22,6 +22,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <atomic>
 #include <mutex>
 #include <ESPAsyncWebServer.h>
 #include <AsyncTCP.h>
@@ -32,6 +33,7 @@
 #include "../Protocol/MQTTManager.h"
 #include "WebAuth.h"
 #include "../Update/GatewayOta.h"
+#include "../Update/Manifest.h"
 #include <memory>
 
 /**
@@ -100,17 +102,15 @@ private:
     // Firmware download requested by /firmware/update, done by the loop task
     String pendingOtaUrl;
     uint64_t pendingOtaSession = 0; // login session that asked for it (binds a confirmation)
+    Manifest::Expect pendingOtaExpect; // an install from the manifest: what the file must be
     volatile bool urlOtaRunning = false; // loop task is downloading firmware
     std::mutex otaUrlMutex;
-    void runUrlOta(const String &url, uint64_t session);
+    void runUrlOta(const String &url, uint64_t session, const Manifest::Expect &expect);
 
-    // Update check, also done by the loop task; the page polls for the result
+    // Update check (Update/UpdateCheck.h), done by the loop task; the page
+    // polls GET /firmware/check
     bool updateCheckRequested = false;
     bool updateCheckRunning = false;
-    bool updateCheckDone = false;
-    int updateCheckStatus = 0;
-    String updateCheckResult;
-    unsigned long updateCheckAt = 0;
     void runUpdateCheck();
     void abortUpload(const String &reason, bool log = true);
     volatile unsigned long restartAt = 0; // always written before restartRequested
@@ -167,6 +167,22 @@ private:
     void handleOtaImageChunk(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data,
                              size_t len, bool final);
     void handleOtaImageComplete(AsyncWebServerRequest *request);
+    // The end of a sensor image upload or download (one set of rules);
+    // expect / digest: a download from the manifest (what it must be, the
+    // SHA-256 of the whole file)
+    bool finishSensorImage(String &text, const Manifest::Expect *expect = nullptr, const uint8_t *digest = nullptr);
+    // Sensor image from a URL (M4c S4): queued here, downloaded by the loop
+    // task in an update-mode session (runSensorFetch)
+    void handleOtaFetch(AsyncWebServerRequest *request);
+    void handleOtaFetchStatus(AsyncWebServerRequest *request);
+    void runSensorFetch(const String &url, const Manifest::Expect &expect);
+    bool fetchBusyLocked() const; // under otaUrlMutex
+    String pendingFetchUrl;       // under otaUrlMutex
+    Manifest::Expect pendingFetchExpect; // under otaUrlMutex
+    uint8_t fetchState = 0;       // SensorFetch::State, under otaUrlMutex
+    String fetchResult;           // under otaUrlMutex
+    std::atomic<uint32_t> fetchBytes{0}, fetchTotal{0};
+    void fetchStatus(char *buf, size_t cap); // GET /ota/fetch/status JSON
     void handleOtaImageDelete(AsyncWebServerRequest *request);
     void handleLogs(AsyncWebServerRequest *request);
     void handleLogsClear(AsyncWebServerRequest *request);
@@ -179,7 +195,10 @@ private:
     void handleMqtt(AsyncWebServerRequest *request);
     void handleMqttPost(AsyncWebServerRequest *request);
     void handleFirmwareVersion(AsyncWebServerRequest *request);
-    void handleFirmwareCheck(AsyncWebServerRequest *request);
+    void handleCheckStart(AsyncWebServerRequest *request);
+    void handleCheckStatus(AsyncWebServerRequest *request);
+    void handleFirmwareInstall(AsyncWebServerRequest *request);
+    bool queueFirmwareDownload(AsyncWebServerRequest *request, const String &url, const Manifest::Expect &expect);
     void handleFirmwareUpdate(AsyncWebServerRequest *request);
     void handleReboot(AsyncWebServerRequest *request);
     void handleNotFound(AsyncWebServerRequest *request);

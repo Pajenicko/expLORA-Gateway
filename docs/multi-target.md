@@ -179,18 +179,70 @@ log buffer size) and `variants/<env>/platformio.ini`.
   "rolled back from vX" (the new firmware writes its version into the record
   when it starts).
 - From URL: HTTPS only, server certificate checked against the built-in CA
-  bundle, redirects followed, Content-Length required, runs in the loop task;
-  update check also in the loop task (page polls). The filesystem is not
-  unmounted during OTA.
+  bundle, redirects followed, Content-Length required, exactly that many
+  bytes (a short or long body is an error), runs in the loop task.
+- Update check (S5): `POST /firmware/check` queues it for the loop task
+  (update-mode session, reason "update check"), `GET /firmware/check`
+  answers `{"state","at","seq","text"}`. The signed manifest
+  (`UPDATE_MANIFEST_URL` in `board_config.h`, overridable with `-D` for a
+  bench build; this board's entry `BOARD_MANIFEST_KEY`) is downloaded into
+  RAM (<= 4 kB, refused from the Content-Length; 20 s + 2 kB/s budget) and
+  checked by `src/Update/Manifest.h` (pure; `test/test_manifest` with
+  fixtures made by `tools/release/explora_manifest.py`): strict line 1,
+  signature over the bytes after it (ReleaseKeys, no unsigned path), JSON
+  structure (seq, `gateway` / `sensor` objects, the parser's memory - at
+  least 384 JSON values always fit, the release tool refuses more -, nesting
+  <= 10 - else refused), then each entry on its own: this board's invalid
+  entry = no gateway offer, the other board's / sensor entries that break a
+  rule or this firmware's limits (and a 9th valid sensor package) skipped
+  with a log line; unknown keys ignored; replay floor.
+  `tools/release/explora_manifest.py` mirrors these rules exactly (the
+  native corpus test checks both agree) and refuses to build or verify a
+  manifest with a skipped entry unless `--allow-skip`. `GatewayOta::checkManifest` does it next to the
+  state (one copy of the JSON parser code) and stores a higher seq;
+  `src/Update/UpdateCheck.{h,cpp}` keeps the accepted manifest in RAM
+  (offers for the page, the install and the fetch) and records the result
+  in `/update/state.json` (`seq`, `check`). A refused manifest or a failed
+  check (no session, download error, no memory) clears the offers: the page
+  offers only what the last check accepted. `POST /firmware/install` (version) and `POST /ota/fetch` with
+  `hw` + `version` take only what the last check offers (newer gateway
+  firmware; a sensor image not stored, newer, or the same version signed
+  while the stored one is unsigned) and pass `Manifest::Expect` to the
+  download: exact size, SHA-256 of the whole file, Verified with the
+  manifest's version (and HW type) - else refused, the gateway slot erased
+  (`GatewayOta::discard`), the sensor store unchanged. The filesystem is not unmounted
+  during OTA. Sensor images from a URL (`POST /ota/fetch`, gen 2 page,
+  Advanced) use the same download code (`httpsDownload` in
+  `src/Web/WebServer.cpp`) and the same store path as an upload
+  (`finishSensorImage`); pure rules in `src/Update/SensorFetch.h` +
+  `test/test_sensor_fetch`. The sensor image download has its own time
+  budget (30 s + 2 kB/s of the Content-Length from the request, at most
+  86 s, `SensorFetch::budgetMs`); the gateway download keeps 15 min for the
+  body (2 min until the headers). Every phase is bounded: the TLS client
+  of a download (`DeadlineClient`) reads as closed at the deadline, so
+  connection, redirects (at most 3 per request, all downloads; a hop is
+  connected only while its connect + TLS time of 15 s still fits before
+  the deadline, and the previous hop's TLS session is closed first) and a
+  server that trickles its headers end at most one 10 s read timeout
+  after it (residual: the DNS lookup of a redirect to another host runs
+  inside its hop, lwIP retries, and can add a few seconds); the body loop
+  checks the same limit. Changed vs 1.x: bytes after the Content-Length now fail a gateway
+  URL install (1.x ignored them), and the URL rule (`urlAccepted`: https://,
+  at most 256 characters, a valid host, no spaces / control characters) is
+  stricter than the old prefix check.
 - Update mode (2.0.0, `src/Update/UpdateMode.h`, pure rules in
   `UpdateModePolicy.h` + `test/test_update_mode`): every outbound TLS
   session that checks for or downloads an update. Refused while another
-  session, an upload or a sensor OTA job (anything but Paused / terminal)
-  runs, offline or without a set clock. Always: MQTT held, the radio task
+  session, an upload or a sensor OTA job (anything but Paused / terminal;
+  for a sensor image download also a queued start, and Waiting while no
+  start is out and its deadline leaves the longest radio pause of 120 s
+  plus two report intervals - `waitingAllows`) runs, offline or without a
+  set clock. The job is checked again after the radio paused (aborted if it
+  moved meanwhile). Always: MQTT held, the radio task
   puts the radio in standby (keeps its liveness heartbeat), heavy pages and
   actions answered 503. Then the TLS check (60 kB + the session's own needs:
   check 8 kB, gateway download 28 kB - measured downloads took 69.5-77 kB in
-  all); only if it does not fit, every interface that does not carry the
+  all; sensor image download 16 kB - measured 52.6-61.6 kB in all on the Pro); only if it does not fit, every interface that does not carry the
   uplink is switched off, re-checked after up to 3 s, aborted (and restored)
   if still short; DNS servers and the default route are re-applied after
   the switch-off and right before the connection (the host resolved once
@@ -208,8 +260,9 @@ log buffer size) and `variants/<env>/platformio.ini`.
   (the reason only after the login). `/diag/heap` `updateMode` (incl.
   `lastRefusal`), the Firmware page shows the last session and refusal.
 - Signatures (2.0.0, M4c): sensor images in the store are checked against
-  the release keys (`src/Security/ReleaseKeys.h`, empty until the owner
-  creates the key: signed files then show "unknown key" = unsigned) –
+  the release keys (`src/Security/ReleaseKeys.h`: the production key
+  76091636 and an empty rotation slot; another key shows "unknown key" =
+  unsigned) –
   verified / unsigned / refused, see docs/protocol-v2.md §14.5; "Signed
   images only" on the Firmware page (Preferences `signedOnly`, default off).
   The gateway's own firmware: see "Gateway image" above (same setting).

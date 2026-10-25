@@ -4,8 +4,13 @@
 // expLORA Gateway Pro (EXPLORA GATEWAY PRO v1.0, ESP32-WROOM-32E-N16)
 #define BOARD_NAME "expLORA Gateway Pro"
 
-// OTA auto-update manifest
-#define FIRMWARE_UPDATE_URL "https://pajenicko.cz/webflash/explora-gw-pro-autoupdate.json"
+// Signed package manifest of the 2.x line (Update/Manifest.h), the same
+// for both boards; a bench build may define its own (-D)
+#ifndef UPDATE_MANIFEST_URL
+#define UPDATE_MANIFEST_URL "https://pajenicko.cz/webflash/explora/v1/packages.json"
+#endif
+// This board's entry in the manifest ("gateway": {"pro": ..., "lite": ...})
+#define BOARD_MANIFEST_KEY "pro"
 // Board id in a gateway signature block (Security/SigBlock.h: 1 Pro, 2 Lite)
 #define BOARD_SIGN_TARGET 1
 

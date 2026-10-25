@@ -31,6 +31,7 @@ static_assert(MAX_GEN2_SENSORS == SensorsJson::MAX_GEN2, "SensorsJsonBudget.h: M
 #include "../Protocol/Gen2Crypto.h"
 #include "../Protocol/Gen2Response.h"
 #include "DueTime.h"
+#include "../Security/SigBlock.h"
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <memory>
@@ -1247,13 +1248,15 @@ int SensorManager::parseSensorsLocked(const String &fileContent, const char *pat
             g.cfgVersion = 1;
         }
         Gen2Config::clamp(g.config);
-        unsigned maj = 0, min = 0, pat = 0;
-        if (sscanf(obj["fw"] | "", "%u.%u.%u", &maj, &min, &pat) == 3)
+        // "maj.min.pat" as written by snapshotLocked (no sscanf: it would
+        // link newlib's floating-point scanf, ~9 kB of flash)
+        uint32_t fw = 0;
+        if (SigBlock::parseVersion(obj["fw"] | "", fw))
         {
             g.hasFw = true;
-            g.fwMajor = (uint8_t)maj;
-            g.fwMinor = (uint8_t)min;
-            g.fwPatch = (uint8_t)pat;
+            g.fwMajor = (uint8_t)(fw >> 16);
+            g.fwMinor = (uint8_t)(fw >> 8);
+            g.fwPatch = (uint8_t)fw;
             g.hwType = obj["hw"] | 0u;
         }
         g.bootState = obj["bootState"] | 0xFF;

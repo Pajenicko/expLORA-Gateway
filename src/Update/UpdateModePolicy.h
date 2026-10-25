@@ -92,13 +92,51 @@ inline uint8_t switchOffPlan(Link uplink, uint8_t running)
     return running & (uint8_t)~keep;
 }
 
+// The longest radio pause of a sensor image download session: entering
+// (radio pause, heavy pages, interfaces settling: at most 12 s), the
+// download within its budget (SensorFetch::budgetMs: connection, TLS,
+// redirects, headers and body are charged to it, at most 86 s for the
+// largest file, plus at most one 10 s read timeout until the client sees
+// the deadline) and the end (signature check, commit: a few seconds).
+// Residual: the DNS lookup of a redirect to another host is not bounded by
+// the budget (SensorFetch::HOP_RESERVE_MS) and may add a few seconds
+constexpr uint32_t SENSOR_FETCH_PAUSE_MAX_S = 120;
+
+// A Waiting job and a sensor image download: the radio pause costs nothing
+// only while no start is out (its accepting UP would come during the pause
+// and be lost; the transfer would then be anchored minutes late) and the
+// "no accept" deadline leaves two of the sensor's intervals after the
+// longest pause: one UP receives the start, the next accepts it (a start
+// no longer re-arms the deadline after START_ARMS starts). No deadline
+// armed: nothing to expire
+inline bool waitingAllows(const OtaJob::WaitView &w)
+{
+    if (w.startOut)
+    {
+        return false;
+    }
+    return !w.deadlineArmed ||
+           (uint64_t)w.deadlineLeftS >= (uint64_t)SENSOR_FETCH_PAUSE_MAX_S + 2ULL * w.intervalS;
+}
+
 // A sensor OTA job allows the update mode only when it is terminal (or
 // there is none) or Paused: the radio is put in standby for the session,
 // and a job in Waiting / Transfer / Verified / Swapping / Confirming needs
 // it (a lost accepting UP or status costs a round, a lost confirmation
-// can end in a revert). A queued start (startPending) counts as active
-inline bool jobAllows(OtaJob::State s, bool startPending)
+// can end in a revert). A queued start (startPending) counts as active.
+// A sensor image download (S4, its radio pause bounded by
+// SENSOR_FETCH_PAUSE_MAX_S) is also allowed with a queued start (the job
+// is created after the session, with fresh deadlines) and with a Waiting
+// job that waitingAllows(); the job's own image cannot change meanwhile
+// (otaImageBusy at the end of the download)
+inline bool jobAllows(OtaJob::State s, bool startPending, Reason reason = Reason::None,
+                      const OtaJob::WaitView &wait = OtaJob::WaitView())
 {
+    if (reason == Reason::SensorFetch)
+    {
+        return s != OtaJob::State::Transfer && s != OtaJob::State::Verified && s != OtaJob::State::Swapping &&
+               s != OtaJob::State::Confirming && (s != OtaJob::State::Waiting || waitingAllows(wait));
+    }
     return !startPending && (OtaJob::terminal(s) || s == OtaJob::State::Paused);
 }
 
@@ -111,6 +149,7 @@ enum class Refusal : uint8_t
     ClockNotSet,   // certificates cannot be checked
     UploadRunning, // a firmware or sensor image upload runs
     SensorJob,     // a sensor OTA job needs the radio
+    JobWaiting,    // a Waiting job needs the radio soon (sensor image download)
 };
 
 inline const char *refusalText(Refusal r)
@@ -131,6 +170,8 @@ inline const char *refusalText(Refusal r)
         return "a firmware or sensor image upload is running";
     case Refusal::SensorJob:
         return "a sensor OTA job is running (pause it or wait until it ends)";
+    case Refusal::JobWaiting:
+        return "a waiting sensor OTA job needs the radio (wait until it ends or abort it)";
     }
     return "refused";
 }
@@ -144,6 +185,8 @@ struct Precheck
     bool uploadRunning;
     OtaJob::State job;
     bool jobStartPending;
+    Reason reason; // what would run (the job rule depends on it)
+    OtaJob::WaitView jobWait; // a Waiting job (the sensor image download's rule)
 };
 
 // In this order: the cheapest and most specific reason first
@@ -169,9 +212,10 @@ inline Refusal precheck(const Precheck &p)
     {
         return Refusal::UploadRunning;
     }
-    if (!jobAllows(p.job, p.jobStartPending))
+    if (!jobAllows(p.job, p.jobStartPending, p.reason, p.jobWait))
     {
-        return Refusal::SensorJob;
+        return p.job == OtaJob::State::Waiting && p.reason == Reason::SensorFetch ? Refusal::JobWaiting
+                                                                                  : Refusal::SensorJob;
     }
     return Refusal::None;
 }
@@ -476,6 +520,28 @@ inline bool urlHost(const char *url, char *host, size_t cap, bool &literal)
     }
     literal = dotted;
     return true;
+}
+
+// A URL the gateway downloads from (gateway firmware and sensor images):
+// https://, at most 256 characters, no spaces or control characters, a
+// usable host
+inline bool urlAccepted(const char *url)
+{
+    const size_t n = url ? strlen(url) : 0;
+    if (n > 256)
+    {
+        return false;
+    }
+    for (size_t i = 0; i < n; i++)
+    {
+        if ((unsigned char)url[i] <= ' ' || url[i] == 0x7F)
+        {
+            return false;
+        }
+    }
+    char host[128];
+    bool literal = false;
+    return urlHost(url, host, sizeof(host), literal);
 }
 
 // A URL for the log: scheme://host[:port]/path - the host as the connection

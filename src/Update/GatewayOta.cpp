@@ -109,36 +109,64 @@ void loadLocked()
     {
         return;
     }
-    stateLoaded = true;
-    state = UpdateState::State();
-    File f = LittleFS.open(PATH, "r");
-    if (!f)
-    {
-        return;
-    }
     std::unique_ptr<char[]> buf(new (std::nothrow) char[UpdateState::TEXT_CAPACITY]);
     if (!buf)
     {
-        f.close();
         logWarning("Update state: no memory to read it");
-        stateLoaded = false;
+        return; // not loaded: nothing is saved over the file
+    }
+    File f = LittleFS.open(PATH, "r");
+    if (!f)
+    {
+        if (LittleFS.exists(PATH))
+        {
+            // There but unreadable now: not "no file" (a save would replace
+            // it with a default state, seq 0)
+            logWarning("Update state: " + String(PATH) + " cannot be opened - not loaded");
+            return;
+        }
+        state = UpdateState::State();
+        stateLoaded = true;
         return;
     }
+    state = UpdateState::State();
+    stateLoaded = true;
     const size_t n = f.readBytes(buf.get(), UpdateState::TEXT_CAPACITY - 1);
     f.close();
     buf[n] = '\0';
     if (!UpdateState::parse(buf.get(), n, state))
     {
-        logWarning("Update state " + String(PATH) + " unreadable - starting a new one");
+        // The replay floor of the update check survives a damaged file
+        // whenever its text still holds a complete one (never silently
+        // lowered), else 0 (logged as an error: only flash corruption or a
+        // hand-made file gets here). The state is read once per run (only a
+        // failed attempt - no memory, the file cannot be opened - is
+        // repeated), so no other floor is known
+        bool found = false;
+        const uint32_t salvaged = UpdateState::salvageSeq(buf.get(), n, found);
+        state.seq = found ? salvaged : 0;
+        char t[112];
+        snprintf(t, sizeof(t), "Update state unreadable - a new one with %s%lu", state.seq ? "manifest seq " : "",
+                 (unsigned long)state.seq);
+        if (found)
+        {
+            logWarning(t);
+        }
+        else
+        {
+            logError(String(t) + ": no complete manifest seq found, any seq is accepted again");
+        }
     }
 }
 
 bool saveWrite();
 
-// mtx held. tmp + rename (a reset meanwhile keeps the old file)
+// mtx held. tmp + rename (a reset meanwhile keeps the old file). Never
+// while the state could not be read (no memory): the file would be
+// replaced by a default state (seq 0, records lost)
 bool saveLocked()
 {
-    if (saveWrite())
+    if (stateLoaded && saveWrite())
     {
         return true;
     }
@@ -647,23 +675,29 @@ String validationRefusal()
            " s left) - try again after that";
 }
 
-String installRefusal()
+bool installRefused(String &why)
 {
-    String v = validationRefusal();
-    if (v.length() > 0)
+    if (validationPending())
     {
-        return v;
+        why = validationRefusal();
+        if (why.length() == 0)
+        {
+            why = "the running firmware is being validated - try again later";
+        }
+        return true;
     }
     std::lock_guard<std::mutex> lock(mtx);
     if (activated)
     {
-        return "a firmware update was just activated - the gateway restarts";
+        why = "a firmware update was just activated - the gateway restarts";
+        return true;
     }
     if (writing)
     {
-        return "another firmware update is running";
+        why = "another firmware update is running";
+        return true;
     }
-    return "";
+    return false;
 }
 
 void signedOnlyOn()
@@ -703,27 +737,29 @@ void Writer::release()
     releaseLocked();
 }
 
-String Writer::begin()
+bool Writer::begin(String &error)
 {
-    String refusal = installRefusal();
-    if (refusal.length() > 0)
+    if (installRefused(error))
     {
-        return refusal;
+        return false;
     }
     const esp_partition_t *p = esp_ota_get_next_update_partition(nullptr);
     if (!p)
     {
-        return "no OTA partition";
+        error = "no OTA partition";
+        return false;
     }
     {
         std::lock_guard<std::mutex> lock(mtx);
         if (activated)
         {
-            return "a firmware update was just activated - the gateway restarts";
+            error = "a firmware update was just activated - the gateway restarts";
+            return false;
         }
         if (writing)
         {
-            return "another firmware update is running";
+            error = "another firmware update is running";
+            return false;
         }
         // Erased and its record cleared now: a write that never reaches the
         // slot (wrong board, too short, cut transfer, URL failure) must not
@@ -737,7 +773,8 @@ String Writer::begin()
     if (!st_)
     {
         release();
-        return "not enough memory for the firmware check";
+        error = "not enough memory for the firmware check";
+        return false;
     }
     esp_ota_handle_t h = 0;
     esp_err_t err;
@@ -752,19 +789,21 @@ String Writer::begin()
         release();
         if (err == ESP_ERR_OTA_ROLLBACK_INVALID_STATE)
         {
-            return "the running firmware is still being validated - install again in two minutes";
+            error = "the running firmware is still being validated - install again in two minutes";
+            return false;
         }
-        return String("esp_ota_begin failed (") + esp_err_to_name(err) + ")";
+        error = String("esp_ota_begin failed (") + esp_err_to_name(err) + ")";
+        return false;
     }
     handle_ = h;
     received_ = 0;
     headLen_ = 0;
     haveOutcome_ = false;
     outcome_ = GatewayImage::Outcome();
-    return "";
+    return true;
 }
 
-String Writer::writeFlash(const uint8_t *data, size_t len)
+bool Writer::writeFlash(const uint8_t *data, size_t len, String &error)
 {
     esp_err_t err;
     {
@@ -774,25 +813,28 @@ String Writer::writeFlash(const uint8_t *data, size_t len)
     if (err != ESP_OK)
     {
         abort();
-        return String("flash write failed (") + esp_err_to_name(err) + ")";
+        error = String("flash write failed (") + esp_err_to_name(err) + ")";
+        return false;
     }
-    return "";
+    return true;
 }
 
-String Writer::write(const uint8_t *data, size_t len)
+bool Writer::write(const uint8_t *data, size_t len, String &error)
 {
     if (!handle_ || haveOutcome_)
     {
-        return "no firmware write in progress";
+        error = "no firmware write in progress";
+        return false;
     }
     if (len == 0)
     {
-        return "";
+        return true;
     }
     if (received_ + len > part_->size)
     {
         abort();
-        return "Data exceed OTA slot size";
+        error = "Data exceed OTA slot size";
+        return false;
     }
     received_ += len;
     st_->stream.feed(data, len, st_->hash);
@@ -806,7 +848,7 @@ String Writer::write(const uint8_t *data, size_t len)
         len -= take;
         if (headLen_ < GatewayImage::HEADER_SIZE)
         {
-            return "";
+            return true;
         }
         switch (GatewayImage::checkHead(head_, headLen_, CONFIG_IDF_FIRMWARE_CHIP_ID))
         {
@@ -814,18 +856,19 @@ String Writer::write(const uint8_t *data, size_t len)
             break;
         case GatewayImage::HeadError::OtherChip:
             abort();
-            return "Firmware is for a different board (" BOARD_NAME " expected)";
+            error = "Firmware is for a different board (" BOARD_NAME " expected)";
+            return false;
         default:
             abort();
-            return "Not an ESP32 firmware image";
+            error = "Not an ESP32 firmware image";
+            return false;
         }
-        String e = writeFlash(head_, headLen_);
-        if (e.length() > 0)
+        if (!writeFlash(head_, headLen_, error))
         {
-            return e;
+            return false;
         }
     }
-    return len ? writeFlash(data, len) : String();
+    return len ? writeFlash(data, len, error) : true;
 }
 
 GatewayImage::Outcome Writer::finish(uint64_t announced)
@@ -1001,10 +1044,19 @@ Result conclude(Writer &w, const GatewayImage::Outcome &o, uint64_t session, boo
     }
 }
 
-void discard(Writer &w)
+void discard(Writer &w, const char *why)
 {
     eraseHead(w.partition());
     w.abort();
+    if (!why)
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mtx);
+    loadLocked();
+    snprintf(state.lastText, sizeof(state.lastText), "refused (update manifest): %s", why);
+    state.lastAt = unixNow();
+    saveLocked();
 }
 
 String confirm(const char *digestHex, uint64_t session, bool signedOnly)
@@ -1125,7 +1177,70 @@ View view(uint64_t session)
                         String(hex).substring(0, 16) + "...";
     }
     v.lastText = state.lastText;
+    v.manifestSeq = state.seq;
+    v.checkText = state.checkText;
+    v.checkAt = state.checkAt;
     return v;
+}
+
+// Skip lines of one check: the first SKIP_LINES are logged, the rest
+// counted in one line after the check (a signed manifest can name hundreds)
+constexpr uint16_t SKIP_LINES = 8;
+uint16_t skipLines = 0; // loop task (one check at a time)
+
+void logSkip(const char *what)
+{
+    if (skipLines++ >= SKIP_LINES)
+    {
+        return;
+    }
+    char t[128];
+    snprintf(t, sizeof(t), "Update check: manifest entry %s skipped (invalid for this firmware)", what);
+    logWarning(t);
+}
+
+// The manifest's JSON is parsed here, next to the state's own (one copy of
+// the JSON parser code); the lock is not held while it is checked
+Manifest::Result checkManifest(const char *file, size_t len, const Manifest::Limits &lim, Manifest::Doc &out,
+                               char *why, size_t whyCap)
+{
+    uint32_t stored;
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        loadLocked();
+        if (!stateLoaded)
+        {
+            snprintf(why, whyCap, "update state");
+            return Manifest::Result::Error;
+        }
+        stored = state.seq;
+    }
+    skipLines = 0;
+    const Manifest::Result r = Manifest::load(file, len, BOARD_MANIFEST_KEY, lim, stored, out, why, whyCap,
+                                              ReleaseKeys::KEYS, ReleaseKeys::SLOTS, logSkip);
+    if (skipLines > SKIP_LINES)
+    {
+        logWarning("Update check: " + String(skipLines - SKIP_LINES) + " more manifest entries skipped");
+    }
+    if (r == Manifest::Result::Ok)
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (out.seq > state.seq)
+        {
+            state.seq = out.seq; // in RAM even if the save fails (logged there)
+            saveLocked();
+        }
+    }
+    return r;
+}
+
+void recordCheck(const String &text)
+{
+    std::lock_guard<std::mutex> lock(mtx);
+    loadLocked();
+    UpdateState::copyText(state.checkText, sizeof(state.checkText), text.c_str());
+    state.checkAt = unixNow();
+    saveLocked();
 }
 
 void printDiagJson(Print &out)
@@ -1140,6 +1255,20 @@ void printDiagJson(Print &out)
                v.validating ? "true" : "false", (unsigned long)v.validateLeftS, v.validateFailed ? "true" : "false",
                v.waiting ? "true" : "false", (unsigned long)v.waitingLeftS);
     jsonText(out, v.lastText.c_str());
-    out.print("}");
+    out.printf(",\"manifestSeq\":%lu,\"checkAt\":%lu,\"check\":", (unsigned long)v.manifestSeq,
+               (unsigned long)v.checkAt);
+    jsonText(out, v.checkText.c_str());
+    // The release key ids this firmware verifies with (filled slots)
+    out.print(",\"releaseKeys\":[");
+    bool first = true;
+    for (size_t i = 0; i < ReleaseKeys::SLOTS; i++)
+    {
+        if (ReleaseKeys::KEYS[i].keyId != 0)
+        {
+            out.printf("%s\"%08lx\"", first ? "" : ",", (unsigned long)ReleaseKeys::KEYS[i].keyId);
+            first = false;
+        }
+    }
+    out.print("]}");
 }
 } // namespace GatewayOta

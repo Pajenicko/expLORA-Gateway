@@ -127,15 +127,16 @@ LinkState linkState()
 }
 
 // Under the gate
-Precheck currentPrecheck()
+Precheck currentPrecheck(Reason reason)
 {
     Precheck p = {};
+    p.reason = reason;
     p.active = activeFlag.load();
     p.restartPending = restartPending && restartPending();
     p.uplink = currentLink();
     p.clockSet = time(nullptr) >= 1700000000;
     p.uploadRunning = uploadBusy && uploadBusy();
-    p.job = sensorManager ? sensorManager->otaJobState(p.jobStartPending) : OtaJob::State::None;
+    p.job = sensorManager ? sensorManager->otaJobState(p.jobStartPending, &p.jobWait) : OtaJob::State::None;
     return p;
 }
 
@@ -264,7 +265,7 @@ bool enter(Reason reason, size_t extraHeap, String &error, uint32_t &gen)
     WatchdogPause pause; // radio / heavy waits, LTE power-down
     {
         std::lock_guard<std::mutex> lock(gate);
-        Refusal r = precheck(currentPrecheck());
+        Refusal r = precheck(currentPrecheck(reason));
         if (r != Refusal::None)
         {
             error = String("Update not started: ") + UpdateModePolicy::refusalText(r);
@@ -320,6 +321,21 @@ bool enter(Reason reason, size_t extraHeap, String &error, uint32_t &gen)
         abortEnter("the radio did not pause within " + String(RADIO_PAUSE_WAIT_MS / 1000) + " s");
         gen = 0;
         return false;
+    }
+    // The job may have moved between the check above and the pause (an UP
+    // the radio task handled meanwhile: an accepting UP, a start sent)
+    {
+        bool pending = false;
+        OtaJob::WaitView wait;
+        const OtaJob::State job =
+            sensorManager ? sensorManager->otaJobState(pending, &wait) : OtaJob::State::None;
+        if (!UpdateModePolicy::jobAllows(job, pending, reason, wait))
+        {
+            error = "Update aborted: the sensor OTA job changed";
+            abortEnter("the sensor OTA job changed while the radio paused");
+            gen = 0;
+            return false;
+        }
     }
     // Heavy pages admitted before the flag still hold their memory
     t0 = millis();
@@ -395,11 +411,11 @@ void leave(uint32_t gen, const String &result)
     restore(false, result);
 }
 
-String wouldRefuse()
+const char *wouldRefuse(Reason reason)
 {
     std::lock_guard<std::mutex> lock(gate);
-    Refusal r = precheck(currentPrecheck());
-    return r == Refusal::None ? String() : String(UpdateModePolicy::refusalText(r));
+    Refusal r = precheck(currentPrecheck(reason));
+    return r == Refusal::None ? nullptr : UpdateModePolicy::refusalText(r);
 }
 
 bool active()

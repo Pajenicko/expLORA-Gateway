@@ -274,7 +274,7 @@ public:
     // State of the job (None without one) and whether a start is queued
     // (Update/UpdateMode.h: the radio is paused only for a Paused or
     // terminal job)
-    OtaJob::State otaJobState(bool &startPending) const;
+    OtaJob::State otaJobState(bool &startPending, OtaJob::WaitView *wait = nullptr) const;
     // A non-terminal job uses an image of this HW type (no upload / delete then)
     bool otaImageBusy(uint16_t hwType) const;
     // An image was replaced or deleted: a terminal job of this HW type goes

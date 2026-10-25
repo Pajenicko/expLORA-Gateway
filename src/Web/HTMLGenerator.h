@@ -31,6 +31,28 @@
 #include "../Storage/OtaStore.h"
 #include "../Protocol/OtaJob.h"
 #include "../Update/GatewayOta.h"
+#include "../Update/Manifest.h"
+
+// The update check on the Firmware page (Update/UpdateCheck.h): the
+// accepted manifest of this run, copied under its lock (the last result,
+// time and seq come from GatewayOta::View)
+struct UpdateCheckView
+{
+    bool have = false; // a manifest was accepted in this run
+    uint32_t keyId = 0;
+    bool hasGateway = false;
+    uint32_t gatewayVersion = 0;
+    Manifest::Offer gatewayOffer = Manifest::Offer::None;
+    struct Sensor
+    {
+        uint16_t hw;
+        uint32_t offered;
+        bool stored;
+        uint32_t storedFw;
+        Manifest::Offer offer;
+    } sensor[Manifest::MAX_PACKAGES];
+    uint8_t sensors = 0;
+};
 
 // OTA part of the generation 2 detail page (protocol v2, spec 14.5)
 struct Gen2OtaView
@@ -47,6 +69,7 @@ struct Gen2OtaView
     bool signedOnly = false; // "Signed images only" (Firmware page)
     uint32_t otaHourMs = 0; // OTA airtime of the sliding hour (radio task)
     String lastEvent;
+    String fetchResult; // last sensor image download (POST /ota/fetch)
     OtaJob::Now now;
 };
 
@@ -160,6 +183,16 @@ public:
     // handleNetwork); part 0, 1, ... until NETWORK_PAGE_PARTS, a piece may be
     // empty (a card the board does not have)
     static constexpr size_t NETWORK_PAGE_PARTS = 6;
+
+    // Generation 2 detail page in Advanced mode, reserved in one piece:
+    // measured up to 9.5 kB (a finished job, two images, the last download
+    // and the download form); four images add ~0.65 kB, longer job,
+    // message and download texts some more; rounded up
+    static constexpr size_t GEN2_ADV_PAGE_SIZE = 11776;
+    // Generation 1 add / edit form: measured 3.57 kB (a METEO in Advanced
+    // with a 230-character forward URL); a 200-character URL full of HTML
+    // escapes and a 32-character name add up to ~1 kB more
+    static constexpr size_t SENSOR_FORM_SIZE = 4608;
     static String generateNetworkPagePart(const NetworkPageView &view, size_t part);
 
     // Sensor list page in pieces (one per sensor row), streamed by the web
@@ -198,7 +231,8 @@ public:
     static String apiCsvRow(const SensorData &sensor, unsigned long nowMs);
 
     // Generate firmware update page
-    static String generateFirmwarePage(const String &updateStatus, bool signedOnly, const GatewayOta::View &gw);
+    static String generateFirmwarePage(const String &updateStatus, bool signedOnly, const GatewayOta::View &gw,
+                                       const UpdateCheckView &check);
     // Small page after an action (saved, restarting): text is HTML; reloads
     // after refreshS (to url when given)
     static String generateNoticePage(const char *title, const String &text, uint8_t refreshS, const char *url);

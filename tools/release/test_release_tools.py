@@ -19,6 +19,8 @@ import explora_sigblock as sb  # noqa: E402
 
 SIGN = os.path.join(HERE, "explora_sign.py")
 KEYGEN = os.path.join(HERE, "explora_keygen.py")
+MANIFEST = os.path.join(HERE, "explora_manifest.py")
+BASE = "https://example.com/explora/v1"
 
 
 def gateway_image(desc_version=b"2.1.3", marker=None, chip=0, size=1024):
@@ -339,6 +341,278 @@ class Tools(unittest.TestCase):
             sb.parse_block(block)
         good = sb.build_block(sb.KIND_SENSOR, 3, 0x00020C, sensor_image(), key)
         self.assertEqual(sb.parse_block(good)["key_id"], sb.key_id(key.public_key()))
+
+    # ------------------------------------------------------------ manifest
+
+    def signed_set(self):
+        """Signed Pro gateway + HW3 sensor files (the test key)."""
+        r, gw = self.sign(gateway_image(), "--board", "pro", name="g.bin", out="gw-pro-2.1.3.bin")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r, sn = self.sign(sensor_image(size=512), kind="sensor", name="s.bin", out="hw0003-0.2.12.bin")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return [gw, sn]
+
+    def build(self, files, *extra, out="packages.json", seq="5"):
+        dst = os.path.join(self.d, out)
+        return run(MANIFEST, "build", "--base", BASE, "--seq", seq, "--key", self.key, *extra, "-o", dst,
+                   *files), dst
+
+    def mverify(self, path, *extra):
+        return run(MANIFEST, "verify", "--pub", self.pub, *extra, path)
+
+    def test_manifest_round_trip(self):
+        files = self.signed_set()
+        r, out = self.build(files)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("(verified)", r.stdout)
+        data = read(out)
+        head, body = data.split(b"\n", 1)
+        self.assertRegex(head.decode(), r"^EXSM1 [0-9a-f]{8} [0-9a-f]{128}$")
+        self.assertEqual(head.split()[1].decode(), "%08x" % sb.key_id(sb.load_public_key(self.pub)))
+        import json
+        doc = json.loads(body)
+        self.assertEqual(doc["seq"], 5)
+        self.assertEqual(list(doc["gateway"]), ["pro"])
+        g = doc["gateway"]["pro"]
+        self.assertEqual(g["version"], "2.1.3")
+        self.assertEqual(g["url"], BASE + "/gw-pro-2.1.3.bin")
+        self.assertEqual(g["size"], len(read(files[0])))
+        import hashlib
+        self.assertEqual(g["sha256"], hashlib.sha256(read(files[0])).hexdigest())
+        self.assertEqual(doc["sensor"]["0003"]["version"], "0.2.12")
+        v = self.mverify(out)
+        self.assertEqual(v.returncode, 0, v.stdout)
+        self.assertIn("valid manifest seq 5", v.stdout)
+        # Replay floor
+        self.assertEqual(self.mverify(out, "--min-seq", "6").returncode, 1)
+        self.assertEqual(self.mverify(out, "--min-seq", "5").returncode, 0)
+        # No key material printed
+        self.assertNotIn("PRIVATE", r.stdout + r.stderr)
+        # Existing output only with --force
+        r, _ = self.build(files)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("exists", r.stderr)
+        r, _ = self.build(files, "--force", seq="7")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_manifest_tamper(self):
+        r, out = self.build(self.signed_set())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        good = read(out)
+        for i in (150, len(good) // 2, len(good) - 2):
+            bad = bytearray(good)
+            bad[i] ^= 1
+            v = self.mverify(self.file("t.json", bytes(bad)))
+            self.assertEqual(v.returncode, 1, i)
+        crlf = good.replace(b"\n", b"\r\n", 1)
+        self.assertIn("line 1", self.mverify(self.file("c.json", crlf)).stdout)
+        upper = good[:6] + good[6:14].upper() + good[14:]
+        if upper != good:
+            self.assertEqual(self.mverify(self.file("u.json", upper)).returncode, 1)
+        zero = good[:6] + b"00000000" + good[14:]
+        self.assertIn("key id 0", self.mverify(self.file("z.json", zero)).stdout)
+        # Another key: not among the given ones
+        other = os.path.join(self.keydir, "o.pem")
+        self.assertEqual(run(KEYGEN, other).returncode, 0)
+        v = run(MANIFEST, "verify", "--pub", os.path.join(self.keydir, "o.pub.pem"), out)
+        self.assertEqual(v.returncode, 1)
+        self.assertIn("not among the given keys", v.stdout)
+
+    def test_manifest_refuses_unsigned_and_mismatched(self):
+        files = self.signed_set()
+        raw = self.file("hw0004.bin", sensor_image(hw=4))
+        r, _ = self.build(files + [raw], out="a.json")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("unsigned", r.stderr)
+        # Payload changed after signing
+        bad = bytearray(read(files[1]))
+        bad[40] ^= 1
+        r, _ = self.build([files[0], self.file("hw0003-x.bin", bytes(bad))], out="b.json")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("SHA-256", r.stderr)
+        # Two files for one HW type
+        r, dup = self.sign(sensor_image(fw=0x00020D), kind="sensor", name="s2.bin", out="hw0003-0.2.13.bin")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r, _ = self.build(files + [dup], out="c.json")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("second sensor file", r.stderr)
+        # Signed with a key that is neither the manifest key nor a --pub key
+        other = os.path.join(self.keydir, "o.pem")
+        self.assertEqual(run(KEYGEN, other).returncode, 0)
+        src = self.file("g2.bin", gateway_image(chip=9))
+        dst = os.path.join(self.d, "gw-lite.bin")
+        self.assertEqual(run(SIGN, "sign", "--kind", "gateway", "--key", other, src, dst).returncode, 0)
+        r, _ = self.build(files + [dst], out="d.json")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not among the given keys", r.stderr)
+        r, _ = self.build(files + [dst], "--pub", os.path.join(self.keydir, "o.pub.pem"), out="e.json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # Bad base URL / key mode
+        r = run(MANIFEST, "build", "--base", "http://example.com", "--seq", "1", "--key", self.key, "-o",
+                os.path.join(self.d, "f.json"), *files)
+        self.assertNotEqual(r.returncode, 0)
+        os.chmod(self.key, 0o640)
+        r, _ = self.build(files, out="g.json")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("chmod 600", r.stderr)
+        os.chmod(self.key, 0o600)
+
+    def test_manifest_seq_auto(self):
+        files = self.signed_set()
+        r, first = self.build(files, out="p1.json", seq="41")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r, second = self.build(files, "--prev", first, out="p2.json", seq="auto")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("seq 42", r.stdout)
+        r, _ = self.build(files, out="p3.json", seq="auto")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("needs --prev", r.stderr)
+        r, _ = self.build(files, "--prev", second, out="p4.json", seq="41")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not above", r.stderr)
+        # The same seq again: refused (two manifests under one seq)
+        r, _ = self.build(files, "--prev", second, out="p5.json", seq="42")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not above", r.stderr)
+        r, _ = self.build(files, "--prev", second, out="p5.json", seq="43")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # A previous manifest that does not verify is refused
+        bad = bytearray(read(second))
+        bad[-3] ^= 1
+        r, _ = self.build(files, "--prev", self.file("pbad.json", bytes(bad)), out="p6.json", seq="auto")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--prev", r.stderr)
+        # ... or one signed by another key
+        other = os.path.join(self.keydir, "o.pem")
+        self.assertEqual(run(KEYGEN, other).returncode, 0)
+        r = run(MANIFEST, "build", "--base", BASE, "--seq", "100", "--key", other, "--pub", self.pub, "-o",
+                os.path.join(self.d, "po.json"), *files)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r, _ = self.build(files, "--prev", os.path.join(self.d, "po.json"), out="p7.json", seq="auto")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not among the given keys", r.stderr)
+        # Only https:// URLs or files
+        r, _ = self.build(files, "--prev", "http://example.com/packages.json", out="p8.json", seq="auto")
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_manifest_size_limit(self):
+        r, out = self.build(self.signed_set())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        big = read(out) + b" " * (4097 - len(read(out)))
+        v = self.mverify(self.file("big.json", big))
+        self.assertEqual(v.returncode, 1)
+        self.assertIn("more than 4096", v.stdout)
+        import explora_manifest as em
+        doc = {"seq": 1, "sensor": {"%04X" % i: {"version": "0.1.0", "url": "https://h/x", "size": 4096,
+                                                  "sha256": "0" * 64} for i in range(1, 10)}}
+        refusals, skips = em.check_json(doc)
+        self.assertEqual(refusals, [])
+        self.assertEqual(skips, ["sensor.0009 (more than 8 sensor packages)"])
+        doc["sensor"] = {"00a3": doc["sensor"]["0001"]}
+        self.assertEqual(em.check_json(doc)[1], ["sensor.00a3 (HW type key)"])
+
+    def test_manifest_rules_mirror_the_gateway(self):
+        """check_json as src/Update/Manifest.h (the native test_manifest
+        corpus checks the firmware against the same function)."""
+        import explora_manifest as em
+        sha = "0" * 64
+
+        def pk(**kw):
+            p = {"version": "2.0.1", "url": "https://h.example/f.bin", "size": 100000, "sha256": sha}
+            p.update(kw)
+            return p
+
+        def skips(p, kind="gateway"):
+            doc = {"seq": 1, "gateway": {"pro": p}} if kind == "gateway" else {"seq": 1, "sensor": {"0003": p}}
+            refusals, sk = em.check_json(doc)
+            self.assertEqual(refusals, [])
+            return sk
+
+        # URL: bytes, host after the FIRST '@', 127-byte host, literals
+        self.assertEqual(skips(pk(url="https://u:p@h.example:8443/f")), [])
+        self.assertTrue(skips(pk(url="https://a@b@h.example/f")))
+        self.assertTrue(skips(pk(url="https://u:p@ss@h.example/f")))
+        self.assertEqual(skips(pk(url="https://" + "h" * 127 + "/f")), [])
+        self.assertTrue(skips(pk(url="https://" + "h" * 128 + "/f")))
+        self.assertEqual(skips(pk(url="https://h.example/" + "a" * 238)), [])
+        self.assertTrue(skips(pk(url="https://h.example/" + "a" * 237 + "\u00e9")))  # 256 chars, 257 bytes
+        self.assertEqual(skips(pk(url="https://[::1]/f")), [])
+        self.assertTrue(skips(pk(url="https://h?x/f")))
+        self.assertEqual(skips(pk(url="https://h:80?x/f")), [])  # the gateway checks the name before ':'
+        self.assertTrue(skips(pk(url="https://:80/f")))
+        self.assertTrue(skips(pk(url="https://h/a\x00b")))
+        # Versions: leading zeros as the gateway, parts 0..255
+        self.assertEqual(skips(pk(version="002.000.001")), [])
+        self.assertTrue(skips(pk(version="2.0.256")))
+        self.assertTrue(skips(pk(version="2.0.0-dev")))
+        # Size limits per kind
+        self.assertEqual(skips(pk(size=em.GATEWAY_MIN)), [])
+        self.assertTrue(skips(pk(size=em.GATEWAY_MIN - 1)))
+        self.assertTrue(skips(pk(size=em.GATEWAY_MAX + 1)))
+        self.assertTrue(skips(pk(size=True)))
+        self.assertEqual(skips(pk(size=em.SENSOR_MAX), "sensor"), [])
+        self.assertTrue(skips(pk(size=em.SENSOR_MAX + 1), "sensor"))
+        self.assertTrue(skips(pk(size=em.SENSOR_MIN - 1), "sensor"))
+        # A null board is absent; unknown boards and fields are ignored
+        self.assertEqual(em.check_json({"seq": 1, "gateway": {"pro": None, "c6": {"x": 1}}}), ([], []))
+        # Structure: refused
+        for bad in ({"seq": 1, "gateway": []}, {"seq": 1, "sensor": "x"}, {"seq": -1}, {"seq": 2 ** 32},
+                    {"seq": True}, {"seq": 1.0}, {}, [1]):
+            self.assertTrue(em.check_json(bad)[0], bad)
+        # Node bound and nesting (ArduinoJson's limit 10, the root counts)
+        self.assertEqual(em.check_json({"seq": 1, "x": list(range(em.MAX_NODES - 2))})[0], [])
+        self.assertTrue(em.check_json({"seq": 1, "x": list(range(em.MAX_NODES - 1))})[0])
+        deep = []
+        for _ in range(8):
+            deep = [deep]
+        self.assertEqual(em.check_json({"seq": 1, "x": deep})[0], [])  # 10 levels
+        self.assertTrue(em.check_json({"seq": 1, "x": [deep]})[0])  # 11
+        # The JSON reader: trailing bytes ignored (as the gateway), stricter
+        # than the gateway for duplicates / NaN / 01
+        self.assertEqual(em.parse_body(b' {"seq":1} junk'), {"seq": 1})
+        for bad in (b'{"seq":1,"seq":2}', b'{"seq":NaN}', b'{"seq":01}', b"{'seq':1}", b'{"seq":1,}'):
+            with self.assertRaises(ValueError):
+                em.parse_body(bad)
+
+    def test_manifest_allow_skip(self):
+        """A file the gateway would skip (here: a sensor image over this
+        firmware's limit) is refused unless --allow-skip; verify likewise."""
+        import explora_manifest as em
+        files = self.signed_set()
+        big = sensor_image(hw=0x10, size=em.SENSOR_MAX - sb.SIZE + 32)  # signed file 32 B over the limit
+        r, f = self.sign(big, kind="sensor", name="big.bin", out="hw0010-0.2.12.bin")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r, _ = self.build(files + [f], out="s1.json")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("sensor.0010.size", r.stderr)
+        self.assertIn("--allow-skip", r.stderr)
+        r, out = self.build(files + [f], "--allow-skip", out="s2.json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stderr.count("WARNING"), 1)
+        v = self.mverify(out)
+        self.assertEqual(v.returncode, 1)
+        self.assertIn("entries the gateway skips", v.stdout)
+        v = self.mverify(out, "--allow-skip")
+        self.assertEqual(v.returncode, 0, v.stdout)
+        self.assertIn("WARNING", v.stderr)
+        # A forward-looking previous manifest still works as --prev (only
+        # its signature and seq are used), with or without --allow-skip now
+        r, _ = self.build(files, "--prev", out, out="s3.json", seq="auto")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("seq 6", r.stdout)
+        self.assertNotIn("WARNING", r.stderr)
+        r, _ = self.build(files, "--prev", out, out="s4.json", seq="5")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not above", r.stderr)
+
+    def test_prev_redirect_to_http_refused(self):
+        import explora_manifest as em
+        h = em.HttpsOnlyRedirects()
+        import urllib.request
+        req = urllib.request.Request("https://example.com/packages.json")
+        with self.assertRaises(em.ManifestError):
+            h.redirect_request(req, None, 302, "Found", {}, "http://example.com/packages.json")
+        self.assertIsNotNone(h.redirect_request(req, None, 302, "Found", {}, "https://example.org/p.json"))
 
     def test_parse_version_ascii_only(self):
         self.assertEqual(sb.parse_version("2.0.0-dev"), 0x020000)

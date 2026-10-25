@@ -201,10 +201,12 @@ inline Parsed parse(const char *text, Field f, float stored, float &out)
 
 // Generation 2 corrections are stored rounded to 0.001 (CalibrationJson
 // writeJson): an entered value is rounded the same way, so what is applied
-// now is what a restart reads back
+// now is what a restart reads back. -0.0 (e.g. -0.0004) becomes 0: no
+// "change" against a stored 0 and no "-0" on the page
 inline float milli(float x)
 {
-    return (float)(std::round(x * 1000.0) / 1000.0);
+    const float r = (float)(std::round(x * 1000.0) / 1000.0);
+    return r == 0.0f ? 0.0f : r;
 }
 
 // A reading corrected by the field of its quantity (the altitude is not a

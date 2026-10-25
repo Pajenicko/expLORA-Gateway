@@ -10,13 +10,13 @@
  * (04 || X || Y), read big-endian (printed as 8 hex digits it is the hash
  * prefix). test/test_sigverify checks every filled slot against its point.
  *
- * NO PRODUCTION KEY YET: both slots are empty (keyId 0). The key pair is
- * created by the owner only (tools/release/explora_keygen.py, the private
- * key stays on the signing machine only, never in a
- * repository); the tool prints the slot to paste here. Until then every
- * image verifies as SigVerify::Result::NoKey, which callers must treat as
- * "unsigned - not verified", never as verified. Test keys live under test/
- * only.
+ * Slot 0 holds the production release key (key id 76091636). The key pair
+ * is created by the owner only (tools/release/explora_keygen.py, the
+ * private key stays on the signing machine only, never in a
+ * repository); the tool prints the slot to paste here. An image signed with
+ * any other key verifies as SigVerify::Result::NoKey, which callers must
+ * treat as "unsigned - not verified", never as verified. Test keys live
+ * under test/ only.
  *
  * Copyright Pajenicko s.r.o., Igor Sverma (C) 2026
  *
@@ -51,10 +51,18 @@ struct Key
 
 constexpr size_t SLOTS = 2;
 
-// [0] current release key, [1] next key (rotation). Empty: no production
-// key has been generated yet
+// [0] current release key, [1] next key (rotation; empty until a key
+// rotation is prepared)
 constexpr Key KEYS[SLOTS] = {
-    {0, {}},
+    // production release key (owner, 2026-10-25), key id 76091636
+    {0x76091636u,
+        {
+         0x04, 0x3B, 0xE8, 0xFB, 0x13, 0x19, 0x5B, 0x1F, 0x03, 0xFA, 0x20, 0x1E, 0x14,
+         0x87, 0x7E, 0x49, 0x36, 0xF1, 0x2A, 0x73, 0xAE, 0x9C, 0x60, 0x1B, 0x5B, 0x21,
+         0xC6, 0x10, 0xF0, 0x97, 0x02, 0x39, 0x1B, 0xD3, 0x42, 0x0C, 0x73, 0x9C, 0x51,
+         0x75, 0x1A, 0xF5, 0x7B, 0x5B, 0xB2, 0x40, 0xA9, 0x2C, 0x11, 0x81, 0x41, 0xC3,
+         0xEE, 0x15, 0x03, 0xD3, 0x0B, 0x2A, 0x19, 0xC3, 0x43, 0x54, 0x94, 0x67, 0x37,
+        }},
     {0, {}},
 };
 } // namespace ReleaseKeys

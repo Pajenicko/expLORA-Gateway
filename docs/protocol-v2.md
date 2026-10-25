@@ -1593,6 +1593,35 @@ image has no OTA receiver – a sensor running it could not be updated over the
 air again". Block reads from LittleFS in `loop()` follow the flash permit rule
 (§7) like the configuration writes.
 
+**From a URL (gateway 2.0.0, M4c S4).** `POST /ota/fetch` (logged in, `url`
+= `https://`, ≤ 256 characters, the same rule as the gateway's own URL
+update) queues a download for the loop task. It runs in an update-mode
+session (MQTT held, radio in standby) and streams into the same store path
+as an upload (`upload.tmp`, the image/block split, CRC and SHA-256 while
+streaming, then the same validation, classification, "Signed images only"
+rule and job rule, one shared code path). Only HTTP 200 with a Content-Length
+of 512…114,816 bytes is accepted (checked before anything is written; redirects
+only to `https://`); a short or long body, a reset, 15 s without data, more
+than 30 s + 2 kB/s of the Content-Length from the request (at most 86 s; the
+connection, at most 3 redirects and the headers are charged to it and cut
+off at that point too, at most one 10 s read timeout later) or
+the session's hard cap abort the download before the image is classified (a cut
+signed file is never stored as unsigned), `upload.tmp` is removed and the
+store is unchanged (a reset meanwhile: `upload.tmp` is deleted at boot). One
+download at a time, refused (409; 503 during another session) while an
+upload, a gateway download or check, another session or a pending restart
+runs, while a new gateway firmware is being validated and while a job is in
+Transfer, Verified, Swapping or Confirming. A queued start, Paused and
+terminal jobs allow it; Waiting only while no start is out (its accepting UP
+would be lost) and the "no accept" deadline leaves the longest radio pause
+(120 s: entering, the download budget, the end) plus two report intervals
+(one UP gets the start, the next accepts it). The job rule is checked again
+after the radio paused. The HW
+type is in the trailer at the end of the image, so a download for the HW type
+of an unfinished job or a queued start is refused only at the end (the
+store unchanged). `GET /ota/fetch/status`: `{"state":
+"idle|queued|downloading|stored|failed","bytes","total","result"}`.
+
 **Signed images (gateway 2.0.0, M4c).** The file may carry the 128-byte
 signature block (`src/Security/SigBlock.h`, ECDSA P-256 / SHA-256, written by
 `tools/release/explora_sign.py --kind sensor`) after the image. Only the image
@@ -1606,8 +1635,8 @@ target = trailer HW type, version = trailer firmware, payload length = image
 length, hash = SHA-256 of the stored bytes (computed while streaming), key id
 in the firmware's release key table and the signature valid – `"signed"` =
 key id; **unknown key** – a well-formed, bound block whose key id is not in
-the table: stored as unsigned with `"unknownKey"` and a note (until the owner
-creates the release key the table is empty and every signed file ends here);
+the table: stored as unsigned with `"unknownKey"` and a note (the table holds
+the production key 76091636 and an empty rotation slot);
 **refused** – a malformed block (incl. key id 0, which marks an empty key
 slot and is never made by `explora_keygen.py`), a binding mismatch (also
 with an unknown key: the binding is checked first; a well-formed block for

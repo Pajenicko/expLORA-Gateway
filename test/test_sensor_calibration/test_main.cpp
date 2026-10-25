@@ -279,6 +279,13 @@ static void test_gen2_milli_matches_stored(void)
     TEST_ASSERT_EQUAL_FLOAT(0.0f, milli(0.0004f));
     TEST_ASSERT_EQUAL_FLOAT(0.013f, milli(0.0125f));
     TEST_ASSERT_EQUAL_FLOAT(-0.3f, milli(-0.3f));
+    // -0.0 becomes +0.0 (bitwise: a stored 0 compares equal, no "-0" shown)
+    const float zero = 0.0f;
+    for (float x : {-0.0004f, -0.0f, -0.0005f + 0.0002f})
+    {
+        const float m = milli(x);
+        TEST_ASSERT_EQUAL_MEMORY(&zero, &m, sizeof(float));
+    }
     const float xs[] = {0.0004f, 0.0125f, -0.0005f, 1.23456f, -49.9994f, 0.125f, 3.14159f, -0.001f, 99.9995f};
     for (float x : xs)
     {

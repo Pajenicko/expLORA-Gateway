@@ -160,7 +160,7 @@ static void test_wrong_key_and_unknown_key(void)
     // Key id not in the table
     TEST_ASSERT_TRUE(SigVerify::verify(r.block, e, TEST_KEYS, 1) == Result::NoKey);
     TEST_ASSERT_TRUE(SigVerify::verify(r.block, e, TEST_KEYS, 0) == Result::NoKey);
-    // The release table (no production key yet) never verifies a test image
+    // The release table (production key only) never verifies a test image
     TEST_ASSERT_TRUE(SigVerify::verify(r.block, e) == Result::NoKey);
     // Key id 0 (in the signed bytes) never matches, even an empty slot: it
     // marks an empty slot, so a block naming it is malformed

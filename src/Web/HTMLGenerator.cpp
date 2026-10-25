@@ -1368,6 +1368,20 @@ static void addGen2OtaCard(String &html, const Gen2Sensor &g, const Gen2OtaView 
             "' enctype='multipart/form-data'><p>Upload a sensor image (<code>firmware.bin</code> with the OTA "
             "trailer, optionally signed): <input type='file' name='image' accept='.bin' required> "
             "<button class=b>Upload</button></p></form>";
+    // Or downloaded by the gateway (POST /ota/fetch, update mode); the
+    // status is polled, then the page is loaded again with the result
+    html += "<p>or from an https:// URL: <input id=fu placeholder='https://example.com/firmware.bin'> <button "
+            "class=b onclick='fe()'>Download</button> <span id=fs class=m></span></p>";
+    if (v.fetchResult.length() > 0)
+    {
+        html += "<p><small>Last download: " + HTMLGenerator::htmlEscape(v.fetchResult) + "</small></p>";
+    }
+    html += "<script>function fe(){var u=fu.value.trim();u&&confirm('Update mode: MQTT and sensor reception pause "
+            "meanwhile. Continue?')&&fetch('/ota/fetch',{method:'POST',body:new URLSearchParams({url:u})}).then(r=>"
+            "r.text().then(t=>{if(!r.ok)throw Error(t);fp()})).catch(e=>fs.textContent=e.message)}function fp(){"
+            "fetch('/ota/fetch/status').then(r=>r.json()).then(d=>{/^[qd]/.test(d.state)?(fs.textContent=d.bytes+"
+            "' / '+d.total+' B',setTimeout(fp,1500)):location.href='/sensors/gen2?devId=" +
+            String(id) + "'}).catch(()=>setTimeout(fp,3000))}</script>";
     html += String("<p><small>Signed images only: <strong>") + (v.signedOnly ? "on" : "off") +
             "</strong> (Firmware page). " +
             (v.signedOnly ? "Unsigned images are refused and cannot be started or resumed."
@@ -1499,7 +1513,7 @@ String HTMLGenerator::generateGen2DetailPage(const Gen2Sensor &g, const String &
         addHtmlFooter(html);
         return html;
     }
-    html.reserve(9000);
+    html.reserve(GEN2_ADV_PAGE_SIZE);
     const int8_t txNow = g.effectiveTxPower(); // configured, or what the status report says the sensor uses
     const Gen2Link::Margins link = Gen2Link::margins(g.link, gen2LinkNowS(), txNow);
     const String recommendation = txPowerAdvice(link, txNow);
@@ -1739,10 +1753,18 @@ String HTMLGenerator::generateUpdateProgressPage(const String &updateStatus)
     return html;
 }
 
-String HTMLGenerator::generateFirmwarePage(const String &updateStatus, bool signedOnly, const GatewayOta::View &gw)
+static String versionText(uint32_t v)
+{
+    char t[16];
+    OtaImage::versionText(v, t, sizeof(t));
+    return String(t);
+}
+
+String HTMLGenerator::generateFirmwarePage(const String &updateStatus, bool signedOnly, const GatewayOta::View &gw,
+                                           const UpdateCheckView &c)
 {
     String html;
-    html.reserve(6144);
+    html.reserve(7680);
     addHtmlHeader(html, "Firmware", Page::Firmware);
     html += "<p id=msg class=w hidden></p>";
     // Update mode: the last session (while one runs, /firmware serves
@@ -1771,10 +1793,76 @@ String HTMLGenerator::generateFirmwarePage(const String &updateStatus, bool sign
     {
         html += "<p class=m>Last install: " + htmlEscape(gw.lastText) + "</p>";
     }
-    html += "<button onclick='chk()'>Check for update</button><p class=m>The check and a download run in update "
-            "mode: MQTT and sensor reception pause; this page may lose the connection for a few minutes.</p>";
+    // Updates: the gateway checks the signed manifest itself (Update/UpdateCheck.h)
+    html += "<h3>Updates</h3><p>";
+    if (gw.checkText.length() > 0)
+    {
+        html += "Last check";
+        if (gw.checkAt)
+        {
+            const time_t t = gw.checkAt;
+            struct tm tm;
+            char when[24];
+            localtime_r(&t, &tm);
+            strftime(when, sizeof(when), " %Y-%m-%d %H:%M", &tm);
+            html += when;
+        }
+        html += ": " + htmlEscape(gw.checkText);
+    }
+    else
+    {
+        html += "Not checked yet.";
+    }
+    html += "</p>";
+    if (c.have)
+    {
+        const String v = versionText(c.gatewayVersion);
+        switch (c.gatewayOffer)
+        {
+        case Manifest::Offer::Install:
+            html += "<p><b>Gateway v" + v + " is available</b></p><button onclick=\"ins('" + v + "')\">Install v" + v +
+                    "</button> ";
+            break;
+        case Manifest::Offer::None:
+            html += "<p class=m>The manifest has no firmware for this board.</p>";
+            break;
+        case Manifest::Offer::Unknown:
+            html += "<p class=m>v" + v + " is offered, but the running version cannot be compared.</p>";
+            break;
+        default:
+            html += "<p>Up to date.</p>";
+            break;
+        }
+    }
+    html += "<button onclick='chk()'>Check now</button><p class=m>The check and a download run in update mode: MQTT "
+            "and sensor reception pause; this page may lose the connection for a few minutes.</p>";
     if (adv())
     {
+        if (c.have || gw.manifestSeq)
+        {
+            char key[12];
+            snprintf(key, sizeof(key), "%08lx", (unsigned long)c.keyId);
+            html += "<p class=m>Manifest seq " + String(gw.manifestSeq) +
+                    (c.have ? String(", verified (key ") + key + ")" : String("")) + "</p>";
+        }
+        if (c.sensors > 0)
+        {
+            html += "<table><tr><th>Sensor HW<th>Stored<th>Offered<th></tr>";
+            for (uint8_t i = 0; i < c.sensors; i++)
+            {
+                const UpdateCheckView::Sensor &s = c.sensor[i];
+                char hw[8];
+                snprintf(hw, sizeof(hw), "%04X", s.hw);
+                const String v = versionText(s.offered);
+                html += String("<tr><td>") + hw + "<td>" + (s.stored ? versionText(s.storedFw) : String("-")) + "<td>" +
+                        v + "<td>" +
+                        (s.offer == Manifest::Offer::Install
+                             ? "<button class=b2 onclick=\"sf('" + String(hw) + "','" + v + "')\">Fetch</button>"
+                             : String(Manifest::offerName(s.offer))) +
+                        "</tr>";
+            }
+            html += "</table>";
+        }
         html += "<label for=fu>Firmware URL</label><input id=fu placeholder='https://example.com/firmware.bin'>"
                 "<button class=b2 onclick=\"var u=fu.value.trim();u?upd(u):alert('Enter a URL first')\">Update "
                 "from URL</button>";
@@ -1811,23 +1899,34 @@ String HTMLGenerator::generateFirmwarePage(const String &updateStatus, bool sign
                 "gateway firmware and sensor images are refused (an unfinished sensor job with one is held). A wrong "
                 "signature is always refused.</p><button>Save</button></form></section>";
     }
-    html += "<script>var V='" FIRMWARE_VERSION "',W='Update mode: MQTT and sensor reception pause, interfaces other "
+    html += "<script>var W='Update mode: MQTT and sensor reception pause, interfaces other "
             "than the uplink may switch off (then reload this page in a few minutes). Continue?';"
             "function J(t){try{return JSON.parse(t)}catch(e){return null}}"
             "function N(m){msg.textContent=m;msg.hidden=false}"
-            "function R(r){return r.text().then(function(t){return{ok:r.ok,s:r.status,d:J(t)||{}}})}"
-            "function E(x){return x.d.error||x.d.message||'HTTP '+x.s}"
+            "function R(r){return r.text().then(function(t){return{ok:r.ok,s:r.status,d:J(t)||{},t:t}})}"
+            "function E(x){return x.d.error||x.d.message||x.t||'HTTP '+x.s}"
             "function P(u,b){return fetch(u,{method:'POST',headers:{'Content-Type':"
             "'application/x-www-form-urlencoded'},body:b}).then(R)}"
-            "function nw(a,b){a=a.split('.');b=b.split('.');for(var i=0;i<3;i++){var x=+a[i]||0,y=+b[i]||0;"
-            "if(x!=y)return x>y}return false}"
-            "function chk(n){n=n||0;if(!n&&!confirm(W))return;fetch('/firmware/check').then(R).then(function(x){"
-            "if(x.s==202){if(n<60)return setTimeout(function(){chk(n+1)},1000);throw Error('no answer')}"
-            "if(!x.ok)throw Error(E(x));var d=x.d;if(d.version&&nw(d.version,V)){if(confirm('Version '+d.version+"
-            "' is available. Update now?'))upd(d.url,1)}else alert('v'+V+' is the latest version')}).catch("
-            "function(e){e instanceof TypeError?N('The connection was lost - the gateway may be in update mode. "
-            "Reload the page in a few minutes.'):alert('Update check failed: '+e.message)})}"
-            "function upd(u,w){if(!w&&!confirm(W))return;N('Firmware update started - wait about 2 minutes, do not "
+            "function L(){N('The connection was lost - the gateway may be in update mode. Reload the page in a few "
+            "minutes.')}"
+            // Poll u until f(answer) is true, then reload (lost answers are
+            // retried: the session may switch interfaces off); at most 90
+            // polls (3 min) of any kind, a 401 ends it at once
+            "function Q(u,f,n){n=n||0;setTimeout(function(){fetch(u).then(R).then(function(x){if(x.s==401)N('Logg"
+            "ed out - reload the page.');else if(x.ok&&f(x.d))location.reload();else n<90?Q(u,f,n+1):N('No result"
+            " yet - reload the page.')}).catch(function(){n<90?Q(u,f,n+1):L()})},2000)}"
+            "function chk(){if(!confirm(W))return;P('/firmware/check','').then(function(x){if(!x.ok)throw Error(E(x"
+            "));N('Checking...');Q('/firmware/check',function(d){return d.state=='idle'})}).catch(function(e){e "
+            "instanceof TypeError?L():alert('Update check failed: '+e.message)})}"
+            "function ins(v){if(!confirm(W))return;N('Installing v'+v+' - wait a few minutes, do not power off.');"
+            "setTimeout(function(){location.reload()},120000);P('/firmware/install','version='+v).then(function(x){"
+            "if(!x.ok)throw Error(E(x));if(x.d.message)N(x.d.message)}).catch(function(e){e instanceof TypeError?L("
+            "):N('Not started: '+e.message)})}"
+            "function sf(h,v){if(!confirm(W))return;P('/ota/fetch','hw='+h+'&version='+v).then(function(x){if(!x.ok"
+            ")throw Error(E(x));N('Downloading the sensor image...');Q('/ota/fetch/status',function(d){return d."
+            "state=='stored'||d.state=='failed'})}).catch(function(e){e instanceof TypeError?L():alert('Not started: "
+            "'+e.message)})}"
+            "function upd(u){if(!confirm(W))return;N('Firmware update started - wait about 2 minutes, do not "
             "power off.');setTimeout(function(){location.reload()},120000);P('/firmware/update','url='+"
             "encodeURIComponent(u)).then(function(x){if(!x.ok)throw Error(E(x));if(x.d.message)N(x.d.message)})"
             ".catch(function(e){N('Update request sent; if nothing happens, try again ('+e.message+')')})}"
@@ -1896,7 +1995,7 @@ String HTMLGenerator::generateSensorForm(const SensorData *s, int index)
 {
     const bool a = adv();
     String html;
-    html.reserve(3584);
+    html.reserve(SENSOR_FORM_SIZE);
     addHtmlHeader(html, s ? "Edit sensor" : "Add sensor", Page::Sensors);
     html += "<section><h2>";
     if (s)

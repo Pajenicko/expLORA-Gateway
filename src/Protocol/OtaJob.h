@@ -1258,6 +1258,26 @@ inline bool batteryHold(const Job &j, const Now &n)
 {
     return j.state == State::Paused && j.dlBattery.armed() && !j.dlBattery.reached(n);
 }
+
+// What a radio pause of a few minutes would cost a Waiting job
+// (UpdateModePolicy::waitingAllows): a start out (its accepting UP would be
+// lost) and how long the "no accept" deadline still runs
+struct WaitView
+{
+    bool startOut = false;
+    bool deadlineArmed = false;
+    uint32_t deadlineLeftS = 0;
+    uint32_t intervalS = 0;
+};
+inline WaitView waitView(const Job &j, const Now &n)
+{
+    WaitView w;
+    w.startOut = j.startValid;
+    w.deadlineArmed = j.dlState.armed();
+    w.deadlineLeftS = j.dlState.leftS(n);
+    w.intervalS = j.intervalS;
+    return w;
+}
 // Resume: a manual pause, or the battery hold (the admin lifts it; a sensor
 // still low refuses 6 again, which re-arms it)
 inline bool canResume(const Job &j, const Now &n)

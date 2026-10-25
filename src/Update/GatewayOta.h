@@ -58,6 +58,7 @@
 
 #include "../Data/Logging.h"
 #include "GatewayImage.h"
+#include "Manifest.h"
 
 #include <esp_partition.h>
 
@@ -84,14 +85,25 @@ bool validationPending(uint32_t *leftS = nullptr, bool *failed = nullptr);
 // (it waits for its validation)
 String validationRefusal();
 
-// Why no install can start now ("" = it can): the running firmware waits
-// for its validation, another install writes the slot, or an image was
-// activated and the gateway is about to restart
-String installRefusal();
+// true: no install can start now - the running firmware waits for its
+// validation, another install writes the slot, or an image was activated
+// and the gateway is about to restart; why explains (the flags decide, the
+// text may be empty only if it could not be allocated)
+bool installRefused(String &why);
 
 // "Signed images only" was switched on: an unsigned image waiting for its
 // confirmation is dropped and erased
 void signedOnlyOn();
+
+// Update check (S5): a downloaded manifest (Update/Manifest.h load():
+// signature, rules, replay floor = the highest seq accepted so far, kept
+// in /update/state.json); when it is accepted, its seq is stored if it is
+// higher. Error with why "update state": the state cannot be read now (no
+// memory) - never checked against an unknown replay floor
+Manifest::Result checkManifest(const char *file, size_t len, const Manifest::Limits &lim, Manifest::Doc &out,
+                               char *why, size_t whyCap);
+// The result of the last update check (Firmware page, /diag/heap)
+void recordCheck(const String &text);
 
 struct Result;
 
@@ -103,12 +115,13 @@ public:
     Writer(const Writer &) = delete;
     Writer &operator=(const Writer &) = delete;
 
-    // "" or the reason. Drops an image that waits for a confirmation (its
-    // slot is written again)
-    String begin();
-    // "" or the reason (the write is aborted then). The image header is held
-    // until it is complete and checked against this chip
-    String write(const uint8_t *data, size_t len);
+    // false: error says why (the flag decides: a reason that could not be
+    // allocated still fails). Drops an image that waits for a confirmation
+    // (its slot is written again)
+    bool begin(String &error);
+    // false: error says why (the write is aborted then). The image header is
+    // held until it is complete and checked against this chip
+    bool write(const uint8_t *data, size_t len, String &error);
     // The end: length, tail, signature, esp_ota_end(). Safe to call twice
     GatewayImage::Outcome finish(uint64_t announced);
     void abort();
@@ -135,7 +148,7 @@ private:
     std::unique_ptr<State> st_;
 
     bool owns_ = false; // holds the install slot (one writer at a time)
-    String writeFlash(const uint8_t *data, size_t len);
+    bool writeFlash(const uint8_t *data, size_t len, String &error);
 };
 
 // What conclude() did
@@ -152,9 +165,10 @@ struct Result
 // "upload" / "URL" for the log
 Result conclude(Writer &w, const GatewayImage::Outcome &o, uint64_t session, bool signedOnly, const char *source);
 
-// A finished image that is not concluded (the upload turned out invalid):
-// erased, never activated
-void discard(Writer &w);
+// A finished image that is not concluded (the upload turned out invalid,
+// a manifest install did not match): erased, never activated. why: also
+// recorded as the last install result ("refused (update manifest): why")
+void discard(Writer &w, const char *why = nullptr);
 
 // POST /firmware/confirm: activates the waiting image. "" = activated
 // (restart), else the reason
@@ -174,6 +188,9 @@ struct View
     String waitingDigest;   // 64 hex
     uint32_t waitingLeftS = 0;
     String lastText;        // last install result
+    uint32_t manifestSeq = 0; // highest accepted manifest seq
+    String checkText;       // last update check
+    uint32_t checkAt = 0;   // its unix time (0 = clock not set)
 };
 View view(uint64_t session);
 

@@ -509,15 +509,90 @@ static void test_update_state_json(void)
     }
     memset(m.lastText, '"', sizeof(m.lastText) - 1);
     m.lastAt = 0xFFFFFFFFu;
+    m.seq = 0xFFFFFFFFu;
+    memset(m.checkText, '"', sizeof(m.checkText) - 1);
+    m.checkAt = 0xFFFFFFFFu;
     n = UpdateState::format(m, buf, sizeof(buf));
     TEST_ASSERT_TRUE(n > 0 && n < UpdateState::TEXT_CAPACITY);
     TEST_ASSERT_TRUE(UpdateState::parse(buf, n, r));
     TEST_ASSERT_EQUAL_STRING(m.lastText, r.lastText);
+    TEST_ASSERT_EQUAL_STRING(m.checkText, r.checkText);
+    TEST_ASSERT_EQUAL_UINT32(0xFFFFFFFFu, r.seq);
     // Unknown fields (a later stage's) are read past; this firmware drops them
-    // when it writes the file (UpdateState.h: the S5 contract)
-    const char *later = "{\"v\":1,\"seq\":7,\"pending\":{\"ver\":\"2.1.0\",\"part\":\"app1\",\"x\":1}}";
+    // when it writes the file (UpdateState.h: the contract)
+    const char *later = "{\"v\":1,\"seq\":7,\"pending\":{\"ver\":\"2.1.0\",\"part\":\"app1\",\"x\":1},\"auto\":{\"y\":2}}";
     TEST_ASSERT_TRUE(UpdateState::parse(later, strlen(later), r));
     TEST_ASSERT_EQUAL_STRING("2.1.0", r.pending.ver);
+    TEST_ASSERT_EQUAL_UINT32(7, r.seq);
+}
+
+// S5: seq and the last check in /update/state.json; a v1 file of S3/S4
+// (no seq) reads as seq 0; an unreadable file gives its seq back through
+// salvageSeq
+void test_state_manifest_fields()
+{
+    UpdateState::State s, r;
+    const char *s3 = "{\"v\":1,\"running\":{\"ver\":\"2.0.0\",\"part\":\"app0\",\"sig\":\"unsigned\",\"key\":0}}";
+    TEST_ASSERT_TRUE(UpdateState::parse(s3, strlen(s3), r));
+    TEST_ASSERT_EQUAL_UINT32(0, r.seq);
+    TEST_ASSERT_EQUAL_STRING("", r.checkText);
+    s.seq = 4000000000u;
+    UpdateState::copyText(s.checkText, sizeof(s.checkText), "ok (seq 4000000000): up to date");
+    s.checkAt = 1761200500;
+    char buf[UpdateState::TEXT_CAPACITY];
+    size_t n = UpdateState::format(s, buf, sizeof(buf));
+    TEST_ASSERT_EQUAL_STRING("{\"v\":1,\"seq\":4000000000,\"check\":{\"text\":\"ok (seq 4000000000): up to date\",\"at\":"
+                             "1761200500}}",
+                             buf);
+    TEST_ASSERT_TRUE(UpdateState::parse(buf, n, r));
+    TEST_ASSERT_EQUAL_UINT32(4000000000u, r.seq);
+    TEST_ASSERT_EQUAL_UINT32(1761200500u, r.checkAt);
+    // A file cut in the middle / with a damaged byte: not parsed, seq salvaged
+    bool found = false;
+    TEST_ASSERT_FALSE(UpdateState::parse(buf, n - 20, r));
+    TEST_ASSERT_EQUAL_UINT32(4000000000u, UpdateState::salvageSeq(buf, n - 20, found));
+    TEST_ASSERT_TRUE(found);
+    const char *damaged = "{\"v\":1,\"running\":{\"ver\":\"2.0.0\"\x01,\"seq\":42,\"check\":{";
+    TEST_ASSERT_FALSE(UpdateState::parse(damaged, strlen(damaged), r));
+    TEST_ASSERT_EQUAL_UINT32(42, UpdateState::salvageSeq(damaged, strlen(damaged), found));
+    TEST_ASSERT_TRUE(found);
+    // Nothing to salvage: 0, not found (the caller logs the reset)
+    TEST_ASSERT_EQUAL_UINT32(0, UpdateState::salvageSeq("{\"v\":1,\"se", 11, found));
+    TEST_ASSERT_FALSE(found);
+    TEST_ASSERT_EQUAL_UINT32(0, UpdateState::salvageSeq("\"seq\":", 6, found));
+    TEST_ASSERT_FALSE(found);
+    // Out of range or no digits: not taken; the largest valid one wins
+    const char *two = "\"seq\":99999999999,\"seq\":5,\"seq\":x,\"seq\":17}";
+    TEST_ASSERT_EQUAL_UINT32(17, UpdateState::salvageSeq(two, strlen(two), found));
+    TEST_ASSERT_TRUE(found);
+    // A number cut by the damage (no ',' or '}' after it) is not taken: "seq":4
+    // of 42 would lower the floor
+    const char *cut = "{\"v\":1,\"seq\":4";
+    TEST_ASSERT_EQUAL_UINT32(0, UpdateState::salvageSeq(cut, strlen(cut), found));
+    TEST_ASSERT_FALSE(found);
+    const char *cut2 = "{\"v\":1,\"seq\":5,\"x\":1,\"seq\":4";
+    TEST_ASSERT_EQUAL_UINT32(5, UpdateState::salvageSeq(cut2, strlen(cut2), found));
+    TEST_ASSERT_TRUE(found);
+    const char *spaced = "{\"seq\":42 }";
+    UpdateState::salvageSeq(spaced, strlen(spaced), found);
+    TEST_ASSERT_FALSE(found);
+    // A JSON-valid file whose seq is not an integer 0..2^32-1 is damaged
+    // (parse fails, the caller salvages and logs), never read as seq 0
+    for (const char *bad : {"{\"v\":1,\"seq\":-1}", "{\"v\":1,\"seq\":\"42\"}", "{\"v\":1,\"seq\":1.5}",
+                            "{\"v\":1,\"seq\":4294967296}", "{\"v\":1,\"seq\":true}", "{\"v\":1,\"seq\":{}}"})
+    {
+        TEST_ASSERT_FALSE_MESSAGE(UpdateState::parse(bad, strlen(bad), r), bad);
+        TEST_ASSERT_EQUAL_UINT32(0, r.seq);
+        UpdateState::salvageSeq(bad, strlen(bad), found);
+        TEST_ASSERT_FALSE_MESSAGE(found, bad);
+    }
+    const char *nul = "{\"v\":1,\"seq\":null}";
+    TEST_ASSERT_TRUE(UpdateState::parse(nul, strlen(nul), r)); // null = missing
+    TEST_ASSERT_EQUAL_UINT32(0, r.seq);
+    // seq 0 is not written (missing = 0)
+    UpdateState::State z;
+    n = UpdateState::format(z, buf, sizeof(buf));
+    TEST_ASSERT_EQUAL_STRING("{\"v\":1}", buf);
 }
 
 int main(int, char **)
@@ -525,6 +600,7 @@ int main(int, char **)
     initKeys();
     UNITY_BEGIN();
     RUN_TEST(test_verified_every_chunking);
+    RUN_TEST(test_state_manifest_fields);
     RUN_TEST(test_unsigned_and_tails);
     RUN_TEST(test_classification_matrix);
     RUN_TEST(test_finish_idempotent);

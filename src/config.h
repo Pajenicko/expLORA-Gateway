@@ -28,7 +28,7 @@
 // Firmware version (FIRMWARE_VERSION)
 #include "version.h"
 
-// OTA Configuration: FIRMWARE_UPDATE_URL is per board (board_config.h)
+// Update check: UPDATE_MANIFEST_URL and BOARD_MANIFEST_KEY are in board_config.h
 #include "board_config.h"
 
 // LoRa radio parameters - must match the sensors (receive only)

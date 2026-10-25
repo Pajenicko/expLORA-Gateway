@@ -4,8 +4,13 @@
 // expLORA Gateway Lite
 #define BOARD_NAME "expLORA Gateway Lite"
 
-// OTA auto-update manifest
-#define FIRMWARE_UPDATE_URL "https://pajenicko.cz/webflash/explora-gw-lite-autoupdate.json"
+// Signed package manifest of the 2.x line (Update/Manifest.h), the same
+// for both boards; a bench build may define its own (-D)
+#ifndef UPDATE_MANIFEST_URL
+#define UPDATE_MANIFEST_URL "https://pajenicko.cz/webflash/explora/v1/packages.json"
+#endif
+// This board's entry in the manifest ("gateway": {"pro": ..., "lite": ...})
+#define BOARD_MANIFEST_KEY "lite"
 // Board id in a gateway signature block (Security/SigBlock.h: 1 Pro, 2 Lite)
 #define BOARD_SIGN_TARGET 2
 

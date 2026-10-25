@@ -87,8 +87,49 @@ Pin assignments live in `variants/<board>/board_config.h`.
 3. **Firmware updates** can also be installed from the web interface (Firmware page):
    upload a binary, or download one over HTTPS (the server certificate is
    checked against the built-in CA bundle). Images for the other board are
-   refused. "Check for update" offers only a newer version (major, minor and
-   patch compared as numbers), never an older one.
+   refused.
+
+   **Check now** (Firmware page): the gateway downloads the signed package
+   manifest `https://pajenicko.cz/webflash/explora/v1/packages.json` and
+   decides itself what to offer - the browser no longer compares versions,
+   and the 1.x `explora-gw-<board>-autoupdate.json` is not read by 2.x. The
+   manifest is one file, at most 4 kB: a line `EXSM1 <key id> <signature>`
+   (ECDSA P-256 with a release key over the exact bytes after it), then
+   JSON with a sequence number `seq` and per board / per sensor HW type the
+   version, URL, size and SHA-256 of a signed file. A manifest that is not
+   signed with a key the firmware carries, has a bad signature or a broken
+   structure (no valid `seq`, `gateway` / `sensor` not objects, too large or
+   too complex) is refused (logged; an error for a bad signature). Single
+   entries are checked one by one so that a later release cannot stop the
+   check of gateways already installed: an entry this firmware cannot use
+   (a bigger image than it allows, a 9th sensor HW type, a bad URL or
+   version) is skipped with a log line and never offered; an invalid entry
+   for this board only means no gateway offer ("gateway entry invalid"),
+   the sensor packages are still used. Fields it does not know are
+   ignored. Replay
+   protection: the gateway keeps the highest `seq` it accepted in
+   `/update/state.json` and refuses a lower one (the same one is fine); there
+   is no expiry date. A damaged state file keeps its `seq` when it can still
+   be read from the text; a formatted filesystem (or a rollback to a firmware
+   without this check, which drops the field) starts again at 0, which is
+   harmless because nothing older than the running firmware is installed
+   from the manifest. The page shows the
+   last check (time and result) and "vX is available - Install" or "Up to
+   date" (offers come only from the last check: a refused manifest or a
+   failed check offers nothing until the next successful one); skipped
+   entries are logged one line each, at most 8 per check plus one "N more"
+   line; Advanced mode also shows the seq, the key ("verified, key
+   ab12cd34") and the sensor images per HW type (stored vs offered, with
+   Fetch). **Install** downloads the offered file like a URL install, but it
+   must have the manifest's size and SHA-256 and be signed with a release key
+   for this board with the manifest's version, newer than the running one -
+   otherwise it is refused and erased (no confirmation, no downgrade from the
+   manifest). **Fetch** stores a sensor image the same way (size, SHA-256, HW
+   type, version, signature; the sensor image download rules apply).
+   `GET /firmware/check` has the check's state and last result; `/diag/heap`
+   has `manifestSeq`, `check`, `checkAt` and `releaseKeys` (the key ids this
+   firmware verifies with) under `update`. A development
+   build whose version is not maj.min.pat offers no install.
 
    **Signed firmware and confirmation:** a file signed with a release key
    (a 128-byte signature block appended by `tools/release/explora_sign.py`)
@@ -107,6 +148,11 @@ Pin assignments live in `variants/<board>/board_config.h`.
    counts as unsigned (it needs the confirmation, and is refused with
    **Signed images only** on) - by design, an upload has no announced length
    to compare. A download from a URL with a wrong length is refused.
+   Changed in 2.0.0: a download from a URL must end exactly at its announced
+   Content-Length - a server that sends any bytes after it (even a stray line
+   break) is refused, where 1.x installed the image and ignored them; the
+   URL must also be a plain `https://` address of at most 256 characters
+   with a valid host and no spaces.
 
    **Older version:** a verified file whose version is lower than the running
    firmware is not installed at once either: the Firmware page asks you to
@@ -133,7 +179,7 @@ Pin assignments live in `variants/<board>/board_config.h`.
    Firmware page may then still say "verified" for the replaced firmware; a
    full USB flash (PlatformIO upload) resets it.
 
-   The check and a download from a URL run in **update mode**: MQTT is
+   The check, an install from the manifest and a download from a URL run in **update mode**: MQTT is
    disconnected, sensor reception pauses (the radio is in standby) and the
    web interface answers most pages with "update in progress" (HTTP 503)
    until it ends (the login, a short status page under Firmware and the
@@ -145,7 +191,8 @@ Pin assignments live in `variants/<board>/board_config.h`.
    LTE uplink: WiFi) and switched on again afterwards. If the page was
    loaded over such an interface, the connection drops - reload it after a
    few minutes. Update mode is refused during an upload and while a sensor
-   OTA job is running (pause it first). If the interfaces it switched off
+   OTA job is running (pause it first; for a sensor image download from a
+   URL see the generation 2 OTA section). If the interfaces it switched off
    (and that worked before) are not back 5 minutes after the session, the
    gateway restarts - not while an upload or a sensor OTA transfer, swap
    or confirmation runs (it waits for them), and not for an interface you
@@ -343,6 +390,36 @@ over LoRa from its detail page (`/sensors/gen2?devId=…`, docs/protocol-v2.md
    after a restart; Resume refused until the option is off, Abort works); a
    job whose image is already complete on the sensor is not stopped, but it
    is held as well if the sensor would need the image again.
+   **From a URL** (Advanced mode): instead of uploading, enter an `https://`
+   address next to the upload and press Download. The gateway downloads the
+   file itself in update mode (MQTT and sensor reception pause for the few
+   seconds it takes, at most about 2 minutes; see Firmware updates) and stores it exactly like an
+   upload, with the same checks, signature classification and "Signed images
+   only" rule (an unsigned file from a URL is stored with the same warning and
+   needs the same confirmation at the start). The server must answer 200 with
+   a Content-Length of at most 114,816 bytes (image plus signature block);
+   anything else, a body shorter or longer than announced, a cut or silent
+   connection (15 s), a server slower than 30 s plus 2 kB/s for the file
+   (at most 86 s from the request, connection, redirects and headers
+   included - they are cut off at that point too, at most 10 s later, plus
+   a few seconds if a redirect's new host is slow to look up; WiFi
+   and Ethernet take about 2 s, LTE about 12 s for the largest file), more
+   than 3 redirects or a certificate the built-in CA bundle
+   does not accept ends the download, and the store stays as it was. The page shows the
+   progress and then the result ("Last download: ..."); `GET
+   /ota/fetch/status` and `/diag/heap` (`sensorFetch`) have the state, bytes
+   and result. One download at a time; it is refused while an upload, a
+   firmware download or another update-mode session runs and while a job
+   needs the radio (Transfer, Verified, Swapping, Confirming - pause it
+   first). A job that waits for its sensor (Waiting) may stay as it is
+   while no start has gone out to the sensor yet and its deadline leaves
+   2 minutes plus two report intervals; otherwise the download is refused
+   until the job ends (or you abort it). The job's own image cannot be
+   replaced meanwhile. A queued start is fine (the job begins after the
+   download). Like an update check it is also refused while a newly
+   installed gateway firmware is being validated (its first 2 minutes).
+   Uploads (sensor image or firmware) are refused while a download is
+   queued or runs; start them after it ends.
 2. **Start** with "Update to vX". The page lists what blocks a start (no
    image, no OTA receiver, no status report yet, RTC not usable, an
    unconfirmed image running, another job – one at a time, an unsigned image

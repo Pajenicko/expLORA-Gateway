@@ -76,6 +76,14 @@ constexpr size_t EXTRA_CHECK = 8192;
 // lowest point keeps the 8 kB reserve with ~3 kB to spare. The Pro with
 // every interface up (~95 kB idle) still fits without switching anything off
 constexpr size_t EXTRA_GATEWAY_DOWNLOAD = 28672;
+// Sensor image download (S4): the 2 kB download buffer, the upload state
+// (~0.4 kB), the LittleFS file and the TCP data in flight next to TLS; the
+// signature check runs after TLS is closed. Measured with the bench server
+// (P-256 certificate): Pro over Ethernet 97.6-98.4 -> 36.3-39.4 kB (at most
+// 61.6 kB, i.e. 9.6 kB above the 52 kB TLS peak), the Lite over WiFi 182 ->
+// 125 kB (57 kB). 16 kB leaves room for longer certificate chains and more
+// data in flight over WiFi
+constexpr size_t EXTRA_SENSOR_FETCH = 16384;
 
 // Loop task: enter / leave a session. false: refused or aborted, error says
 // why. Sessions are numbered (generation, never 0): leave() and expired()
@@ -115,11 +123,12 @@ private:
     String outcome = "ok";
 };
 
-// Any task: why enter() would be refused right now, empty if it would
+// Any task: why enter() would be refused right now, nullptr if it would
 // start (the memory check is not part of it: it runs in enter(), after
 // MQTT and the radio stopped and possibly interfaces went off). Lets a web
-// handler answer at once instead of queueing work that will be refused
-String wouldRefuse();
+// handler answer at once instead of queueing work that will be refused.
+// A constant text: nothing is allocated, so the answer cannot fail open
+const char *wouldRefuse(Reason reason = Reason::None);
 
 // Any task: a session is active (from the start of enter() to the end of leave())
 bool active();
