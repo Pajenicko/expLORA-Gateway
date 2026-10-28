@@ -327,6 +327,7 @@ bool ConfigManager::loadFromPreferences()
 
     adminPasswordHash = preferences.getString("adminPwd", "");
     signedOnly = preferences.getBool("signedOnly", false);
+    autoUpdate = preferences.getUInt("autoUpd", 0);
 
     ethStatic = preferences.getBool("ethStatic", false);
     ethIp = preferences.getString("ethIp", "");
@@ -378,6 +379,7 @@ bool ConfigManager::saveToPreferences()
     preferences.putBool("wifiEnabled", wifiEnabled);
 #endif
     preferences.putBool("signedOnly", signedOnly);
+    preferences.putUInt("autoUpd", autoUpdate);
     preferences.putBool("lteEnabled", lteEnabled);
     preferences.putString("lteApn", lteApn);
     preferences.putString("ltePin", ltePin);
@@ -427,6 +429,21 @@ bool ConfigManager::setSignedOnly(bool on)
         return false;
     }
     signedOnly = on;
+    return true;
+}
+
+bool ConfigManager::setAutoUpdate(uint32_t packed)
+{
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
+    // One Preferences key, read back (as signedOnly)
+    if (!preferencesInitialized || preferences.putUInt("autoUpd", packed) == 0 ||
+        preferences.getUInt("autoUpd", ~packed) != packed)
+    {
+        logger.error("Automatic updates: the setting could not be saved");
+        return false;
+    }
+    autoUpdate = packed;
     return true;
 }
 
@@ -719,6 +736,7 @@ void ConfigManager::resetToDefaults()
     mqttHAEnabled = HA_DISCOVERY_DEFAULT_ENABLED;
     wifiEnabled = WIFI_DEFAULT_ENABLED;
     signedOnly = false;
+    autoUpdate = 0;
     lteEnabled = LTE_DEFAULT_ENABLED;
     lteApn = LTE_DEFAULT_APN;
     ltePin = "";

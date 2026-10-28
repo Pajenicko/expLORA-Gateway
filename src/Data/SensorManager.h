@@ -31,6 +31,8 @@
 #include "../Protocol/WaitingList.h"
 #include "../Hardware/RadioTask.h"
 #include "../Protocol/OtaJob.h"
+#include "ForwardUrl.h"
+#include "../Update/AutoUpdatePolicy.h"
 #include "Logging.h"
 
 /**
@@ -188,6 +190,11 @@ public:
     // A generation 2 sensor with new readings for MQTT (loop task); discover:
     // its reported quantities grew. false: none left
     bool takeGen2Mqtt(uint32_t &devId, bool &discover);
+    // Forward to URL of one generation 2 sensor whose last UP carried
+    // readings (loop task, blocking like generation 1; dropped during an
+    // update-mode session, while a sensor OTA job starts or runs, offline
+    // or within 5 minutes of a failed forward). false: none was due
+    bool forwardGen2();
 
     // Get list of active sensors (configured) with real index
     std::vector<ActiveSensorEntry> getActiveSensorEntries() const;
@@ -206,7 +213,8 @@ public:
 
     // Generation 2 sensors. add: index, -1 full, -2 DevID exists, -3 save failed,
     // -4 no memory for its slot
-    int addGen2Sensor(uint32_t devId, const uint8_t label[ep::kLabelKeyLen], const String &name);
+    int addGen2Sensor(uint32_t devId, const uint8_t label[ep::kLabelKeyLen], const String &name,
+                      const String &customUrl = String());
     bool deleteGen2Sensor(uint32_t devId);
     bool isKnownGen2(uint32_t devId) const;
     std::vector<Gen2Sensor> getGen2Sensors() const; // copies without key material except the label
@@ -220,14 +228,14 @@ public:
     // New desired configuration (clamped; version raised when it changed).
     // 1 changed and saved, 0 unchanged, -1 unknown DevID, -2 save failed
     int setGen2Config(uint32_t devId, const Gen2Config::Values &values);
-    // Name, corrections (applied from the next uplink) and desired
-    // configuration (clamped, version raised when it changed); nullptr
-    // keeps that part. One sensors.json write: the GEN2_EDIT_* bits of what
-    // changed (0 nothing), -1 unknown DevID, -2 save failed (nothing
+    // Name, forward URL, corrections (applied from the next uplink) and
+    // desired configuration (clamped, version raised when it changed);
+    // nullptr keeps that part. One sensors.json write: the GEN2_EDIT_* bits
+    // of what changed (0 nothing), -1 unknown DevID, -2 save failed (nothing
     // changed, the old values are kept)
-    static constexpr int GEN2_EDIT_NAME = 1, GEN2_EDIT_CAL = 2, GEN2_EDIT_CONFIG = 4;
+    static constexpr int GEN2_EDIT_NAME = 1, GEN2_EDIT_CAL = 2, GEN2_EDIT_CONFIG = 4, GEN2_EDIT_URL = 8;
     int setGen2Edit(uint32_t devId, const String *name, const SensorCalibration::Set *cal,
-                    const Gen2Config::Values *config);
+                    const Gen2Config::Values *config, const String *customUrl = nullptr);
     // Ask for a status report with the next DOWN
     bool requestGen2Status(uint32_t devId);
     // Forget the stored devNonce (sensor lost its configuration store, spec 12a)
@@ -275,6 +283,17 @@ public:
     // (Update/UpdateMode.h: the radio is paused only for a Paused or
     // terminal job)
     OtaJob::State otaJobState(bool &startPending, OtaJob::WaitView *wait = nullptr) const;
+    // The job's state, its sensor and image version (0 without a job), and
+    // a queued start (its sensor), why it is in its state - without copying
+    // the job
+    OtaJob::State otaJobBrief(uint32_t &devId, uint32_t &fw, bool &startPending, uint32_t &startDevId,
+                              OtaJob::Why *why = nullptr) const;
+    // Automatic updates (S6): what the sensor choice needs per gen 2 sensor
+    size_t otaAutoSensors(AutoUpdatePolicy::SensorInfo *out, size_t max) const;
+    // An automatic job for devId with image fw failed (Failed / Aborted by
+    // the gateway):
+    // counted for the sensor (sensors.json "autoFail")
+    void otaAutoFailure(uint32_t devId, uint32_t fw);
     // A non-terminal job uses an image of this HW type (no upload / delete then)
     bool otaImageBusy(uint16_t hwType) const;
     // An image was replaced or deleted: a terminal job of this HW type goes
@@ -282,8 +301,11 @@ public:
     // /diag/heap "ota" object (JSON text)
     String otaDiagJson() const;
 
-    // Forward sensor data to HTTP (blocking - never call with the lock held)
+    // Forward sensor data to HTTP (blocking - never call with the lock held;
+    // loop task only: fwdBackoff)
     bool forwardSensorData(const SensorData &sensor);
+    // Sensors whose last forward failed (skipped for ForwardUrl::BACKOFF_MS)
+    ForwardUrl::Backoff<MAX_SENSORS + MAX_GEN2_SENSORS> fwdBackoff;
 
 
     // -----------------------------------------------------------------------

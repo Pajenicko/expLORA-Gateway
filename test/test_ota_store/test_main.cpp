@@ -209,7 +209,7 @@ static void test_meta_later_firmware_fields(void)
                         "\"uploaded\":1761200000,\"signed\":0,\"unknownKey\":3721796218,"
                         "\"note\":\"signed with an unknown key ddd71e7a\",\"sha256\":\"";
     later += std::string(64, 'a');
-    later += "\",\"source\":{\"url\":\"https://pajenicko.cz/webflash/explora/v1/sensor/hw0003-0.2.12.bin\","
+    later += "\",\"source\":{\"url\":\"https://pajenicko.cz/webflash/explora/v2/sensor/hw0003-0.2.12.bin\","
              "\"seq\":12345,\"channel\":\"stable\"},\"history\":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16],"
              "\"autoUpdate\":true,\"extra1\":\"";
     later += std::string(200, 'x');

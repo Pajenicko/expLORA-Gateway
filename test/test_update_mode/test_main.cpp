@@ -361,7 +361,7 @@ static void test_url_for_log(void)
     {
         const char *in, *want;
     } cases[] = {
-        {"https://pajenicko.cz/webflash/explora/v1/fw.bin", "https://pajenicko.cz/webflash/explora/v1/fw.bin"},
+        {"https://pajenicko.cz/webflash/explora/v2/fw.bin", "https://pajenicko.cz/webflash/explora/v2/fw.bin"},
         {"https://user:pw@files.example:8443/a.bin?token=abc#f", "https://files.example:8443/a.bin"},
         {"https://files.example/a@b.bin?q=@x", "https://files.example/a@b.bin"},
         {"https://a.example?x@b.example/fw", "https://b.example/fw"},

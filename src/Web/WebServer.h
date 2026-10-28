@@ -34,6 +34,8 @@
 #include "WebAuth.h"
 #include "../Update/GatewayOta.h"
 #include "../Update/Manifest.h"
+#include "../Update/AutoUpdatePolicy.h"
+#include "../Update/UpdateMode.h"
 #include <memory>
 
 /**
@@ -106,6 +108,17 @@ private:
     volatile bool urlOtaRunning = false; // loop task is downloading firmware
     std::mutex otaUrlMutex;
     void runUrlOta(const String &url, uint64_t session, const Manifest::Expect &expect);
+    // The work of the three download kinds inside an update-mode session
+    // (manual: one session each; scheduled: one session for the night)
+    // Automatic install (runScheduled): gate is called right before the
+    // activation (false = refused, Busy), end tells how it ended otherwise
+    bool installIn(UpdateMode::Session &session, const String &url, uint64_t requester,
+                   const Manifest::Expect &expect, String &result, bool (*gate)(uint32_t) = nullptr,
+                   AutoUpdatePolicy::GwEnd *end = nullptr);
+    bool checkIn(UpdateMode::Session &session, String &result);
+    // refused (optional): the image was not stored or the file is not there (HTTP 404 / 410) - not a transport failure
+    bool fetchIn(UpdateMode::Session &session, const String &url, const Manifest::Expect &expect, String &result,
+                 bool *refused = nullptr);
 
     // Update check (Update/UpdateCheck.h), done by the loop task; the page
     // polls GET /firmware/check
@@ -198,6 +211,7 @@ private:
     void handleCheckStart(AsyncWebServerRequest *request);
     void handleCheckStatus(AsyncWebServerRequest *request);
     void handleFirmwareInstall(AsyncWebServerRequest *request);
+    void handleAutoUpdatePost(AsyncWebServerRequest *request);
     bool queueFirmwareDownload(AsyncWebServerRequest *request, const String &url, const Manifest::Expect &expect);
     void handleFirmwareUpdate(AsyncWebServerRequest *request);
     void handleReboot(AsyncWebServerRequest *request);
@@ -251,4 +265,11 @@ public:
 
     // Forgotten admin password: cleared from the serial console
     void resetAdminPassword() { auth.resetPassword(); }
+
+    // Automatic updates (Update/AutoUpdate.h), loop task: what runs now
+    // (manual actions always win), and the nightly run - one update-mode
+    // session: the check, then a newer signed gateway firmware (it restarts
+    // the gateway) or the newer signed sensor images
+    AutoUpdatePolicy::Activity autoActivity();
+    AutoUpdatePolicy::Outcome runScheduled(const AutoUpdatePolicy::Settings &s, String &result);
 };

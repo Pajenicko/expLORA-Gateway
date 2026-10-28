@@ -32,6 +32,7 @@
 #include "../Protocol/OtaJob.h"
 #include "../Update/GatewayOta.h"
 #include "../Update/Manifest.h"
+#include "../Update/AutoUpdate.h"
 
 // The update check on the Firmware page (Update/UpdateCheck.h): the
 // accepted manifest of this run, copied under its lock (the last result,
@@ -187,7 +188,8 @@ public:
     // Generation 2 detail page in Advanced mode, reserved in one piece:
     // measured up to 9.5 kB (a finished job, two images, the last download
     // and the download form); four images add ~0.65 kB, longer job,
-    // message and download texts some more; rounded up
+    // message and download texts some more, the forward URL field (S7)
+    // ~0.4 kB plus up to ~1 kB for a URL full of HTML escapes; rounded up
     static constexpr size_t GEN2_ADV_PAGE_SIZE = 11776;
     // Generation 1 add / edit form: measured 3.57 kB (a METEO in Advanced
     // with a 230-character forward URL); a 200-character URL full of HTML
@@ -201,7 +203,7 @@ public:
     static String generateSensorsPagePart(const SensorsPageView &view, size_t part);
 
     // Add a generation 2 sensor (DevID + label key)
-    static String generateGen2AddPage(const String &devId, const String &error);
+    static String generateGen2AddPage(const String &devId, const String &error, const String &url = String());
 
     // Generation 2 sensor detail: status, configuration form, status request,
     // downlink counters, devNonce reset
@@ -232,7 +234,7 @@ public:
 
     // Generate firmware update page
     static String generateFirmwarePage(const String &updateStatus, bool signedOnly, const GatewayOta::View &gw,
-                                       const UpdateCheckView &check);
+                                       const UpdateCheckView &check, const AutoUpdate::View &au);
     // Small page after an action (saved, restarting): text is HTML; reloads
     // after refreshS (to url when given)
     static String generateNoticePage(const char *title, const String &text, uint8_t refreshS, const char *url);

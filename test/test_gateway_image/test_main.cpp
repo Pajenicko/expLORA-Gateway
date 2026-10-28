@@ -512,12 +512,44 @@ static void test_update_state_json(void)
     m.seq = 0xFFFFFFFFu;
     memset(m.checkText, '"', sizeof(m.checkText) - 1);
     m.checkAt = 0xFFFFFFFFu;
+    // S6 "auto"
+    m.au.day = -2147483647 - 1;
+    m.au.cursor = m.au.gwVer = m.au.job = m.au.jobFw = m.au.runAt = 0xFFFFFFFFu;
+    m.au.gwFails = 255;
+    memset(m.au.runText, '"', sizeof(m.au.runText) - 1);
+    // S6 fix round: the optional "auto" members, every one at its widest
+    m.au.gwDay = m.au.tryDay = -2147483647 - 1;
+    m.au.gwAct = true;
+    m.au.pendGw = m.au.retryAt = 0xFFFFFFFFu;
+    m.au.tryStep = 255;
+    // S7: download marker and grace day
+    m.au.gwDl = 0xFFFFFFFFu;
+    m.au.gwDlDay = m.au.graceDay = -2147483647 - 1;
+    for (UpdateState::FetchStrike &f : m.au.sf)
+    {
+        f.hw = 0xFFFF;
+        f.ver = 0xFFFFFFFFu;
+        f.n = 255;
+        f.day = -2147483647 - 1;
+    }
     n = UpdateState::format(m, buf, sizeof(buf));
+    printf("state.json worst case: %u B\n", (unsigned)n);
     TEST_ASSERT_TRUE(n > 0 && n < UpdateState::TEXT_CAPACITY);
     TEST_ASSERT_TRUE(UpdateState::parse(buf, n, r));
     TEST_ASSERT_EQUAL_STRING(m.lastText, r.lastText);
     TEST_ASSERT_EQUAL_STRING(m.checkText, r.checkText);
     TEST_ASSERT_EQUAL_UINT32(0xFFFFFFFFu, r.seq);
+    TEST_ASSERT_EQUAL_STRING(m.au.runText, r.au.runText);
+    TEST_ASSERT_EQUAL_INT32(m.au.day, r.au.day);
+    TEST_ASSERT_EQUAL_UINT32(0xFFFFFFFFu, r.au.jobFw);
+    TEST_ASSERT_EQUAL(255, r.au.gwFails);
+    TEST_ASSERT_TRUE(r.au.gwAct);
+    TEST_ASSERT_EQUAL_INT32(m.au.tryDay, r.au.tryDay);
+    TEST_ASSERT_EQUAL(255, r.au.tryStep);
+    TEST_ASSERT_EQUAL_UINT32(0xFFFFFFFFu, r.au.retryAt);
+    TEST_ASSERT_EQUAL_UINT32(0xFFFFFFFFu, r.au.pendGw);
+    TEST_ASSERT_EQUAL_UINT16(0xFFFF, r.au.sf[7].hw);
+    TEST_ASSERT_EQUAL_INT32(m.au.sf[7].day, r.au.sf[7].day);
     // Unknown fields (a later stage's) are read past; this firmware drops them
     // when it writes the file (UpdateState.h: the contract)
     const char *later = "{\"v\":1,\"seq\":7,\"pending\":{\"ver\":\"2.1.0\",\"part\":\"app1\",\"x\":1},\"auto\":{\"y\":2}}";

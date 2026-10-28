@@ -2,7 +2,7 @@
  * expLORA Gateway
  *
  * Manifest - the signed package manifest (M4c S5): one file
- * https://pajenicko.cz/webflash/explora/v1/packages.json that names the
+ * https://pajenicko.cz/webflash/explora/v2/packages.json that names the
  * current gateway firmware per board and the current sensor image per HW
  * type. Pure C++ (ArduinoJson + SigVerify) for the native tests
  * (test/test_manifest).

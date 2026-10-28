@@ -45,6 +45,7 @@ struct Gen2Sensor
     bool configured = false;
     uint32_t devId = 0;
     String name;
+    String customUrl; // "Forward to URL" with placeholders (Data/ForwardUrl.h), empty = off
     uint8_t label[ep::kLabelKeyLen] = {};
     bool hasDevNonce = false;
     uint32_t lastDevNonce = 0; // last devNonce accepted for a join
@@ -61,6 +62,10 @@ struct Gen2Sensor
     bool hasReverted = false;
     uint32_t revertedFw = 0;
     uint32_t revertedCrc = 0;
+    // Automatic updates (S6): failed automatic jobs of image version
+    // autoFailFw (two stop them for that version; persisted)
+    uint32_t autoFailFw = 0;
+    uint8_t autoFails = 0;
     // Leftovers of this sensor's finished OTA job, kept here so that a job for
     // another sensor does not drop them (persisted): the revert watch (3 x
     // T_confirm, image version + CRC) and a pending abort
@@ -119,6 +124,12 @@ struct Gen2Sensor
     // reported quantities grew, a new firmware / HW type from a JOIN);
     // taken by SensorManager::takeGen2Mqtt
     bool mqttDue = false, mqttDiscover = false;
+    // Forward to URL (RAM): an UP with a valid reading to send, fwdMask the
+    // quantities it carried with a valid value (ForwardUrl::gen2Due /
+    // gen2Valid); taken by SensorManager::forwardGen2 (loop task, after the
+    // response)
+    bool fwdDue = false;
+    uint16_t fwdMask = 0;
     int8_t downlinkRssi = INT8_MIN;  // dBm of the last downlink the sensor received
     // Link history (spec 4.3): last 20 UPs - RSSI/SNR, reported downlink RSSI/SNR, TX power, losses
     Gen2Link::History link;

@@ -131,6 +131,9 @@ public:
 
     // Add log with specified level
     static void log(LogLevel level, const String &message);
+    // printf-style (at most 159 characters; a few String temporaries less
+    // in the code than a concatenated message)
+    static void logf(LogLevel level, const char *format, ...) __attribute__((format(printf, 2, 3)));
 
     // Helper methods for different log levels
     static void error(const String &message);

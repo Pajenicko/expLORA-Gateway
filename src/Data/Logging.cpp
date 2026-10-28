@@ -20,6 +20,7 @@
  */
 
 #include "Logging.h"
+#include <cstdarg>
 #include <time.h>
 #include <esp_heap_caps.h>
 #include <Arduino.h>
@@ -151,6 +152,20 @@ void Logger::log(LogLevel level, const String &message)
     {
         ring.push((uint8_t)level, t, message.c_str(), message.length());
     }
+}
+
+void Logger::logf(LogLevel level, const char *format, ...)
+{
+    if (!initialized || level > currentLevel)
+    {
+        return;
+    }
+    char text[160];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(text, sizeof(text), format, args);
+    va_end(args);
+    log(level, String(text));
 }
 
 // Helper methods for different log levels

@@ -30,7 +30,8 @@ namespace WebAssets
 {
 // Colours as variables (light and dark scheme); .ok/.w/.e state colours,
 // .m muted, .b button link, .b2 secondary, .x destructive, .g field grid,
-// .kv key-value table, .hm hidden on phones, form.i inline form
+// .kv key-value table, .hm hidden on phones, form.i inline form; the nav
+// wraps its entries onto more lines when the width runs out (down to 320 px)
 inline constexpr char CSS[] =
     ":root{--bg:#f4f5f7;--fg:#1d2329;--m:#69727d;--c:#fff;--l:#dde1e6;--a:#0b6bcb;--ok:#1e8e3e;--w:#b26a00;"
     "--e:#c5221f}\n"
@@ -41,7 +42,8 @@ inline constexpr char CSS[] =
     "header{display:flex;flex-wrap:wrap;align-items:baseline;gap:.2rem 1rem;padding:.6rem 1rem;"
     "background:var(--c);border-bottom:1px solid var(--l)}\n"
     "header b{margin-right:auto}\n"
-    "nav a{color:var(--m);text-decoration:none;margin-right:.7rem;white-space:nowrap}\n"
+    "nav{display:flex;flex-wrap:wrap;gap:.2rem .7rem}\n"
+    "nav a{color:var(--m);text-decoration:none;white-space:nowrap}\n"
     "nav a.on{color:var(--a);font-weight:600}\n"
     "a{color:var(--a)}\n"
     "main{max-width:52rem;margin:auto;padding:1rem}\n"

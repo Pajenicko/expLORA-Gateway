@@ -11,8 +11,8 @@ field that is absent. This script posts exactly what a browser posts in
 those states and reads the stored values back from the Advanced pages.
 
 Restores everything it changes (MQTT settings, sensor values, LTE APN, the
-interface mode). The network part restarts the gateway several times (each
-"Save and restart"); --no-network skips it.
+interface mode, the automatic updates card). The network part restarts the
+gateway several times (each "Save and restart"); --no-network skips it.
 
     python3 tests/integration/test_ui_keep.py --url http://192.168.1.42 \\
         --admin-password ... [--no-network]
@@ -237,6 +237,7 @@ def test_sensors(gw):
     dev = ids[0]
     page = gw.get(f"/sensors/gen2?devId={dev}")
     name, interval = value(page, "name"), value(page, "interval")
+    url = value(page, "customUrl") or ""
     corr = [f for f in re.findall(r"name=(\w+Corr|altitude) ", page)]
     before = {f: value(page, f) for f in corr}
     try:
@@ -256,20 +257,32 @@ def test_sensors(gw):
             page = gw.get(f"/sensors/gen2?devId={dev}")
             check(r.status_code == 400 and value(page, "tempCorr") == "-0.3" and value(page, "name") == name + "-k",
                   "gen 2 correction '1x' refused with 400, nothing changed")
+        # Forward to URL (2.0.0): saved, kept when not posted, invalid refused
+        test_url = "http://192.0.2.1/x?t=*TEMP*&h=*HUM*"
+        gw.post("/sensors/gen2/edit", dict(data, customUrl=test_url))
+        page = gw.get(f"/sensors/gen2?devId={dev}")
+        check(value(page, "customUrl") == test_url, "gen 2 forward URL saved")
+        gw.post("/sensors/gen2/edit", data)
+        page = gw.get(f"/sensors/gen2?devId={dev}")
+        check(value(page, "customUrl") == test_url, "gen 2 forward URL kept when not posted")
+        r = gw.post("/sensors/gen2/edit", dict(data, customUrl="ftp://x"), ok=(400,))
+        page = gw.get(f"/sensors/gen2?devId={dev}")
+        check(r.status_code == 400 and value(page, "customUrl") == test_url, "gen 2 forward URL ftp:// refused with 400")
         # Simple: name + interval + corrections
         gw.mode("simple")
         simple = gw.get(f"/sensors/gen2?devId={dev}")
         check("devNonce" not in simple and "Request status" not in simple, "gen 2 Simple page without radio internals")
-        data = {"devId": dev, "name": name, "interval": value(simple, "interval")}
+        check(value(simple, "customUrl") == test_url, "gen 2 Simple page shows the forward URL")
+        data = {"devId": dev, "name": name, "interval": value(simple, "interval"), "customUrl": url}
         for f in re.findall(r"name=(\w+Corr|altitude) ", simple):
             data[f] = before.get(f, value(simple, f))
         gw.post("/sensors/gen2/edit", data)
         gw.mode("advanced")
         page = gw.get(f"/sensors/gen2?devId={dev}")
-        check(value(page, "name") == name and all(value(page, f) == before[f] for f in corr),
-              "gen 2 name and corrections restored")
+        check(value(page, "name") == name and all(value(page, f) == before[f] for f in corr) and
+              (value(page, "customUrl") or "") == url, "gen 2 name, forward URL and corrections restored")
     finally:
-        data = {"devId": dev, "name": name}
+        data = {"devId": dev, "name": name, "customUrl": url}
         for f in corr:
             data[f] = before[f]
         gw.post("/sensors/gen2/edit", data)
@@ -289,6 +302,38 @@ def test_misc(gw):
         check(len(one) == 1 and one[0]["serialNumber"] == ids[0], "/api?sensor=<DevID>: exactly that sensor")
         none = requests.get(gw.base + f"/api?format=json&sensor={ids[0]}&gen=1", timeout=10).json()["sensors"]
         check(none == [], "/api?sensor=<DevID>&gen=1: no row")
+
+
+# ------------------------------------------------------- automatic updates
+
+def auto_read(gw):
+    p = gw.get("/firmware")
+    return checked(p, "gw"), checked(p, "sn"), value(p, "ws"), value(p, "we")
+
+
+def test_auto(gw):
+    print("Automatic updates card (Firmware page)")
+    start = auto_read(gw)
+    try:
+        gw.post("/firmware/auto", {"f": "1", "gw": "1", "ws": "23", "we": "1"})
+        check(auto_read(gw) == (True, False, "23", "1"), "switches + window across midnight saved")
+        # Only the switches (no window fields): the window is kept
+        gw.post("/firmware/auto", {"f": "1", "sn": "1"})
+        check(auto_read(gw) == (False, True, "23", "1"), "window kept when not posted")
+        # Only the window (no f): the switches are kept
+        gw.post("/firmware/auto", {"ws": "3", "we": "6"})
+        check(auto_read(gw) == (False, True, "3", "6"), "switches kept without f")
+        for bad in ({"ws": "4", "we": "4"}, {"ws": "24"}, {"we": "x"}, {"ws": "-1"}, {"ws": "007"}):
+            r = gw.post("/firmware/auto", bad, ok=(400,))
+            check(r.status_code == 400 and auto_read(gw) == (False, True, "3", "6"), f"refused {bad}, nothing changed")
+    finally:
+        d = {"f": "1", "ws": start[2] or "2", "we": start[3] or "5"}
+        if start[0]:
+            d["gw"] = "1"
+        if start[1]:
+            d["sn"] = "1"
+        gw.post("/firmware/auto", d)
+        check(auto_read(gw) == start, f"automatic updates restored {start}")
 
 
 # --------------------------------------------------------------- network
@@ -367,6 +412,7 @@ def main():
             test_mqtt(gw)
             test_sensors(gw)
             test_misc(gw)
+            test_auto(gw)
             if not a.no_network:
                 test_network(gw, pro)
         finally:

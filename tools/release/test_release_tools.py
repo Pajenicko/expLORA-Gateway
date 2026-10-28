@@ -20,7 +20,7 @@ import explora_sigblock as sb  # noqa: E402
 SIGN = os.path.join(HERE, "explora_sign.py")
 KEYGEN = os.path.join(HERE, "explora_keygen.py")
 MANIFEST = os.path.join(HERE, "explora_manifest.py")
-BASE = "https://example.com/explora/v1"
+BASE = "https://example.com/explora/v2"
 
 
 def gateway_image(desc_version=b"2.1.3", marker=None, chip=0, size=1024):

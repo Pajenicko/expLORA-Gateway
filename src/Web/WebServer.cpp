@@ -47,6 +47,8 @@
 #include "../Protocol/OtaImageSigned.h"
 #include "../Update/SensorFetch.h"
 #include "../Update/UpdateCheck.h"
+#include "../Update/AutoUpdate.h"
+#include "../Data/ForwardUrl.h"
 #include <sys/time.h>
 #include <atomic>
 
@@ -308,6 +310,7 @@ void WebPortal::setupRoutes()
     route("/firmware/check", HTTP_GET, &WebPortal::handleCheckStatus);
     route("/firmware/check", HTTP_POST, &WebPortal::handleCheckStart);
     route("/firmware/install", HTTP_POST, &WebPortal::handleFirmwareInstall);
+    route("/firmware/auto", HTTP_POST, &WebPortal::handleAutoUpdatePost);
     route("/firmware/update", HTTP_POST, &WebPortal::handleFirmwareUpdate);
     route("/firmware", HTTP_GET, &WebPortal::handleFirmwarePage);
     route("/firmware/signed", HTTP_POST, &WebPortal::handleSignedOnlyPost);
@@ -835,14 +838,16 @@ static size_t stringPagePeak(size_t pageSize)
 // and 4.95 kB (Advanced) on the Pro, 6.5 kB in Advanced with a manifest of
 // 8 sensor packages and the update-mode card; ~0.6 kB more with the card of
 // an image waiting for its confirmation and texts / versions at their
-// longest - 8 kB leaves ~0.9 kB beyond that
-static constexpr size_t FIRMWARE_PAGE_SIZE = 8192;
+// longest; the automatic updates card (S6) up to ~1.3 kB with every state
+// text - 9 kB leaves ~0.6 kB beyond that
+static constexpr size_t FIRMWARE_PAGE_SIZE = 9216;
 
 // Generation 2 detail: Advanced see HTMLGenerator::GEN2_ADV_PAGE_SIZE;
-// Simple measured 1.9 kB
+// Simple measured 1.9 kB, + the forward URL field (S7: ~0.4 kB, a
+// 200-character URL full of HTML escapes up to ~1 kB more)
 static size_t gen2PageSize()
 {
-    return HTMLGenerator::adv() ? HTMLGenerator::GEN2_ADV_PAGE_SIZE : 3072;
+    return HTMLGenerator::adv() ? HTMLGenerator::GEN2_ADV_PAGE_SIZE : 4096;
 }
 
 // Page streamed piece by piece (chunked): only the piece being sent is in
@@ -1225,6 +1230,9 @@ static bool parseHexField(const String &text, uint8_t maxDigits, uint32_t &out)
     return out != 0;
 }
 
+// The "Forward to URL" field of both generations (ForwardUrl::valid)
+static const char FORWARD_URL_ERROR[] = "Custom URL must start with http:// or https:// (max 200 characters)";
+
 // Parse and validate the sensor form; returns an error message, empty if valid
 // keepKey: an empty key field keeps form.deviceKey (edit form)
 // Parse and validate the sensor form into form (filled with the stored
@@ -1266,10 +1274,9 @@ static String parseSensorForm(AsyncWebServerRequest *request, SensorForm &form, 
     if (has("customUrl"))
     {
         form.customUrl = text("customUrl");
-        if (form.customUrl.length() > 200 || (form.customUrl.length() > 0 && !form.customUrl.startsWith("http://") &&
-                                              !form.customUrl.startsWith("https://")))
+        if (!ForwardUrl::valid(form.customUrl.c_str(), form.customUrl.length()))
         {
-            return "Custom URL must start with http:// or https:// (max 200 characters)";
+            return FORWARD_URL_ERROR;
         }
     }
     return parseCorrections(request, form.cal);
@@ -1475,12 +1482,17 @@ void WebPortal::handleGen2AddPost(AsyncWebServerRequest *request)
     String name = param("name");
     String devIdText = param("devId");
     String keyText = param("key");
+    const String url = param("customUrl");
     uint32_t devId = 0;
     uint8_t label[ep::kLabelKeyLen];
     String error;
     if (name.length() == 0 || name.length() > 32)
     {
         error = "Name must have 1 to 32 characters";
+    }
+    else if (!ForwardUrl::valid(url.c_str(), url.length()))
+    {
+        error = FORWARD_URL_ERROR;
     }
     else if (!ep::parseDevId(devIdText.c_str(), devId))
     {
@@ -1492,10 +1504,13 @@ void WebPortal::handleGen2AddPost(AsyncWebServerRequest *request)
     }
     if (error.length() > 0)
     {
-        sendNoStore(request, 400, "text/html", HTMLGenerator::generateGen2AddPage(devIdText.substring(0, 8), error));
+        // The typed DevID and URL are kept (both bounded like the fields)
+        sendNoStore(request, 400, "text/html",
+                    HTMLGenerator::generateGen2AddPage(devIdText.substring(0, 8), error,
+                                                       url.substring(0, ForwardUrl::MAX_LEN)));
         return;
     }
-    int index = sensorManager.addGen2Sensor(devId, label, name);
+    int index = sensorManager.addGen2Sensor(devId, label, name, url);
     ep::wipe(label, sizeof(label));
     keyText = String();
     if (index == -2)
@@ -1709,7 +1724,7 @@ void WebPortal::handleGen2Edit(AsyncWebServerRequest *request)
         return;
     }
     Gen2Config::Values v;
-    String name;
+    String name, url;
     SensorCalibration::Set cal;
     {
         // Heap copy: Gen2Sensor is too big for the AsyncTCP stack
@@ -1721,6 +1736,7 @@ void WebPortal::handleGen2Edit(AsyncWebServerRequest *request)
         }
         v = current->config;
         name = current->name;
+        url = current->customUrl;
         cal = current->cal;
         current->wipeKeys();
     }
@@ -1737,6 +1753,16 @@ void WebPortal::handleGen2Edit(AsyncWebServerRequest *request)
         if (name.length() == 0 || name.length() > 32)
         {
             sendGen2Detail(request, devId, "Not saved: the name must have 1 to 32 characters", 400);
+            return;
+        }
+    }
+    if (request->hasParam("customUrl", true))
+    {
+        url = request->getParam("customUrl", true)->value();
+        url.trim();
+        if (!ForwardUrl::valid(url.c_str(), url.length()))
+        {
+            sendGen2Detail(request, devId, String("Not saved: ") + FORWARD_URL_ERROR, 400);
             return;
         }
     }
@@ -1757,7 +1783,7 @@ void WebPortal::handleGen2Edit(AsyncWebServerRequest *request)
         v.intervalS = (uint16_t)value;
         Gen2Config::clamp(v); // a slot offset beyond a shorter interval wraps into it
     }
-    const int changed = sensorManager.setGen2Edit(devId, &name, &cal, intervalChanged ? &v : nullptr);
+    const int changed = sensorManager.setGen2Edit(devId, &name, &cal, intervalChanged ? &v : nullptr, &url);
     if (changed == -1) // deleted since the page was loaded
     {
         request->send(404, "text/plain", "Unknown generation 2 sensor");
@@ -2571,7 +2597,7 @@ void WebPortal::handleDiagHeap(AsyncWebServerRequest *request)
     // Gateway firmware: how the running image was installed, validation
     // (rollback) and an image waiting for a confirmation
     res->print(",\"update\":");
-    GatewayOta::printDiagJson(*res);
+    GatewayOta::printDiagJson(*res, AutoUpdate::printDiagJson);
     // Sensor image download (POST /ota/fetch): state, bytes, last result
     res->print(",\"sensorFetch\":");
     {
@@ -2592,6 +2618,10 @@ void WebPortal::handleDiagHeap(AsyncWebServerRequest *request)
     extern TaskHandle_t loopTaskHandle;
     res->print("\"loopStackFree\":");
     res->print((unsigned long)(loopTaskHandle ? uxTaskGetStackHighWaterMark(loopTaskHandle) : 0));
+    // ... of the web server task (async_tcp, this one): its high-water mark
+    // over all pages served so far
+    res->print(",\"webStackFree\":");
+    res->print((unsigned long)uxTaskGetStackHighWaterMark(nullptr));
     res->print(",");
     // Radio task: queue, latency to loop(), stack, flash write permit
     RadioTask::Stats rs = RadioTask::stats();
@@ -3101,27 +3131,36 @@ void WebPortal::runUpdateCheck()
         else
         {
             WatchdogPause pause;
-            std::unique_ptr<char[]> buf(new (std::nothrow) char[Manifest::MAX_FILE]);
-            String error;
-            RamSink sink(buf.get());
-            if (!buf)
-            {
-                UpdateCheck::failed(result = "failed: no memory for the manifest");
-            }
-            else if (!httpsDownload(UPDATE_MANIFEST_URL, session, Manifest::MIN_FILE, Manifest::MAX_FILE, sink, error,
-                                    &Manifest::budgetMs))
-            {
-                UpdateCheck::failed(result = "failed: " + error);
-            }
-            else
-            {
-                UpdateCheck::evaluate(buf.get(), sink.len, result); // logged and recorded there
-            }
-            session.setResult("update check " + result);
+            checkIn(session, result);
         }
     }
     std::lock_guard<std::mutex> lock(otaUrlMutex);
     updateCheckRunning = false;
+}
+
+// The check inside a session (manual or scheduled): true = a manifest was
+// accepted; result as recorded (logged there)
+bool WebPortal::checkIn(UpdateMode::Session &session, String &result)
+{
+    std::unique_ptr<char[]> buf(new (std::nothrow) char[Manifest::MAX_FILE]);
+    String error;
+    RamSink sink(buf.get());
+    bool ok = false;
+    if (!buf)
+    {
+        UpdateCheck::failed(result = "failed: no memory for the manifest");
+    }
+    else if (!httpsDownload(UPDATE_MANIFEST_URL, session, Manifest::MIN_FILE, Manifest::MAX_FILE, sink, error,
+                            &Manifest::budgetMs))
+    {
+        UpdateCheck::failed(result = "failed: " + error);
+    }
+    else
+    {
+        ok = UpdateCheck::evaluate(buf.get(), sink.len, result); // logged and recorded there
+    }
+    session.setResult("update check " + result);
+    return ok;
 }
 
 // Handle firmware update request: validated here, downloaded by the loop
@@ -3244,6 +3283,10 @@ bool WebPortal::queueFirmwareDownload(AsyncWebServerRequest *request, const Stri
 // bounded (DeadlineClient). Blocks the loop for the download
 constexpr uint32_t GATEWAY_HEADER_MS = 120000;
 constexpr uint32_t GATEWAY_BODY_MS = 900000;
+// The HTTP status of the last httpsDownload() (loop task; 0 = no answer):
+// 404 / 410 refuse the file for the automatic updates (AutoUpdatePolicy::refusedHttp)
+static int dlHttpCode = 0;
+
 static bool httpsDownload(const String &url, UpdateMode::Session &session, uint32_t minLen, uint32_t maxLen,
                           DownloadSink &sink, String &error, uint32_t (*budgetMs)(uint32_t))
 {
@@ -3259,6 +3302,7 @@ static bool httpsDownload(const String &url, UpdateMode::Session &session, uint3
     }
     http.addHeader("User-Agent", "expLORA-Gateway/" + String(FIRMWARE_VERSION));
     const int httpCode = http.GET();
+    dlHttpCode = httpCode;
     if (httpCode != HTTP_CODE_OK)
     {
         const bool late = client.late();
@@ -3385,13 +3429,15 @@ struct FirmwareSink : DownloadSink
     Sha256 *whole; // an install from the manifest: SHA-256 of every byte (else nullptr)
     uint32_t total = 0; // the Content-Length
     int lastPct = -1;
+    bool refusedStart = false; // Writer::begin refused (busy, validation)
     FirmwareSink(GatewayOta::Writer &w, Sha256 *h) : writer(w), whole(h) {}
     // The filesystem stays mounted: OTA writes only the other app slot, and
     // unmounting would race with the other task's file writes
     bool begin(uint32_t length, String &error) override
     {
         total = length;
-        return writer.begin(error);
+        refusedStart = !writer.begin(error);
+        return !refusedStart;
     }
     bool write(const uint8_t *data, size_t len, String &error) override
     {
@@ -3427,11 +3473,31 @@ void WebPortal::runUrlOta(const String &url, uint64_t requester, const Manifest:
         return;
     }
     WatchdogPause pause;
+    String result;
+    installIn(session, url, requester, expect, result);
+}
+
+// The download and install inside a session (manual or scheduled). Returns
+// only when nothing was activated (result says why; false = failed or
+// refused, true = waiting for the admin's confirmation); an activated
+// image restarts the gateway
+bool WebPortal::installIn(UpdateMode::Session &session, const String &url, uint64_t requester,
+                          const Manifest::Expect &expect, String &result, bool (*gate)(uint32_t),
+                          AutoUpdatePolicy::GwEnd *end)
+{
+    using AutoUpdatePolicy::GwEnd;
+    GwEnd ended = GwEnd::Busy;
+    if (!end)
+    {
+        end = &ended;
+    }
+    *end = GwEnd::Busy;
     const esp_partition_t *ota = esp_ota_get_next_update_partition(nullptr);
     GatewayOta::Writer writer;
     std::unique_ptr<Sha256> whole(expect.set ? new (std::nothrow) Sha256() : nullptr);
     FirmwareSink sink(writer, whole.get());
     String error;
+    dlHttpCode = 0;
     // From the manifest: exactly its size
     const bool downloaded =
         !ota                     ? (error = "no OTA slot", false)
@@ -3442,9 +3508,12 @@ void WebPortal::runUrlOta(const String &url, uint64_t requester, const Manifest:
     {
         // A cut download is never classified (and never activated)
         logger.error("Firmware download failed: " + error);
+        *end = writer.headRefused() || AutoUpdatePolicy::refusedHttp(dlHttpCode) ? GwEnd::Refused
+               : !ota || (expect.set && !whole) || sink.refusedStart ? GwEnd::Busy
+                                                                     : GwEnd::Transport;
         writer.abort();
-        session.setResult("download failed: " + error);
-        return;
+        session.setResult(result = "download failed: " + error);
+        return false;
     }
     const GatewayImage::Outcome outcome = writer.finish((uint64_t)sink.total);
     if (expect.set && outcome.cls != GatewayImage::Class::Refused)
@@ -3464,8 +3533,15 @@ void WebPortal::runUrlOta(const String &url, uint64_t requester, const Manifest:
             GatewayOta::discard(writer, why); // also the last install result
             logger.error(String("Firmware from the update manifest refused: ") + why + " (" + outcome.text +
                          ") - not activated, slot erased");
-            session.setResult(String("install refused: ") + why);
-            return;
+            session.setResult(result = String("install refused: ") + why);
+            *end = GwEnd::Refused;
+            return false;
+        }
+        if (gate && !gate(expect.version))
+        {
+            GatewayOta::discard(writer, "its attempt could not be saved");
+            session.setResult(result = "install refused: its attempt could not be saved");
+            return false;
         }
     }
     bool signedOnly;
@@ -3473,22 +3549,27 @@ void WebPortal::runUrlOta(const String &url, uint64_t requester, const Manifest:
         std::lock_guard<std::recursive_mutex> guard(configManager.mutex());
         signedOnly = configManager.signedOnly;
     }
-    GatewayOta::Result result = GatewayOta::conclude(writer, outcome, requester, signedOnly, "URL download");
-    if (!result.activated)
+    GatewayOta::Result done = GatewayOta::conclude(writer, outcome, requester, signedOnly, "URL download");
+    if (!done.activated)
     {
         // Confirm: unsigned / unknown key, or a verified older version
-        session.setResult(result.action == GatewayImage::Activation::Confirm
-                              ? String("downloaded, waiting for the admin's confirmation (") +
-                                    (outcome.cls == GatewayImage::Class::Verified ? "older version, " : "") +
-                                    outcome.text + ")"
-                              : "download refused: " + (outcome.cls == GatewayImage::Class::Refused
-                                                            ? String(outcome.text)
-                                                            : result.message));
-        return;
+        const bool confirm = done.action == GatewayImage::Activation::Confirm;
+        result = confirm ? String("downloaded, waiting for the admin's confirmation (") +
+                               (outcome.cls == GatewayImage::Class::Verified ? "older version, " : "") + outcome.text +
+                               ")"
+                         : "download refused: " +
+                               (outcome.cls == GatewayImage::Class::Refused ? String(outcome.text) : done.message);
+        if (outcome.cls == GatewayImage::Class::Refused)
+        {
+            *end = GwEnd::Refused;
+        }
+        session.setResult(result);
+        return confirm;
     }
     logger.info("OTA complete, restarting");
     delay(500);
     ESP.restart();
+    return false;
 }
 
 // Sensor image download: into the image store, exactly like a web upload
@@ -3682,42 +3763,187 @@ void WebPortal::runSensorFetch(const String &url, const Manifest::Expect &expect
         else
         {
             WatchdogPause pause;
-            std::unique_ptr<Sha256> whole(expect.set ? new (std::nothrow) Sha256() : nullptr);
-            ImageSink sink(fetchBytes, fetchTotal, whole.get());
-            String error;
-            uint8_t digest[32];
-            // From the manifest: exactly its size, the SHA-256 of every byte
-            if (expect.set && !whole)
-            {
-                result = "download failed: no memory for the hash";
-                logger.error("Sensor image " + result);
-            }
-            else if (!httpsDownload(url, session, expect.set ? expect.size : SensorFetch::MIN_FILE,
-                                    expect.set ? expect.size : SensorFetch::MAX_FILE, sink, error,
-                                    &SensorFetch::budgetMs) ||
-                     (expect.set && !whole->finish(digest) && (error = "the SHA-256 could not be computed", true)))
-            {
-                if (OtaStore::uploadRunning())
-                {
-                    OtaStore::uploadAbort();
-                }
-                result = "download failed: " + error;
-                logger.error("Sensor image " + result);
-            }
-            else
-            {
-                stored = finishSensorImage(result, expect.set ? &expect : nullptr, digest); // logged there
-                if (!stored)
-                {
-                    result = "not stored: " + result;
-                }
-            }
-            session.setResult(result);
+            stored = fetchIn(session, url, expect, result);
         }
     }
     std::lock_guard<std::mutex> lock(otaUrlMutex);
     fetchResult = result;
     fetchState = (uint8_t)(stored ? SensorFetch::State::Stored : SensorFetch::State::Failed);
+}
+
+// A sensor image download inside a session (manual or scheduled): true =
+// stored; result as logged
+bool WebPortal::fetchIn(UpdateMode::Session &session, const String &url, const Manifest::Expect &expect,
+                        String &result, bool *refused)
+{
+    bool stored = false, notStored = false;
+    dlHttpCode = 0;
+    std::unique_ptr<Sha256> whole(expect.set ? new (std::nothrow) Sha256() : nullptr);
+    ImageSink sink(fetchBytes, fetchTotal, whole.get());
+    String error;
+    uint8_t digest[32];
+    // From the manifest: exactly its size, the SHA-256 of every byte
+    if (expect.set && !whole)
+    {
+        result = "download failed: no memory for the hash";
+        logger.error("Sensor image " + result);
+    }
+    else if (!httpsDownload(url, session, expect.set ? expect.size : SensorFetch::MIN_FILE,
+                            expect.set ? expect.size : SensorFetch::MAX_FILE, sink, error, &SensorFetch::budgetMs) ||
+             (expect.set && !whole->finish(digest) && (error = "the SHA-256 could not be computed", true)))
+    {
+        if (OtaStore::uploadRunning())
+        {
+            OtaStore::uploadAbort();
+        }
+        result = "download failed: " + error;
+        logger.error("Sensor image " + result);
+        notStored = AutoUpdatePolicy::refusedHttp(dlHttpCode);
+    }
+    else
+    {
+        stored = finishSensorImage(result, expect.set ? &expect : nullptr, digest); // logged there
+        if (!stored)
+        {
+            result = "not stored: " + result;
+            notStored = true;
+        }
+    }
+    if (refused)
+    {
+        *refused = notStored;
+    }
+    session.setResult(result);
+    return stored;
+}
+
+AutoUpdatePolicy::Activity WebPortal::autoActivity()
+{
+    AutoUpdatePolicy::Activity a;
+    a.job = sensorManager.otaJobState(a.startPending);
+    a.validation = GatewayOta::validationPending();
+    a.session = UpdateMode::active();
+    std::lock_guard<std::mutex> lock(otaUrlMutex);
+    a.upload = otaUploadActive || otaUploadOwner != nullptr || imgUploadOwner != nullptr || OtaStore::uploadRunning();
+    a.confirmWait = GatewayOta::waitingConfirm();
+    a.download = urlOtaRunning || pendingOtaUrl.length() > 0 || fetchBusyLocked() || updateCheckRequested ||
+                 updateCheckRunning;
+    a.restart = restartRequested;
+    return a;
+}
+
+// Loop task: the nightly run of the automatic updates in one update-mode
+// session (Update/AutoUpdate.h). Verified images only, whatever "Signed
+// images only" says (the manifest paths accept nothing else)
+AutoUpdatePolicy::Outcome WebPortal::runScheduled(const AutoUpdatePolicy::Settings &s, String &result)
+{
+    using AutoUpdatePolicy::Outcome;
+    UpdateMode::Session session(UpdateMode::Reason::Scheduled,
+                                s.gateway ? UpdateMode::EXTRA_GATEWAY_DOWNLOAD : UpdateMode::EXTRA_SENSOR_FETCH);
+    if (!session.ok())
+    {
+        result = session.error();
+        return Outcome::Failed;
+    }
+    WatchdogPause pause;
+    if (!checkIn(session, result))
+    {
+        result = "check " + result;
+        return Outcome::Failed;
+    }
+    // The gateway first (a newer verified firmware restarts the gateway),
+    // then every newer sensor image offered for a HW type whose image no
+    // unfinished job uses. One package at a time: copied under the lock,
+    // downloaded without it
+    using AutoUpdatePolicy::GwEnd;
+    uint8_t stored = 0, failed = 0;
+    bool gwFailed = false;
+    for (int i = s.gateway ? -1 : 0; i < (s.sensors ? (int)Manifest::MAX_PACKAGES : 0); i++)
+    {
+        Manifest::Expect expect;
+        String url;
+        {
+            std::lock_guard<std::mutex> lock(UpdateCheck::mutex());
+            const Manifest::Doc *d = UpdateCheck::docLocked();
+            if (!d || i >= (int)d->sensorCount)
+            {
+                break;
+            }
+            if (i < 0)
+            {
+                if (UpdateCheck::gatewayOfferLocked(d) == Manifest::Offer::Install)
+                {
+                    const char *no = AutoUpdate::gatewayRefusal(d->gateway.version);
+                    if (!no)
+                    {
+                        expect = Manifest::expectOf(d->gateway);
+                        url = d->gateway.url;
+                    }
+                    else
+                    {
+                        result += no;
+                    }
+                }
+            }
+            else if (UpdateCheck::sensorOfferLocked(d, d->sensor[i].hw) == Manifest::Offer::Install)
+            {
+                expect = Manifest::expectOf(d->sensor[i].pkg, d->sensor[i].hw);
+                url = d->sensor[i].pkg.url;
+            }
+        }
+        String why;
+        if (!expect.set || url.length() == 0)
+        {
+            continue;
+        }
+        if (i < 0)
+        {
+            // An image larger than the slot can never install: a strike
+            const esp_partition_t *ota = esp_ota_get_next_update_partition(nullptr);
+            GwEnd end = ota ? GwEnd::Refused : GwEnd::Busy;
+            if (!ota || expect.size > ota->size)
+            {
+                why = "install refused: larger than the OTA slot";
+                logger.error("Automatic update: gateway " + why);
+            }
+            else
+            {
+                AutoUpdate::beforeGatewayDownload(expect.version); // a restart during the download is a strike
+                installIn(session, url, 0, expect, why, &AutoUpdate::beforeGatewayActivation, &end); // restarts when activated
+            }
+            AutoUpdate::gatewayInstallEnded(expect.version, end);
+            result += ", gateway " + why;
+            gwFailed = end != GwEnd::Refused; // a refused image is not retried tonight
+            continue;
+        }
+        if (!AutoUpdate::sensorFetchWanted(expect.hw, expect.version))
+        {
+            Logger::logf(LogLevel::WARNING, "Automatic update: sensor image for HW %04X not fetched (failed on %u nights)",
+                         expect.hw, AutoUpdatePolicy::FETCH_TRIES);
+            continue;
+        }
+        if (session.expired() || sensorManager.otaImageBusy(expect.hw))
+        {
+            Logger::logf(LogLevel::WARNING, "Automatic update: sensor image for HW %04X not fetched (%s)", expect.hw,
+                         session.expired() ? "session limit" : "an unfinished OTA job uses the stored one");
+            failed += session.expired();
+            continue;
+        }
+        bool refused = false;
+        const bool ok = fetchIn(session, url, expect, why, &refused);
+        ok ? stored++ : failed++;
+        using AutoUpdatePolicy::FetchEnd;
+        AutoUpdate::sensorFetched(expect.hw, expect.version,
+                                  ok ? FetchEnd::Stored : refused ? FetchEnd::Refused : FetchEnd::Transport);
+    }
+    if (stored || failed)
+    {
+        char t[48];
+        snprintf(t, sizeof(t), ", sensor images: %u stored, %u failed", stored, failed);
+        result += t;
+    }
+    session.setResult("scheduled: " + result);
+    return failed || gwFailed ? Outcome::Failed : Outcome::Ok;
 }
 
 void WebPortal::handleFirmwarePage(AsyncWebServerRequest *request)
@@ -3760,8 +3986,53 @@ void WebPortal::handleFirmwarePage(AsyncWebServerRequest *request)
         }
     }
     String html = HTMLGenerator::generateFirmwarePage(UpdateMode::statusText(), signedOnly,
-                                                      GatewayOta::view(auth.sessionTag(request)), check);
+                                                      GatewayOta::view(auth.sessionTag(request)), check,
+                                                      AutoUpdate::view());
     request->send(200, "text/html", html);
+}
+
+// "Automatic updates" card: the two switches and the window. Fields that
+// are not posted keep their stored values (f = the switches were posted)
+void WebPortal::handleAutoUpdatePost(AsyncWebServerRequest *request)
+{
+    logger.debug("HTTP request: POST /firmware/auto");
+    if (guardAPOnly(request)) return;
+    AutoUpdatePolicy::Settings s;
+    {
+        std::lock_guard<std::recursive_mutex> guard(configManager.mutex());
+        s = AutoUpdatePolicy::unpack(configManager.autoUpdate);
+    }
+    auto has = [request](const char *n) { return request->hasParam(n, true); };
+    if (has("f"))
+    {
+        s.gateway = has("gw");
+        s.sensors = has("sn");
+    }
+    // An hour: 1 or 2 digits (anything else is refused, not read as 0)
+    auto hour = [request](const char *n, int keep) {
+        if (!request->hasParam(n, true))
+        {
+            return keep;
+        }
+        const String &v = request->getParam(n, true)->value();
+        return v.length() >= 1 && v.length() <= 2 && isDigit(v[0]) && isDigit(v[v.length() - 1]) ? (int)v.toInt()
+                                                                                                    : -1;
+    };
+    const int start = hour("ws", s.startH), end = hour("we", s.endH);
+    if (!AutoUpdatePolicy::validWindow(start, end))
+    {
+        request->send(400, "text/plain", "The update window needs a start and an end hour (0-23) that differ");
+        return;
+    }
+    s.startH = (uint8_t)start;
+    s.endH = (uint8_t)end;
+    if (!configManager.setAutoUpdate(AutoUpdatePolicy::pack(s)))
+    {
+        request->send(500, "text/plain", "Failed to save configuration");
+        return;
+    }
+    AutoUpdate::settingsChanged(s);
+    request->redirect("/firmware");
 }
 
 // "Signed images only" (shared by sensor images and the gateway firmware)

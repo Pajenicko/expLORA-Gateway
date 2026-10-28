@@ -59,6 +59,8 @@ bool activated = false; // an image was activated: the gateway restarts, no othe
 // may be stale, so the boot path does not act on it
 bool saveFailed = false;
 std::atomic<bool> waitingFlag{false}; // waiting.valid, read without the lock by process()
+uint32_t loadWarnedMs = 0; // the last "cannot be read" warning (at most one an hour: every caller retries)
+bool loadWarned = false;
 
 std::mutex valMtx; // validation, markFailures, markRetryAt (loop task writes, web task reads)
 GatewayImage::Validation validation;
@@ -109,11 +111,22 @@ void loadLocked()
     {
         return;
     }
+    // Not loaded (nothing is saved over the file): warned at most once an
+    // hour - every caller tries again
+    auto warn = [](const char *why) {
+        if (!loadWarned || millis() - loadWarnedMs >= 3600000UL)
+        {
+            loadWarned = true;
+            loadWarnedMs = millis();
+            Logger::logf(LogLevel::WARNING, "Update state: %s - not loaded (tried again on use, warned once an hour)",
+                         why);
+        }
+    };
     std::unique_ptr<char[]> buf(new (std::nothrow) char[UpdateState::TEXT_CAPACITY]);
     if (!buf)
     {
-        logWarning("Update state: no memory to read it");
-        return; // not loaded: nothing is saved over the file
+        warn("no memory to read it");
+        return;
     }
     File f = LittleFS.open(PATH, "r");
     if (!f)
@@ -122,7 +135,7 @@ void loadLocked()
         {
             // There but unreadable now: not "no file" (a save would replace
             // it with a default state, seq 0)
-            logWarning("Update state: " + String(PATH) + " cannot be opened - not loaded");
+            warn("the file cannot be opened");
             return;
         }
         state = UpdateState::State();
@@ -541,9 +554,12 @@ void begin(Logger &logger)
     // validated it in this partition and nothing else installed one since:
     // the bootloader state is VALID (a USB flash resets otadata), and the
     // image was not installed by another firmware (same version text in the
-    // same partition would pass the other checks)
+    // same partition would pass the other checks). While an image this
+    // firmware activated is being validated, the record still describes the
+    // previous firmware (the rollback target, which shows it again after a
+    // rollback); the validation replaces it
     const bool runningValid = running && esp_ota_get_state_partition(running, &st) == ESP_OK && st == ESP_OTA_IMG_VALID;
-    if (state.running.set &&
+    if (state.running.set && !(verifying && boot == GatewayImage::Boot::Running) &&
         (!runningValid || strcmp(state.running.part, running->label) != 0 || boot == GatewayImage::Boot::NotRunning ||
          (boot == GatewayImage::Boot::Nothing && verifying)))
     {
@@ -700,6 +716,11 @@ bool installRefused(String &why)
     return false;
 }
 
+bool waitingConfirm()
+{
+    return waitingFlag;
+}
+
 void signedOnlyOn()
 {
     std::lock_guard<std::mutex> lock(mtx);
@@ -798,6 +819,7 @@ bool Writer::begin(String &error)
     handle_ = h;
     received_ = 0;
     headLen_ = 0;
+    headRefused_ = false;
     haveOutcome_ = false;
     outcome_ = GatewayImage::Outcome();
     return true;
@@ -850,7 +872,9 @@ bool Writer::write(const uint8_t *data, size_t len, String &error)
         {
             return true;
         }
-        switch (GatewayImage::checkHead(head_, headLen_, CONFIG_IDF_FIRMWARE_CHIP_ID))
+        const GatewayImage::HeadError he = GatewayImage::checkHead(head_, headLen_, CONFIG_IDF_FIRMWARE_CHIP_ID);
+        headRefused_ = he != GatewayImage::HeadError::None;
+        switch (he)
         {
         case GatewayImage::HeadError::None:
             break;
@@ -1243,7 +1267,31 @@ void recordCheck(const String &text)
     saveLocked();
 }
 
-void printDiagJson(Print &out)
+bool autoRecord(UpdateState::Auto &out)
+{
+    std::lock_guard<std::mutex> lock(mtx);
+    loadLocked();
+    if (!stateLoaded)
+    {
+        return false;
+    }
+    out = state.au;
+    return true;
+}
+
+bool setAutoRecord(const UpdateState::Auto &a)
+{
+    std::lock_guard<std::mutex> lock(mtx);
+    loadLocked();
+    if (!stateLoaded)
+    {
+        return false;
+    }
+    state.au = a;
+    return saveLocked();
+}
+
+void printDiagJson(Print &out, void (*extra)(Print &))
 {
     View v = view(0);
     out.print("{\"version\":");
@@ -1269,6 +1317,11 @@ void printDiagJson(Print &out)
             first = false;
         }
     }
-    out.print("]}");
+    out.print("]");
+    if (extra)
+    {
+        extra(out);
+    }
+    out.print("}");
 }
 } // namespace GatewayOta

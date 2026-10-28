@@ -48,7 +48,7 @@ void tearDown(void) {}
 static void test_url_rule(void)
 {
     using UpdateModePolicy::urlAccepted;
-    TEST_ASSERT_TRUE(urlAccepted("https://pajenicko.cz/webflash/explora/v1/hw0003-0.2.12.bin"));
+    TEST_ASSERT_TRUE(urlAccepted("https://pajenicko.cz/webflash/explora/v2/hw0003-0.2.12.bin"));
     TEST_ASSERT_TRUE(urlAccepted("https://192.168.1.126:8443/good/img.bin"));
     TEST_ASSERT_TRUE(urlAccepted("https://[fe80::1]/a.bin"));
     TEST_ASSERT_TRUE(urlAccepted("https://user:pw@example.com/a.bin"));

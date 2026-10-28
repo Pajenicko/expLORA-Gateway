@@ -27,7 +27,7 @@ void tearDown(void) {}
 
 static ReleaseKeys::Key KEYS[2];
 static const Manifest::Limits LIM = {100, 0x1F0000, 64, 114816};
-static const char *BASE = "https://example.com/explora/v1/";
+static const char *BASE = "https://example.com/explora/v2/";
 
 static void initKeys()
 {

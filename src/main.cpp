@@ -49,6 +49,7 @@
 #include "Security/VersionMarker.h"
 #include "Update/UpdateMode.h"
 #include "Update/GatewayOta.h"
+#include "Update/AutoUpdate.h"
 
 // Storage
 #include "Storage/ConfigManager.h"
@@ -230,6 +231,7 @@ void setup()
     UpdateMode::logLastRestart(logger);
     // Gateway firmware install record: rollback, validation of a new firmware
     GatewayOta::begin(logger);
+    AutoUpdate::begin(); // after the install record (its "auto" part)
 
     // Configuration manager initialization
     configManager = new ConfigManager(logger);
@@ -371,6 +373,10 @@ void loop()
     // Update mode: hard cap of a session, connectivity after one
     UpdateMode::process();
 
+    // Automatic updates: the nightly run (one update-mode session) and the
+    // automatic sensor jobs (Update/AutoUpdate.h)
+    AutoUpdate::process();
+
     // A new firmware is validated after 120 s with the web server up and the
     // lwIP thread / radio task heartbeats fresh (Hardware/Liveness); an image
     // waiting for its confirmation expires after 10 minutes
@@ -417,6 +423,13 @@ void loop()
                 mqttManager->requestGen2Publish(devId, discover);
             }
         }
+    }
+
+    // Generation 2 "Forward to URL": one sensor per pass (blocks like the
+    // generation 1 forward, after the response has gone out)
+    if (sensorManager)
+    {
+        sensorManager->forwardGen2();
     }
 
     // Outcomes of generation 2 responses (per-sensor downlink counters)

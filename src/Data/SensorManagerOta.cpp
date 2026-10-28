@@ -18,6 +18,7 @@
 #include "SensorManager.h"
 
 #include <ArduinoJson.h>
+#include <cstdarg>
 #include <LittleFS.h>
 #include <esp_timer.h>
 #include <sys/time.h>
@@ -29,6 +30,7 @@
 #include "../Storage/OtaStore.h"
 #include "../Protocol/OtaImageSigned.h"
 #include "../Storage/ConfigManager.h"
+#include "../Update/AutoUpdatePolicy.h"
 #include "../Update/UpdateMode.h"
 
 extern ConfigManager *configManager;
@@ -1193,6 +1195,56 @@ OtaJob::State SensorManager::otaJobState(bool &startPending, OtaJob::WaitView *w
     return otaJobPtr ? otaJobPtr->state : State::None;
 }
 
+OtaJob::State SensorManager::otaJobBrief(uint32_t &devId, uint32_t &fw, bool &startPending, uint32_t &startDevId,
+                                         OtaJob::Why *why) const
+{
+    std::lock_guard<std::mutex> lock(sensorMutex);
+    if (why)
+    {
+        *why = otaJobPtr ? otaJobPtr->why : OtaJob::Why::None;
+    }
+    startPending = otaStartPending;
+    startDevId = otaStartPending ? otaStartDevId : 0;
+    devId = otaJobPtr ? otaJobPtr->devId : 0;
+    fw = otaJobPtr ? otaJobPtr->fw : 0;
+    return otaJobPtr ? otaJobPtr->state : State::None;
+}
+
+size_t SensorManager::otaAutoSensors(AutoUpdatePolicy::SensorInfo *out, size_t max) const
+{
+    std::lock_guard<std::mutex> lock(sensorMutex);
+    size_t n = 0;
+    for (size_t i = 0; i < gen2Count && n < max; i++)
+    {
+        const Gen2Sensor &g = gen2[i];
+        AutoUpdatePolicy::SensorInfo &s = out[n++];
+        s.devId = g.devId;
+        s.hasFw = g.hasFw;
+        s.hw = g.hwType;
+        s.fw = g.fwVersion();
+        s.hasReverted = g.hasReverted;
+        s.revertedFw = g.revertedFw;
+        s.failFw = g.autoFailFw;
+        s.fails = g.autoFails;
+    }
+    return n;
+}
+
+void SensorManager::otaAutoFailure(uint32_t devId, uint32_t fw)
+{
+    std::lock_guard<std::mutex> lock(sensorMutex);
+    int i = findGen2Locked(devId);
+    if (i < 0)
+    {
+        return;
+    }
+    Gen2Sensor &g = gen2[i];
+    AutoUpdatePolicy::recordFailure(g.autoFailFw, g.autoFails, fw);
+    scheduleGen2SaveLocked(millis());
+    logger.warning("Automatic update of " + devIdText(devId) + " to v" + versionText(fw) + " failed (" +
+                   String(g.autoFails) + " of " + String(AutoUpdatePolicy::SENSOR_TRIES) + ")");
+}
+
 String SensorManager::otaLastEventText() const
 {
     std::lock_guard<std::mutex> lock(sensorMutex);
@@ -1234,38 +1286,54 @@ void SensorManager::otaImageChanged(uint16_t hwType)
     }
 }
 
+// printf-style append (at most 383 characters per call)
+static void appendf(String &s, const char *format, ...) __attribute__((format(printf, 2, 3)));
+static void appendf(String &s, const char *format, ...)
+{
+    char b[384];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(b, sizeof(b), format, args);
+    va_end(args);
+    s += b;
+}
+
 String SensorManager::otaDiagJson() const
 {
     std::lock_guard<std::mutex> lock(sensorMutex);
-    String s = "{\"state\":\"";
-    s += otaJobPtr ? OtaJob::stateName(otaJobPtr->state) : "none";
-    s += "\"";
+    static const char *const B[] = {"false", "true"};
+    String s;
+    s.reserve(720);
+    appendf(s, "{\"state\":\"%s\"", otaJobPtr ? OtaJob::stateName(otaJobPtr->state) : "none");
     if (otaJobPtr && (otaJobPtr->state != State::None || otaJobPtr->ghost))
     {
         const OtaJob::Job &j = *otaJobPtr;
-        s += ",\"devId\":\"" + devIdText(j.devId) + "\",\"version\":\"" + versionText(j.fw) + "\",\"blocks\":" +
-             String(j.blocks()) + ",\"confirmed\":" + String(j.maxConfirmed) + ",\"sent\":" + String(j.blocksSent) +
-             ",\"repeats\":" + String(j.repeats) + ",\"statuses\":" + String(j.statuses) + ",\"missed\":" +
-             String(j.missedTotal) + ",\"rounds\":" + String(j.rounds) + ",\"airtimeS\":" + String(j.airMs / 1000) +
-             ",\"etaS\":" + String(OtaJob::etaS(j)) + ",\"anchored\":" + String(j.anchorReliable ? "true" : "false") +
-             ",\"anchorRejects\":" + String(j.anchorRejects) +
-             ",\"abortPending\":" + String(j.abortPending ? "true" : "false") + ",\"manualPause\":" +
-             String(j.manualPause ? "true" : "false") + ",\"why\":\"" + OtaJob::whyText(j.why) + "\"";
+        char v[16];
+        OtaImage::versionText(j.fw, v, sizeof(v));
+        appendf(s,
+                ",\"devId\":\"%08lX\",\"version\":\"%s\",\"blocks\":%u,\"confirmed\":%u,\"sent\":%lu,\"repeats\":%lu,"
+                "\"statuses\":%lu,\"missed\":%lu,\"rounds\":%lu,\"airtimeS\":%lu,\"etaS\":%lu,\"anchored\":%s,"
+                "\"anchorRejects\":%u,\"abortPending\":%s,\"manualPause\":%s,\"why\":\"%s\"",
+                (unsigned long)j.devId, v, (unsigned)j.blocks(), (unsigned)j.maxConfirmed, (unsigned long)j.blocksSent,
+                (unsigned long)j.repeats, (unsigned long)j.statuses, (unsigned long)j.missedTotal,
+                (unsigned long)j.rounds, (unsigned long)(j.airMs / 1000), (unsigned long)OtaJob::etaS(j),
+                B[j.anchorReliable], (unsigned)j.anchorRejects, B[j.abortPending], B[j.manualPause],
+                OtaJob::whyText(j.why));
     }
-    s += ",\"skips\":{\"uplinkSlot\":" + String(otaSkipUplink) + ",\"loop\":" + String(otaSkipLoop) +
-         ",\"session\":" + String(otaSkipSession) + ",\"read\":" + String(otaSkipRead) + ",\"radio\":{";
+    appendf(s, ",\"skips\":{\"uplinkSlot\":%lu,\"loop\":%lu,\"session\":%lu,\"read\":%lu,\"radio\":{",
+            (unsigned long)otaSkipUplink, (unsigned long)otaSkipLoop, (unsigned long)otaSkipSession,
+            (unsigned long)otaSkipRead);
     for (size_t i = 1; i < sizeof(otaSkipRadio) / sizeof(otaSkipRadio[0]); i++)
     {
-        if (i > 1)
-        {
-            s += ",";
-        }
-        s += "\"" + String(RadioTask::otaOutcomeName((OtaOutcome)i)) + "\":" + String(otaSkipRadio[i]);
+        appendf(s, "%s\"%s\":%lu", i > 1 ? "," : "", RadioTask::otaOutcomeName((OtaOutcome)i),
+                (unsigned long)otaSkipRadio[i]);
     }
     const OtaStore::Timing t = OtaStore::timing();
-    s += "}},\"timing\":{\"reads\":" + String(t.reads) + ",\"readMaxUs\":" + String(t.readMaxUs) +
-         ",\"readAvgUs\":" + String(t.reads ? t.readSumUs / t.reads : 0) + ",\"verifyUs\":" + String(t.verifyUs) +
-         ",\"saveMaxUs\":" + String(otaSaveMaxUs) + "}";
-    s += ",\"frameBytes\":" + String(sizeof(OtaFrame)) + ",\"jobBytes\":" + String(sizeof(OtaJob::Job)) + "}";
+    appendf(s,
+            "}},\"timing\":{\"reads\":%lu,\"readMaxUs\":%lu,\"readAvgUs\":%lu,\"verifyUs\":%lu,\"saveMaxUs\":%lu},"
+            "\"frameBytes\":%u,\"jobBytes\":%u}",
+            (unsigned long)t.reads, (unsigned long)t.readMaxUs, (unsigned long)(t.reads ? t.readSumUs / t.reads : 0),
+            (unsigned long)t.verifyUs, (unsigned long)otaSaveMaxUs, (unsigned)sizeof(OtaFrame),
+            (unsigned)sizeof(OtaJob::Job));
     return s;
 }

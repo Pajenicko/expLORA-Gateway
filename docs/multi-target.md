@@ -210,7 +210,41 @@ log buffer size) and `variants/<env>/platformio.ini`.
   while the stored one is unsigned) and pass `Manifest::Expect` to the
   download: exact size, SHA-256 of the whole file, Verified with the
   manifest's version (and HW type) - else refused, the gateway slot erased
-  (`GatewayOta::discard`), the sensor store unchanged. The filesystem is not unmounted
+  (`GatewayOta::discard`), the sensor store unchanged.
+- Automatic updates (S6): `src/Update/AutoUpdate.{h,cpp}` driven from
+  `loop()`, pure rules in `src/Update/AutoUpdatePolicy.h` +
+  `test/test_auto_update` (check time = window start + SHA-256(MAC ||
+  "explora-check") mod the window length on the local wall clock, one run
+  per window day, DST jump rule, backoff 15 min doubling to 4 h +-10 %,
+  session eligibility, starvation rule, sensor choice, round robin,
+  three strikes). Settings: Preferences `autoUpd` (one packed value, read
+  back), `POST /firmware/auto` (`f`, `gw`, `sn`, `ws`, `we`; fields not
+  posted are kept). The nightly run is `WebPortal::runScheduled`: one
+  update-mode session (reason "scheduled update", extra heap of a gateway
+  download when the gateway switch is on, else of a sensor fetch), the
+  check (`checkIn`), then the gateway install (`installIn`; the strike
+  counted, `auto.gwAct` set and the night marked done right before the
+  activation - the install is refused if that cannot be saved; the new
+  firmware clears the strikes only once it is validated, the old one
+  finds `gwAct` after a rollback; a refused image or an HTTP 404 / 410 of its
+  URL is a strike, a download the gateway does not survive is counted at
+  the next start through the marker `auto.gwDl/gwDlDay` (set before the
+  download, cleared at its end), any other failed download only a RAM
+  count), then the sensor fetches (`fetchIn`, three nights with a refused
+  image or HTTP 404 / 410 stop a version: `auto.sf`; transport failures (any other HTTP status too) are no
+  strike). The retry wait is saved before each run
+  (`auto.tryDay/tryStep/retryAt`), the grace day after a sensor-job
+  deferral too (`auto.grace`). The persisted pending gateway version
+  (`auto.pendGw`) holds the automatic sensor jobs back without an accepted
+  manifest only in the rollback case and for at most 3 window days after
+  the attempt (`AutoUpdatePolicy::persistedPending`); no automatic job
+  starts while a new firmware is validated. Automatic sensor jobs
+  go through `otaCheckStart` (no blocker, empty confirm) and
+  `otaRequestStart(devId, 0)`; their end is tracked through
+  `/update/state.json` `auto.job`: Failed and an abort by the gateway count
+  in `sensors.json` `autoFail`; an abort by the admin (sensor held 24 h)
+  and a start refused before the job existed (held 30 min) do not. The
+  filesystem is not unmounted
   during OTA. Sensor images from a URL (`POST /ota/fetch`, gen 2 page,
   Advanced) use the same download code (`httpsDownload` in
   `src/Web/WebServer.cpp`) and the same store path as an upload

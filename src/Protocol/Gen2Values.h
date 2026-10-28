@@ -92,8 +92,10 @@ inline float corrected(const SensorCalibration::Set &cal, Qty::Id q, float value
 // qNow, qMask, qBad, cal). A value is stored corrected and marked current;
 // an invalid one clears the quantity's current bit (the pages, /api and MQTT
 // show it as missing, never the last good value) and marks it bad (MQTT
-// sends "None"); both count as a reported quantity (qMask)
-template <class G> Decoded apply(G &g, const ep::Tlv &t)
+// sends "None"); both count as a reported quantity (qMask). fresh
+// (optional): the quantity's bit is set for a valid value (the quantities
+// this UP carried with a value - Forward to URL sends only those)
+template <class G> Decoded apply(G &g, const ep::Tlv &t, uint16_t *fresh = nullptr)
 {
     Qty::Id q;
     float value = 0;
@@ -109,6 +111,10 @@ template <class G> Decoded apply(G &g, const ep::Tlv &t)
         g.value[q] = corrected(g.cal, q, value);
         g.qNow |= m;
         g.qBad &= (uint16_t)~m;
+        if (fresh)
+        {
+            *fresh |= m;
+        }
     }
     else
     {

@@ -2106,3 +2106,284 @@ apply.** Each with the recommended default:
   mid-transfer; the low-battery refusal and the battery wait; a revert after
   an OTA; a reinstall of the running version; Abort / Pause / Clear job in
   every state; the attack suite; the skip rate with LTE on (Pro).
+
+## 15. Signed packages and automatic updates (M4c, gateway 2.0.0)
+
+Everything in this section runs on the gateway and over HTTPS; the sensor,
+its bootloader and the radio transfer of §14 are unchanged (the gateway
+verifies, the sensor keeps checking CRC, HW type and trailer, §10.1).
+Unless noted, integers in the binary structures here are **little endian**
+(unlike the radio frames). Threat model and residual risks:
+`docs/threat-model.md`; the release procedure: `docs/release.md`.
+
+### 15.1 Release keys
+
+ECDSA P-256 with SHA-256 (mbedtls, already linked for TLS). The public keys
+are compiled into the firmware (`src/Security/ReleaseKeys.h`): a table of
+two slots {key id, 65-byte uncompressed point}; slot 0 holds the current
+release key, slot 1 is empty and reserved for a rotation (a firmware that
+carries both keys is released first, the new key is used afterwards). The
+key id is the first 4 bytes of SHA-256 of the 65-byte point, read as a
+big-endian number and written as 8 lowercase hex digits; key id 0 is
+malformed everywhere. `/diag/heap` lists the key ids a firmware verifies
+with (`update.releaseKeys`). The private key is held by the owner only
+(never on CI or GitHub); the tools take it as a path (`--key`).
+
+### 15.2 Signature block (SigBlock)
+
+One 128-byte block appended to a gateway or sensor firmware file
+(`src/Security/SigBlock.h`, written by `tools/release/explora_sign.py`):
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | magic `EXSG` |
+| 4 | u16 | block version 1 |
+| 6 | u16 | kind: 1 gateway, 2 sensor |
+| 8 | u32 | target: gateway board (1 Pro, 2 Lite) or sensor HW type |
+| 12 | u32 | firmware version `maj << 16 \| min << 8 \| pat` |
+| 16 | u32 | payload length (bytes of the file before the block) |
+| 20 | u32 | key id |
+| 24 | 32 | SHA-256 of the payload |
+| 56 | 64 | signature r \|\| s (32 B each, big endian) over SHA-256 of bytes 0..55 |
+| 120 | 8 | reserved, 0 |
+
+The signature binds kind, target, version, length and the payload hash.
+Classification of a received file (gateway: `GatewayImage`, sensor image:
+`OtaImageSigned`), failing closed:
+
+- **Unsigned**: the file has no block (gateway: the last 128 bytes are no
+  block; sensor: nothing after the image whose length the size word at
+  0x20 gives).
+- **Verified**: a well-formed block bound to this file (kind; target = this
+  board, or the sensor trailer's HW type; version = the sensor trailer's
+  firmware version; length; hash) signed by a key of the table.
+- **NoKey** ("unsigned (unknown key)"): the same with a key id the firmware
+  does not carry - treated as unsigned everywhere.
+- **Refused**: anything else after the payload (sensor: not exactly 128
+  bytes), a malformed block, a binding mismatch, a bad signature with a
+  known key, a failed check; a gateway download whose length differs from
+  its Content-Length is refused before its tail is classified (a cut
+  signed file never becomes "unsigned"). A refused file is never stored or
+  activated.
+
+Gateway image: every byte goes into the OTA slot unchanged and through a
+128-byte tail ring into the hash; the block lands after the ESP image and
+its appended SHA-256, where the bootloader ignores it - a 1.x gateway
+installs a signed file like an unsigned one. The block's version is not
+compared with the image (`esp_app_desc_t.version` holds the library
+builder's id); the release tool binds it when it signs (the image's
+`EXPLORA_FW_VERSION=` marker) and the signature covers it.
+Sensor image: only the image is stored (`/ota/hw<HHHH>.bin`, byte-identical
+to the unsigned file); the block stays in RAM, the description
+`hw<HHHH>.json` records `signed` (key id, 0 = unsigned).
+
+### 15.3 Install rules
+
+**Gateway firmware** (upload `POST /firmware`, URL `POST /firmware/update`,
+manifest `POST /firmware/install`, automatic): the image is written to the
+other OTA slot, then
+
+- Verified, same or newer version: activated (`esp_ota_set_boot_partition`)
+  and the gateway restarts;
+- Verified but older (downgrade), Unsigned or NoKey: written but activated
+  only after the admin's confirmation (`POST /firmware/confirm`, bound to
+  the image's SHA-256 and length and to the login session that wrote it,
+  valid 10 minutes); with **Signed images only** an unsigned image is
+  refused; an image left waiting (expiry, the option switched on, a
+  restart) has its first sector erased so it can never boot;
+- Refused: first sector erased, never activated;
+- from the manifest (manual Install or automatic): additionally exactly the
+  manifest's size and SHA-256, Verified with the manifest's version, newer
+  than the running firmware - otherwise refused (no confirmation path, no
+  downgrade from the manifest);
+- a firmware whose own version text is not maj.min.pat sends every Verified
+  image through the confirmation (nothing can be compared).
+
+**Rollback**: a new firmware boots PENDING_VERIFY and is marked valid after
+120 s of a running `loop()` with the web server up and the liveness checks
+healthy (a restart from the web UI marks it valid first); a reset before
+that makes the bootloader return to the previous firmware, which logs
+"rolled back from vX". No install and no update check runs during the
+120 s.
+
+**Sensor image** (upload `POST /ota/upload`, URL `POST /ota/fetch`, manifest
+fetch, automatic fetch): stored when the image checks pass (§14.5) and the
+block is Verified, Unsigned or NoKey; with **Signed images only** an
+unsigned image is refused at upload and blocks starts; a start with an
+unsigned image needs the confirmation "Unsigned image." From the manifest:
+exactly its size and SHA-256, Verified, its HW type and version.
+Automatic paths (§15.6) take Verified only, whatever **Signed images only**
+says.
+
+Size limits: a gateway file is at most the OTA slot (the manifest format
+allows up to 4 MiB for any board); a sensor file 512 B .. 114,816 B (image
+plus block).
+
+### 15.4 Package manifest
+
+One file per installation base, `https://pajenicko.cz/webflash/explora/v2/packages.json`
+(`UPDATE_MANIFEST_URL`, `src/Update/Manifest.h`, written and verified by
+`tools/release/explora_manifest.py`):
+
+```
+EXSM1 <key id: 8 lowercase hex> <r || s: 128 lowercase hex>\n
+{"seq":61,"issued":1761200000,
+ "gateway":{"pro": {"version":"2.0.0","url":"https://.../gw-pro-2.0.0.bin","size":1873008,"sha256":"<64 hex>"},
+            "lite":{...}},
+ "sensor": {"0003":{"version":"1.0.0","url":"https://.../hw0003-1.0.0.bin","size":96368,"sha256":"<64 hex>"}}}
+```
+
+- The signature is ECDSA P-256 over SHA-256 of the **exact bytes after the
+  first `\n`** (nothing is normalised). The header line is strict: `EXSM1`
+  (format version 1), one space, 8 hex, one space, 128 hex, `\n` - no `\r`,
+  no other whitespace, lowercase only. Key id 0, an unknown key id or a bad
+  signature refuses the manifest; there is no unsigned manifest.
+- Limits: at most 4096 bytes (refused from the Content-Length before the
+  body is read), JSON nesting 10, the parser's memory (at least 384 JSON
+  values always fit), at most 8 sensor packages used.
+- `seq` (integer 0..2^32-1) is required; `issued` is informational and never
+  compared with the clock; unknown keys are ignored; bytes after the JSON
+  value are ignored (they are signed anyway).
+- **Replay**: the gateway keeps the highest accepted `seq` in
+  `/update/state.json` and refuses a lower one (the same one is accepted:
+  the same manifest checked again). There is no expiry. A formatted
+  filesystem resets the floor to 0 (harmless: the manifest only names
+  versions, and nothing older than the running firmware is installed from
+  it).
+- Entries are checked one by one (**skip vs refuse**): a structural error
+  (no valid `seq`, `gateway` / `sensor` not objects, too large or too
+  complex) refuses the manifest; a package entry that breaks a rule
+  (`version` not maj.min.pat 0..255, `url` not `https://` or longer than
+  256 bytes or a host longer than 127 bytes, `size` outside the limits of
+  its kind, `sha256` not 64 lowercase hex, a sensor key not 4 uppercase hex
+  digits or `0000`, a 9th sensor package) is skipped with a log line and
+  never offered - except this board's own gateway entry, whose error means
+  "no gateway offer" (the sensor packages are still used). A missing board
+  or HW type is simply not offered. So a later release with a new board or
+  bigger images cannot stop the check of gateways already in the field.
+- `sha256` and `size` are of the whole file as served (signature block
+  included). Package choice: the gateway uses its board; a sensor package
+  is chosen by the HW type from the sensor's JOIN_REQ.
+- Offers come only from the last accepted manifest: a refused manifest or
+  a failed check offers nothing until the next successful one.
+- The 1.x file `explora-gw-<board>-autoupdate.json` (`{"version","url"}`)
+  is not read by 2.x; it stays for the 1.x units in the field
+  (`docs/release.md`).
+
+### 15.5 Update mode
+
+Every outbound TLS session of an update (the check, a gateway download, a
+sensor image download, the nightly run) runs in one update-mode session
+(`src/Update/UpdateMode.h`, rules `UpdateModePolicy.h`): MQTT disconnected,
+LoRa reception paused (radio standby; a sensor job must be terminal or
+Paused - a Waiting job only for a sensor image download with time left),
+heavy web pages answered 503 (login, a short Firmware status page and the
+diagnostics stay; no restart from the UI), and - only when the TLS session
+plus a reserve (check 8 kB, gateway download 28 kB, sensor fetch 16 kB)
+does not fit the free heap - the interfaces that do not carry the uplink
+switched off (Ethernet uplink: WiFi and LTE; WiFi: AP and LTE; LTE: WiFi).
+Hard cap 15 minutes; interfaces it switched off that are not back 5
+minutes after the session restart the gateway (not during an upload or a
+sensor transfer, swap or confirmation). Refused during an upload, another
+session, a pending restart and while a new firmware is being validated.
+HTTPS only, certificates checked against the built-in CA bundle, at most 3
+redirects (https only), every phase time-bounded (check: 20 s + 2 kB/s of
+the file; sensor image: 30 s + 2 kB/s, at most 86 s; gateway: 2 min to the
+headers, 15 min for the body); the body must end exactly at the
+Content-Length.
+
+### 15.6 Automatic updates (scheduler)
+
+`src/Update/AutoUpdate.{h,cpp}`, pure rules `AutoUpdatePolicy.h`
+(`test/test_auto_update`). Off by default: two switches (*Gateway
+firmware*, *Sensor firmware*) and the window (whole local hours [start,
+end), default 02-05, across midnight allowed, start = end refused). Only
+Verified images from the manifest, whatever **Signed images only** says.
+
+- **Clock**: runs only with SNTP synced in this run, the last sync within
+  24 h and a time after 2023.
+- **Check time t0** = window start + (SHA-256(MAC ‖ "explora-check") bytes
+  0-7 as a big-endian number mod the window length), on the local wall
+  clock (one linear scale day·86400 + seconds). **One run per window day**
+  (the date the window starts; `auto.day`). DST: a repeated hour never runs
+  twice; a due time in a skipped hour runs right after the jump; a window
+  wholly inside the skipped hour runs right after it (a forward step of the
+  wall clock larger than the real time step + 10 min, at most 2 h - an SNTP
+  correction moves both and is no jump). A stored day in the future is
+  forgotten.
+- **Backoff** after a failed run inside the window: 15 min, 30 min, 1 h,
+  2 h, 4 h (then 4 h), each ±10 % from the MAC seed; past the window's end
+  the night is given up. The retry wait is saved before each run (as if it
+  failed), so a restart - also one caused by the run - waits for it. A
+  deferred run is tried every 5 minutes; after a deferral by a sensor job
+  it may still start up to 1 h past the window's end (grace, saved).
+- **Session eligibility**: the nightly session starts only when no sensor
+  job is in Waiting, Transfer, Verified, Swapping or Confirming (Paused does
+  not block), no start is queued, no upload, manual download or check runs,
+  no gateway image waits for the admin's confirmation, the running firmware
+  is validated, no restart is pending and no other session runs; manual
+  actions always win.
+- **The run** (one session): the check; then, with *Gateway firmware* on
+  and a newer gateway version offered and not given up, its install from
+  the manifest (restarts when activated); then, with *Sensor firmware* on,
+  every newer sensor image offered for a HW type whose stored image no
+  unfinished job uses and whose version is not struck out.
+- **Gateway strikes** (persisted `auto.gwVer/gwFails/gwDay/gwAct`): a strike
+  is counted (at most one per version and night; a version is not tried
+  again the night it got one) when the install reached the activation
+  (saved before the boot partition is switched - the install is refused if
+  it cannot be saved; cleared only after the new firmware is validated, so
+  a crash or rollback keeps it), when the image is refused (larger than
+  the slot, size / SHA-256 / version / signature / board not as in the
+  manifest) or its URL answers HTTP 404 or 410 (the file is not there),
+  and when the gateway restarted during the download (marker `auto.gwDl/gwDlDay`
+  set before it, cleared at its end; counted at the next start). Three
+  strikes stop the automatic install of that version until another
+  version is offered. Other download failures (network, timeouts, every
+  other HTTP status - 401 / 403 e.g. from a CDN challenge, 408, 429, 5xx)
+  are no strike: backoff, counted in RAM only.
+- **Starvation rule**: while a gateway update is pending (offered by the
+  last accepted manifest, *Gateway firmware* on, not given up, not released
+  by 3 download failures in this run or a refused image) no new automatic
+  sensor job starts. Without an accepted manifest (after a restart or a
+  failed check) the persisted `auto.pendGw` holds the sensors back only for
+  a version that was activated and rolled back (strikes > 0, not given up),
+  and for at most 3 window days after that attempt.
+- **Sensor image fetch strikes** (`auto.sf`, one record per HW type, 8 at
+  most): a fetch whose image is refused (not stored) or whose URL answers
+  HTTP 404 / 410 is one strike per night; three stop that version until the
+  manifest offers another one; a success clears it; transport failures are
+  no strike.
+- **Automatic sensor jobs** (outside the session, one at a time, after a
+  terminal job and with no start pending; DevID round robin from
+  `auto.cursor`): a sensor gets the stored image of its HW type when it has
+  reported its firmware (JOIN_REQ), the image is Verified and newer than
+  its firmware, it did not revert to this version before (by version, not
+  CRC), it has fewer than 2 automatic failures with this version
+  (`sensors.json` `autoFail`), `otaCheckStart` has no blocker and an empty
+  confirm list; start through `otaRequestStart(devId, 0)`. Failed and an
+  abort by the gateway count as a failure; an abort by the admin does not
+  (the sensor is left alone for 24 h), nor does a start refused before the
+  job existed (30 min). Jobs may start at any time of day, but never while
+  a gateway update is pending, while a new gateway firmware is being
+  validated, inside a window before its run, or when the job's estimate +
+  30 min would reach the next window.
+
+### 15.7 `/update/state.json`
+
+Version 1, one JSON object, at most 1792 bytes (worst case ~1.7 kB), saved
+atomically; unknown fields are dropped by the firmware that writes it.
+
+| Field | Meaning |
+|---|---|
+| `running` | how the running image was installed (`ver`, `part`, `sig` verified / unsigned / unknown key, `key`); valid only while version and partition match the running firmware; kept while a new image is validated (it describes the rollback target) |
+| `pending` | an activated image not yet validated (`ver`, `part`, `sig`, `key`, `at`); the old firmware finds it after a rollback |
+| `written` | an image written and waiting for the admin's confirmation (`part`, `at`); erased at the next start |
+| `last` | the last install result (`text`, `at`) |
+| `seq` | highest accepted manifest seq (replay floor; a damaged file keeps it if the text still holds a complete number) |
+| `check` | the last check result (`text`, `at`) |
+| `auto` | automatic updates: `day` (last window day done), `cursor` (DevID of the last automatic sensor start), `gwVer` / `gwFails` (strikes of one gateway version), `job` / `jobFw` (the automatic sensor job in progress), `run` / `runAt` (last run result); optional (written only when set): `gwDay` (window day of the last strike), `gwAct` (activated, not yet validated), `pendGw` (pending gateway version), `tryDay` / `tryStep` / `retryAt` (the retry wait), `gwDl` / `gwDlDay` (a gateway download in progress), `grace` (window day with the 1 h grace), `sf` (sensor fetch strikes: `[hw, version, nights, last day]` per HW type) |
+
+An unreadable file starts a new state (its `seq` salvaged when possible);
+the automatic updates wait for a readable record (retried every 5 minutes,
+one warning per hour).

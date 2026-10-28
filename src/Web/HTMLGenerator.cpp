@@ -20,6 +20,7 @@
  */
 
 #include "HTMLGenerator.h"
+#include <cstdarg>
 #include <esp_heap_caps.h>
 #include <algorithm>
 #include <atomic>
@@ -269,6 +270,19 @@ static String uptimeText()
     if (d || h || m)
         t += String(m) + " m ";
     return t + String(s % 60) + " s";
+}
+
+// printf-style append (at most 767 characters per call): far less code
+// than a chain of String temporaries
+static void addf(String &html, const char *format, ...) __attribute__((format(printf, 2, 3)));
+static void addf(String &html, const char *format, ...)
+{
+    char b[768];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(b, sizeof(b), format, args);
+    va_end(args);
+    html += b;
 }
 
 static void kvRow(String &html, const char *key, const String &value)
@@ -944,7 +958,21 @@ String HTMLGenerator::generateSensorsPagePart(const SensorsPageView &view, size_
     return html;
 }
 
-String HTMLGenerator::generateGen2AddPage(const String &devId, const String &error)
+// "Forward to URL" of both generations (Data/ForwardUrl.h); generation 2
+// lists the placeholders of its quantities
+static void addForwardUrl(String &html, const String &url, bool gen2)
+{
+    html += "<label for=customUrl>Forward to URL <small>(optional)</small></label><input id=customUrl name=customUrl "
+            "maxlength=200 placeholder='https://example.com/api?temp=*TEMP*&amp;hum=*HUM*' value='" +
+            HTMLGenerator::htmlEscape(url) + "'><p class=m>Placeholders: *TEMP* *HUM* *PRESS* *PPM* *LUX* ";
+    if (!gen2)
+    {
+        html += "*WIND_SPEED* *WIND_DIR* *RAIN* *DAILY_RAIN* *RAIN_RATE* ";
+    }
+    html += "*BAT* *RSSI* *SN* *TYPE*</p>";
+}
+
+String HTMLGenerator::generateGen2AddPage(const String &devId, const String &error, const String &url)
 {
     String html;
     html.reserve(2048);
@@ -959,8 +987,9 @@ String HTMLGenerator::generateGen2AddPage(const String &devId, const String &err
             "id=devId name=devId maxlength=8 pattern='[0-9A-Fa-f]{8}' required value='" +
             htmlEscape(devId) + "'></div><div><label for=key>Key <small>(label)</small></label><input id=key name=key "
             "maxlength=19 autocomplete=off pattern='[0-9A-Fa-f]{4}-?[0-9A-Fa-f]{4}-?[0-9A-Fa-f]{4}-?[0-9A-Fa-f]{4}' "
-            "required placeholder='A1B2-C3D4-E5F6-0718'></div></div><button>Add</button><a class='b b2' "
-            "href='/sensors'>Cancel</a></form></section>";
+            "required placeholder='A1B2-C3D4-E5F6-0718'></div></div>";
+    addForwardUrl(html, url, true);
+    html += "<button>Add</button><a class='b b2' href='/sensors'>Cancel</a></form></section>";
     addHtmlFooter(html);
     return html;
 }
@@ -1194,6 +1223,19 @@ static String otaButton(const char *id, const char *action, const char *label, c
 }
 
 // OTA card of the generation 2 detail page (spec 14.5)
+// The start / retry form up to its button (the confirmation when needed)
+static void startForm(String &html, const Gen2OtaView &v, const char *id)
+{
+    addf(html, "<form method='post' action='/sensors/gen2/ota'><input type='hidden' name='devId' value='%s'><input "
+               "type='hidden' name='action' value='start'>",
+         id);
+    if (v.confirm.length() > 0)
+    {
+        addf(html, "<p class=e>%s</p><label><input type='checkbox' name='confirm' value='%lu'> I confirm</label> ",
+             HTMLGenerator::htmlEscape(v.confirm).c_str(), (unsigned long)v.confirmToken);
+    }
+}
+
 static void addGen2OtaCard(String &html, const Gen2Sensor &g, const Gen2OtaView &v, const char *id)
 {
     html += "<section><h2>Firmware update over the air</h2>";
@@ -1207,8 +1249,9 @@ static void addGen2OtaCard(String &html, const Gen2Sensor &g, const Gen2OtaView 
     {
         char other[9];
         snprintf(other, sizeof(other), "%08lX", (unsigned long)j.devId);
-        html += "<p>Another OTA job is running (sensor <a href='/sensors/gen2?devId=" + String(other) + "'><code>" +
-                String(other) + "</code></a>) - one at a time.</p>";
+        addf(html, "<p>Another OTA job is running (sensor <a href='/sensors/gen2?devId=%s'><code>%s</code></a>) - one at "
+                   "a time.</p>",
+             other, other);
     }
     if (mine)
     {
@@ -1248,14 +1291,14 @@ static void addGen2OtaCard(String &html, const Gen2Sensor &g, const Gen2OtaView 
             html += " <small>abort not delivered yet</small>";
         }
         html += "</td></tr>";
-        html += "<tr><td>Image</td><td>v" + fwText(j.fw) + " <small>(" + String(j.len) + " B, from v" +
-                fwText(j.baseFw) + ")</small></td></tr>";
-        html += "<tr><td>Blocks confirmed / missing / sent</td><td>" + String(done) + " / " + String(n - done) +
-                " / " + String(j.blocksSent) + " <small>(" + String(j.repeats) + " repeats)</small></td></tr>";
-        html += "<tr><td>Rounds / statuses / missed</td><td>" + String(j.rounds) + " / " + String(j.statuses) + " / " +
-                String(j.missedTotal) + "</td></tr>";
-        html += "<tr><td>Airtime</td><td>" + String(j.airMs / 1000) + " s this job, " + String(v.otaHourMs / 1000) +
-                " s of 172 s in the last hour</td></tr>";
+        addf(html,
+             "<tr><td>Image</td><td>v%s <small>(%lu B, from v%s)</small></td></tr><tr><td>Blocks confirmed / missing / "
+             "sent</td><td>%u / %u / %lu <small>(%lu repeats)</small></td></tr><tr><td>Rounds / statuses / missed</td>"
+             "<td>%lu / %lu / %lu</td></tr><tr><td>Airtime</td><td>%lu s this job, %lu s of 172 s in the last hour</td>"
+             "</tr>",
+             fwText(j.fw).c_str(), (unsigned long)j.len, fwText(j.baseFw).c_str(), done, (unsigned)(n - done),
+             (unsigned long)j.blocksSent, (unsigned long)j.repeats, (unsigned long)j.rounds, (unsigned long)j.statuses,
+             (unsigned long)j.missedTotal, (unsigned long)(j.airMs / 1000), (unsigned long)(v.otaHourMs / 1000));
         if (j.state == OtaJob::State::Transfer || j.state == OtaJob::State::Paused ||
             j.state == OtaJob::State::Waiting)
         {
@@ -1297,14 +1340,7 @@ static void addGen2OtaCard(String &html, const Gen2Sensor &g, const Gen2OtaView 
             // as a start (downgrade, reinstall, the image that reverted here)
             if (v.blockers.length() == 0) // blockers are listed below
             {
-                html += "<form method='post' action='/sensors/gen2/ota'><input type='hidden' name='devId' value='" +
-                        String(id) + "'><input type='hidden' name='action' value='start'>";
-                if (v.confirm.length() > 0)
-                {
-                    html += "<p class=e>" + HTMLGenerator::htmlEscape(v.confirm) +
-                            "</p><label><input type='checkbox' name='confirm' value='" + String(v.confirmToken) +
-                            "'> I confirm</label> ";
-                }
+                startForm(html, v, id);
                 html += "<button class=b>Retry" +
                         (v.imageOk ? String(" with v") + fwText(v.imageFw) : String("")) + "</button></form>";
             }
@@ -1320,8 +1356,9 @@ static void addGen2OtaCard(String &html, const Gen2Sensor &g, const Gen2OtaView 
     {
         if (v.imageOk)
         {
-            html += "<p>Image for this sensor: <strong>v" + fwText(v.imageFw) + "</strong> (" + String(v.imageLen) +
-                    " B), estimated " + durationText(v.estimateS) + " incl. the swap and confirmation.</p>";
+            addf(html, "<p>Image for this sensor: <strong>v%s</strong> (%lu B), estimated %s incl. the swap and "
+                       "confirmation.</p>",
+                 fwText(v.imageFw).c_str(), (unsigned long)v.imageLen, durationText(v.estimateS).c_str());
         }
         if (v.blockers.length() > 0)
         {
@@ -1333,15 +1370,8 @@ static void addGen2OtaCard(String &html, const Gen2Sensor &g, const Gen2OtaView 
         }
         if (v.imageOk && v.blockers.length() == 0 && !(mine && OtaJob::canRetry(j)))
         {
-            html += "<form method='post' action='/sensors/gen2/ota'><input type='hidden' name='devId' value='" +
-                    String(id) + "'><input type='hidden' name='action' value='start'>";
-            if (v.confirm.length() > 0)
-            {
-                html += "<p class=e>" + HTMLGenerator::htmlEscape(v.confirm) +
-                        "</p><label><input type='checkbox' name='confirm' value='" + String(v.confirmToken) +
-                        "'> I confirm</label> ";
-            }
-            html += "<button class=b>Update to v" + fwText(v.imageFw) + "</button></form>";
+            startForm(html, v, id);
+            addf(html, "<button class=b>Update to v%s</button></form>", fwText(v.imageFw).c_str());
         }
     }
     // Image store
@@ -1353,21 +1383,21 @@ static void addGen2OtaCard(String &html, const Gen2Sensor &g, const Gen2OtaView 
         snprintf(hw, sizeof(hw), "%04X", m.hwType);
         char sig[48];
         OtaImageSigned::stateText(m.signedKey, m.unknownKey, sig, sizeof(sig));
-        html += "<tr><td>0x" + String(hw) + "</td><td>v" + fwText(m.fw) + "</td><td>" + String(m.len) + " B</td><td" +
-                (m.isSigned() ? String(">") : String(" class=w>")) + sig + "</td><td><form method='post' action='/ota/delete' onsubmit='return confirm(\"Delete this image?\")'>"
-                "<input type='hidden' name='hw' value='" +
-                String(m.hwType) + "'><input type='hidden' name='devId' value='" + String(id) +
-                "'><button class=x>Delete</button></form></td></tr>";
+        addf(html,
+             "<tr><td>0x%s</td><td>v%s</td><td>%lu B</td><td%s%s</td><td><form method='post' action='/ota/delete' "
+             "onsubmit='return confirm(\"Delete this image?\")'><input type='hidden' name='hw' value='%u'><input "
+             "type='hidden' name='devId' value='%s'><button class=x>Delete</button></form></td></tr>",
+             hw, fwText(m.fw).c_str(), (unsigned long)m.len, m.isSigned() ? ">" : " class=w>", sig, m.hwType, id);
     }
     if (v.imageCount == 0)
     {
         html += "<tr><td colspan='5'>none</td></tr>";
     }
     html += "</table>";
-    html += "<form method='post' action='/ota/upload?devId=" + String(id) +
-            "' enctype='multipart/form-data'><p>Upload a sensor image (<code>firmware.bin</code> with the OTA "
-            "trailer, optionally signed): <input type='file' name='image' accept='.bin' required> "
-            "<button class=b>Upload</button></p></form>";
+    addf(html, "<form method='post' action='/ota/upload?devId=%s' enctype='multipart/form-data'><p>Upload a sensor "
+               "image (<code>firmware.bin</code> with the OTA trailer, optionally signed): <input type='file' "
+               "name='image' accept='.bin' required> <button class=b>Upload</button></p></form>",
+         id);
     // Or downloaded by the gateway (POST /ota/fetch, update mode); the
     // status is polled, then the page is loaded again with the result
     html += "<p>or from an https:// URL: <input id=fu placeholder='https://example.com/firmware.bin'> <button "
@@ -1376,17 +1406,16 @@ static void addGen2OtaCard(String &html, const Gen2Sensor &g, const Gen2OtaView 
     {
         html += "<p><small>Last download: " + HTMLGenerator::htmlEscape(v.fetchResult) + "</small></p>";
     }
-    html += "<script>function fe(){var u=fu.value.trim();u&&confirm('Update mode: MQTT and sensor reception pause "
-            "meanwhile. Continue?')&&fetch('/ota/fetch',{method:'POST',body:new URLSearchParams({url:u})}).then(r=>"
-            "r.text().then(t=>{if(!r.ok)throw Error(t);fp()})).catch(e=>fs.textContent=e.message)}function fp(){"
-            "fetch('/ota/fetch/status').then(r=>r.json()).then(d=>{/^[qd]/.test(d.state)?(fs.textContent=d.bytes+"
-            "' / '+d.total+' B',setTimeout(fp,1500)):location.href='/sensors/gen2?devId=" +
-            String(id) + "'}).catch(()=>setTimeout(fp,3000))}</script>";
-    html += String("<p><small>Signed images only: <strong>") + (v.signedOnly ? "on" : "off") +
-            "</strong> (Firmware page). " +
-            (v.signedOnly ? "Unsigned images are refused and cannot be started or resumed."
-                          : "Unsigned images are stored with a warning; a start needs a confirmation.") +
-            "</small></p></section>";
+    addf(html,
+         "<script>function fe(){var u=fu.value.trim();u&&confirm('Update mode: MQTT and sensor reception pause "
+         "meanwhile. Continue?')&&fetch('/ota/fetch',{method:'POST',body:new URLSearchParams({url:u})}).then(r=>"
+         "r.text().then(t=>{if(!r.ok)throw Error(t);fp()})).catch(e=>fs.textContent=e.message)}function fp(){"
+         "fetch('/ota/fetch/status').then(r=>r.json()).then(d=>{/^[qd]/.test(d.state)?(fs.textContent=d.bytes+"
+         "' / '+d.total+' B',setTimeout(fp,1500)):location.href='/sensors/gen2?devId=%s'}).catch(()=>setTimeout(fp,"
+         "3000))}</script><p><small>Signed images only: <strong>%s</strong> (Firmware page). %s</small></p></section>",
+         id, v.signedOnly ? "on" : "off",
+         v.signedOnly ? "Unsigned images are refused and cannot be started or resumed."
+                      : "Unsigned images are stored with a warning; a start needs a confirmation.");
 }
 
 
@@ -1453,13 +1482,14 @@ static const char *signalWord(int rssi)
     return rssi >= -95 ? "good" : rssi >= -110 ? "fair" : "weak";
 }
 
-// Name, (Simple) report interval and the delete button of a generation 2
-// sensor; Advanced sets the interval in the configuration card
+// Name, forward URL, (Simple) report interval and the delete button of a
+// generation 2 sensor; Advanced sets the interval in the configuration card
 static void addGen2EditForm(String &html, const Gen2Sensor &g, const String &id, bool simple)
 {
     html += "<form method=post action='/sensors/gen2/edit'><input type=hidden name=devId value=" + id +
             "><label for=name>Name</label><input id=name name=name maxlength=32 required value='" +
             HTMLGenerator::htmlEscape(g.name) + "'>";
+    addForwardUrl(html, g.customUrl, true);
     if (simple)
     {
         html += "<label for=interval>Report every (s)</label><input type=number id=interval name=interval min=" +
@@ -1488,8 +1518,8 @@ String HTMLGenerator::generateGen2DetailPage(const Gen2Sensor &g, const String &
     const unsigned long now = millis();
     if (!adv())
     {
-        // Simple: readings, name, interval, delete - no radio or security details
-        html.reserve(2560);
+        // Simple: readings, name, forward URL, interval, delete - no radio or security details
+        html.reserve(3584);
         addHtmlHeader(html, "Gen 2 sensor", Page::Sensors);
         html += "<section><h2>" + htmlEscape(g.name) + " <small>Gen 2 &middot; DevID " + String(id) + "</small></h2>";
         if (message.length() > 0)
@@ -1534,56 +1564,80 @@ String HTMLGenerator::generateGen2DetailPage(const Gen2Sensor &g, const String &
     html += "</td></tr>";
     if (g.hasFw)
     {
-        html += "<tr><td>Hardware / firmware</td><td>HW " + String(g.hwType) + ", FW " + String(g.fwMajor) + "." +
-                String(g.fwMinor) + "." + String(g.fwPatch) + "</td></tr>";
+        addf(html, "<tr><td>Hardware / firmware</td><td>HW %u, FW %u.%u.%u</td></tr>", g.hwType, g.fwMajor, g.fwMinor,
+             g.fwPatch);
     }
-    html += "<tr><td>Boot state</td><td>" + bootStateText(g.bootState) +
-            (g.blVersion ? " <small>(bootloader " + String(g.blVersion >> 4) + "." + String(g.blVersion & 0x0F) + ")</small>"
-                         : String("")) +
-            "</td></tr>";
+    html += "<tr><td>Boot state</td><td>" + bootStateText(g.bootState);
+    if (g.blVersion)
+    {
+        addf(html, " <small>(bootloader %u.%u)</small>", g.blVersion >> 4, g.blVersion & 0x0F);
+    }
+    html += "</td></tr>";
     if (g.seen)
     {
-        html += "<tr><td>Signal at the gateway</td><td>" + String(g.rssi) + " dBm, SNR " + String(g.snr, 1) +
-                " dB, " + String(g.freqError / 1000.0f, 1) + " kHz</td></tr>";
+        addf(html, "<tr><td>Signal at the gateway</td><td>%d dBm, SNR %.1f dB, %.1f kHz</td></tr>", g.rssi, g.snr,
+             g.freqError / 1000.0f);
     }
     html += "<tr><td>Link margin</td><td>uplink ";
-    html += link.upValid() ? String(link.upMargin()) + " dB <small>(" + linkSummary(link) + "; " +
-                                 String(link.upSamples) + " UPs)</small>"
-                           : String("&ndash; <small>(" + String(link.upSamples) + " of " +
-                                    String(Gen2Link::MIN_UP_SAMPLES) + " UPs needed)</small>");
+    if (link.upValid())
+    {
+        addf(html, "%d dB <small>(%s; %u UPs)</small>", (int)link.upMargin(), linkSummary(link).c_str(),
+             (unsigned)link.upSamples);
+    }
+    else
+    {
+        addf(html, "&ndash; <small>(%u of %u UPs needed)</small>", (unsigned)link.upSamples,
+             (unsigned)Gen2Link::MIN_UP_SAMPLES);
+    }
     html += ", downlink ";
-    html += link.downValid()
-                ? String(link.downMargin()) + " dB <small>(worst " + String(link.worstDown) + " dBm" +
-                      (link.downSnrSamples > 0 ? ", SNR &ge; " + String(link.worstDownSnr > 0 ? "+" : "") +
-                                                   String(link.worstDownSnr) + " dB"
-                                             : String("")) +
-                      ")</small>"
-                : String("&ndash; <small>(" + String(link.downSamples) + " of " +
-                         String(Gen2Link::MIN_DOWN_SAMPLES) + " reports needed)</small>");
-    html += link.lost > 0 ? "<br><span class=w>" + String(link.lost) +
-                                (link.lost == 1 ? " UP" : " UPs") + " lost in the window</span>"
-                          : String("<br><small>no UPs lost in the window</small>");
-    html += "<br><small>over the SF9 limits (" + String(Gen2Link::SENSITIVITY_DBM) + " dBm, SNR " +
-            String(Gen2Link::SNR_LIMIT_DB) + " dB), last 7 days / 20 UPs</small>";
+    if (link.downValid())
+    {
+        addf(html, "%d dB <small>(worst %d dBm", (int)link.downMargin(), (int)link.worstDown);
+        if (link.downSnrSamples > 0)
+        {
+            addf(html, ", SNR &ge; %s%d dB", link.worstDownSnr > 0 ? "+" : "", (int)link.worstDownSnr);
+        }
+        html += ")</small>";
+    }
+    else
+    {
+        addf(html, "&ndash; <small>(%u of %u reports needed)</small>", (unsigned)link.downSamples,
+             (unsigned)Gen2Link::MIN_DOWN_SAMPLES);
+    }
+    if (link.lost > 0)
+    {
+        addf(html, "<br><span class=w>%lu %s lost in the window</span>", (unsigned long)link.lost,
+             link.lost == 1 ? "UP" : "UPs");
+    }
+    else
+    {
+        html += "<br><small>no UPs lost in the window</small>";
+    }
+    addf(html, "<br><small>over the SF9 limits (%d dBm, SNR %d dB), last 7 days / 20 UPs</small>",
+         (int)Gen2Link::SENSITIVITY_DBM, (int)Gen2Link::SNR_LIMIT_DB);
     if (!recommendation.isEmpty())
     {
         html += "<br><small>" + recommendation + "</small>";
     }
     html += "</td></tr>";
-    html += "<tr><td>TX power (configured)</td><td>" + String(g.config.txPowerDbm) + " dBm";
+    addf(html, "<tr><td>TX power (configured)</td><td>%d dBm", g.config.txPowerDbm);
     if (txNow != g.config.txPowerDbm)
     {
-        html += " <small>(the sensor reports " + String(txNow) + " dBm)</small>";
+        addf(html, " <small>(the sensor reports %d dBm)</small>", txNow);
     }
     if (txNow > Gen2Config::EU_TX_POWER_DBM)
     {
         html += "<br><span class=e>" + txPowerWarning() + "</span>";
     }
     html += "</td></tr>";
-    html += "<tr><td>Session</td><td>" +
-            String(g.sessionUp ? "up, last FCnt " + String(g.lastFcnt) : String("none (the sensor joins or is answered with REJOIN)")) +
-            "</td></tr>";
-    html += "</table>";
+    if (g.sessionUp)
+    {
+        addf(html, "<tr><td>Session</td><td>up, last FCnt %lu</td></tr></table>", (unsigned long)g.lastFcnt);
+    }
+    else
+    {
+        html += "<tr><td>Session</td><td>none (the sensor joins or is answered with REJOIN)</td></tr></table>";
+    }
     if (g.lastUpLen > 0)
     {
         html += "<h3>Last uplink</h3><table>";
@@ -1608,50 +1662,46 @@ String HTMLGenerator::generateGen2DetailPage(const Gen2Sensor &g, const String &
     html += "<section><h2>Configuration</h2><p>";
     if (!g.sessionUp)
     {
-        html += "Configuration v" + String(g.cfgVersion) + " is sent with the next join.";
+        addf(html, "Configuration v%u is sent with the next join.", g.cfgVersion);
     }
     else if (inSync)
     {
-        html += "<span class=ok>Set</span> &ndash; the sensor runs v" + String(g.cfgVersion) + ".";
+        addf(html, "<span class=ok>Set</span> &ndash; the sensor runs v%u.", g.cfgVersion);
     }
     else
     {
-        html += "<span class=w>Waiting for the sensor</span> &ndash; v" + String(g.cfgVersion) +
-                " goes out with its next uplink (it reports v" + String(g.configVersion) + ").";
+        addf(html, "<span class=w>Waiting for the sensor</span> &ndash; v%u goes out with its next uplink (it reports v%u).",
+             g.cfgVersion, g.configVersion);
     }
-    html += "</p><form method='post' action='/sensors/gen2/config'>";
-    html += "<input type='hidden' name='devId' value='" + String(id) + "'>";
-    html += "<label for='interval'>Report interval (s, " + String(Gen2Config::MIN_INTERVAL_S) + "&ndash;" +
-            String(Gen2Config::MAX_INTERVAL_S) + "):</label>";
-    html += "<input type='number' id='interval' name='interval' min='" + String(Gen2Config::MIN_INTERVAL_S) +
-            "' max='" + String(Gen2Config::MAX_INTERVAL_S) + "' value='" + String(c.intervalS) + "' required>";
-    html += "<small>Below " + String(Gen2Config::DUTY_SAFE_INTERVAL_S) +
-            " s the sensor stretches the interval to its 0.1 % duty-cycle limit.</small>";
-    html += "<label for='slot'>Slot offset within the interval (s):</label>";
-    html += "<input type='number' id='slot' name='slot' min='0' max='" + String(Gen2Config::MAX_INTERVAL_S - 1) +
-            "' value='" + String(c.slotS) + "'>";
-    html += "<label for='txPower'>Sensor TX power (dBm, " + String(Gen2Config::MIN_TX_POWER_DBM) + " to " +
-            String(Gen2Config::MAX_TX_POWER_DBM) + ", default " + String(Gen2Config::DEFAULT_TX_POWER_DBM) +
-            "):</label>";
-    html += "<input type='number' id='txPower' name='txPower' min='" + String(Gen2Config::MIN_TX_POWER_DBM) +
-            "' max='" + String(Gen2Config::MAX_TX_POWER_DBM) + "' value='" + String(c.txPowerDbm) +
-            "' oninput='txWarn.hidden=this.value<=" + String(Gen2Config::EU_TX_POWER_DBM) + "'>";
-    html += "<p id=txWarn class=e" + String(c.txPowerDbm > Gen2Config::EU_TX_POWER_DBM ? "" : " hidden") + ">" +
-            txPowerWarning() + "</p>";
+    addf(html,
+         "</p><form method='post' action='/sensors/gen2/config'><input type='hidden' name='devId' value='%s'><label "
+         "for='interval'>Report interval (s, %u&ndash;%u):</label><input type='number' id='interval' name='interval' "
+         "min='%u' max='%u' value='%u' required><small>Below %u s the sensor stretches the interval to its 0.1 %% "
+         "duty-cycle limit.</small><label for='slot'>Slot offset within the interval (s):</label><input "
+         "type='number' id='slot' name='slot' min='0' max='%u' value='%u'>",
+         id, (unsigned)Gen2Config::MIN_INTERVAL_S, (unsigned)Gen2Config::MAX_INTERVAL_S,
+         (unsigned)Gen2Config::MIN_INTERVAL_S, (unsigned)Gen2Config::MAX_INTERVAL_S, (unsigned)c.intervalS,
+         (unsigned)Gen2Config::DUTY_SAFE_INTERVAL_S, (unsigned)(Gen2Config::MAX_INTERVAL_S - 1), (unsigned)c.slotS);
+    addf(html,
+         "<label for='txPower'>Sensor TX power (dBm, %d to %d, default %d):</label><input type='number' id='txPower' "
+         "name='txPower' min='%d' max='%d' value='%d' oninput='txWarn.hidden=this.value<=%d'><p id=txWarn class=e%s>",
+         (int)Gen2Config::MIN_TX_POWER_DBM, (int)Gen2Config::MAX_TX_POWER_DBM, (int)Gen2Config::DEFAULT_TX_POWER_DBM,
+         (int)Gen2Config::MIN_TX_POWER_DBM, (int)Gen2Config::MAX_TX_POWER_DBM, (int)c.txPowerDbm,
+         (int)Gen2Config::EU_TX_POWER_DBM, c.txPowerDbm > Gen2Config::EU_TX_POWER_DBM ? "" : " hidden");
+    html += txPowerWarning();
+    html += "</p>";
     if (!recommendation.isEmpty())
     {
         html += "<small>" + recommendation + "</small>";
     }
-    html += "<small>After a power change the sensor asks for an ACK on the next 2 uplinks and goes back to the "
-            "previous power if none arrives.</small>";
-    html += "<label for='ackEvery'>Request an ACK every N-th uplink (0 = never):</label>";
-    html += "<input type='number' id='ackEvery' name='ackEvery' min='0' max='255' value='" + String(c.ackEvery) + "'>";
-    html += "<label for='ackRetries'>Retries of confirmed reports (0&ndash;15):</label>";
-    html += "<input type='number' id='ackRetries' name='ackRetries' min='0' max='15' value='" +
-            String(c.ackRetries) + "'>";
-    html += "<label for='ackBackoff'>Retry backoff base (s, 1&ndash;15):</label>";
-    html += "<input type='number' id='ackBackoff' name='ackBackoff' min='1' max='15' value='" +
-            String(c.ackBackoffS) + "'>";
+    addf(html,
+         "<small>After a power change the sensor asks for an ACK on the next 2 uplinks and goes back to the previous "
+         "power if none arrives.</small><label for='ackEvery'>Request an ACK every N-th uplink (0 = never):</label>"
+         "<input type='number' id='ackEvery' name='ackEvery' min='0' max='255' value='%u'><label "
+         "for='ackRetries'>Retries of confirmed reports (0&ndash;15):</label><input type='number' id='ackRetries' "
+         "name='ackRetries' min='0' max='15' value='%u'><label for='ackBackoff'>Retry backoff base (s, "
+         "1&ndash;15):</label><input type='number' id='ackBackoff' name='ackBackoff' min='1' max='15' value='%u'>",
+         (unsigned)c.ackEvery, (unsigned)c.ackRetries, (unsigned)c.ackBackoffS);
     html += "<button>Save configuration</button></form></section>";
 
     // Status report
@@ -1665,51 +1715,57 @@ String HTMLGenerator::generateGen2DetailPage(const Gen2Sensor &g, const String &
     {
         html += "<p>No status report received yet.</p>";
     }
-    html += "<form method='post' action='/sensors/gen2/status'><input type='hidden' name='devId' value='" +
-            String(id) + "'>";
+    addf(html, "<form method='post' action='/sensors/gen2/status'><input type='hidden' name='devId' value='%s'>", id);
     html += g.statusRequested ? "<p>Requested &ndash; the sensor answers after its next uplink.</p>"
                               : "<button>Request status</button>";
     html += "</form></section>";
 
     // Downlink
-    html += "<section><h2>Downlink</h2><table>";
-    html += "<tr><td>Sent in RX1 / RX2</td><td>" + String(g.downRx1) + " / " + String(g.downRx2) + "</td></tr>";
-    html += "<tr><td>Not sent</td><td>" + String(g.downNotSent);
+    addf(html, "<section><h2>Downlink</h2><table><tr><td>Sent in RX1 / RX2</td><td>%lu / %lu</td></tr><tr><td>Not "
+               "sent</td><td>%lu",
+         (unsigned long)g.downRx1, (unsigned long)g.downRx2, (unsigned long)g.downNotSent);
     if (g.lastDownOutcome != 0xFF)
     {
-        html += " <small>(last response: " + String(RadioTask::txOutcomeName((TxOutcome)g.lastDownOutcome)) +
-                ")</small>";
+        addf(html, " <small>(last response: %s)</small>", RadioTask::txOutcomeName((TxOutcome)g.lastDownOutcome));
     }
-    html += "</td></tr>";
-    html += "<tr><td>No timed response possible</td><td>" + String(g.noSlot) + "</td></tr>";
-    html += "<tr><td>JOIN_ACC / REJOIN</td><td>" + String(g.joinAccepts) + " / " + String(g.rejoins) +
-            " <small>(" + String(g.joinLimited) + " held back by the 10 s limit)</small></td></tr>";
-    html += "<tr><td>DOWN with configuration</td><td>" + String(g.configDowns) + "</td></tr>";
+    addf(html,
+         "</td></tr><tr><td>No timed response possible</td><td>%lu</td></tr><tr><td>JOIN_ACC / REJOIN</td><td>%lu / "
+         "%lu <small>(%lu held back by the 10 s limit)</small></td></tr><tr><td>DOWN with configuration</td><td>%lu"
+         "</td></tr>",
+         (unsigned long)g.noSlot, (unsigned long)g.joinAccepts, (unsigned long)g.rejoins,
+         (unsigned long)g.joinLimited, (unsigned long)g.configDowns);
     if (g.downlinkRssi != INT8_MIN)
     {
-        html += "<tr><td>Downlink at the sensor</td><td>" + String(g.downlinkRssi) + " dBm, SNR " +
-                String(g.downlinkSnr / 4.0f, 2) + " dB</td></tr>";
+        addf(html, "<tr><td>Downlink at the sensor</td><td>%d dBm, SNR %.2f dB</td></tr>", g.downlinkRssi,
+             g.downlinkSnr / 4.0f);
     }
-    html += "<tr><td>Uplinks verified</td><td>" + String(g.upFrames) + " <small>(MIC failed " +
-            String(g.micFailures) + ", without session " + String(g.upWithoutSession) + ")</small></td></tr>";
-    html += "</table></section>";
+    addf(html,
+         "<tr><td>Uplinks verified</td><td>%lu <small>(MIC failed %lu, without session %lu)</small></td></tr></table>"
+         "</section>",
+         (unsigned long)g.upFrames, (unsigned long)g.micFailures, (unsigned long)g.upWithoutSession);
 
     // Join / devNonce
-    html += "<section><h2>Join</h2><table>";
-    html += "<tr><td>Last accepted devNonce</td><td>" + (g.hasDevNonce ? String(g.lastDevNonce) : String("none")) +
-            "</td></tr>";
-    html += "<tr><td>JOIN_REQ verified</td><td>" + String(g.joinRequests) + "</td></tr>";
-    html += "<tr><td>JOIN_REQ rejected: devNonce not above the last accepted one</td><td>" +
-            String(g.replayedJoins) + "</td></tr></table>";
+    char nonce[12] = "none";
+    if (g.hasDevNonce)
+    {
+        snprintf(nonce, sizeof(nonce), "%lu", (unsigned long)g.lastDevNonce);
+    }
+    addf(html,
+         "<section><h2>Join</h2><table><tr><td>Last accepted devNonce</td><td>%s</td></tr><tr><td>JOIN_REQ verified"
+         "</td><td>%lu</td></tr><tr><td>JOIN_REQ rejected: devNonce not above the last accepted one</td><td>%lu</td>"
+         "</tr></table>",
+         nonce, (unsigned long)g.joinRequests, (unsigned long)g.replayedJoins);
     if (g.staleJoinStreak >= 3)
     {
         html += "<p class=e>The sensor keeps joining with an old devNonce: it has probably lost "
                 "its configuration (reflashed with a full erase, damaged store). Reset the devNonce right before "
                 "restarting the sensor.</p>";
     }
-    html += "<form method='post' action='/sensors/gen2/resetnonce' onsubmit='return confirm(\"Accept the next join "
-            "of this sensor with any devNonce?\")'><input type='hidden' name='devId' value='" +
-            String(id) + "'><button class=x>Reset devNonce</button></form></section>";
+    addf(html,
+         "<form method='post' action='/sensors/gen2/resetnonce' onsubmit='return confirm(\"Accept the next join of "
+         "this sensor with any devNonce?\")'><input type='hidden' name='devId' value='%s'><button class=x>Reset "
+         "devNonce</button></form></section>",
+         id);
     if (ota)
     {
         addGen2OtaCard(html, g, *ota, id);
@@ -1761,10 +1817,10 @@ static String versionText(uint32_t v)
 }
 
 String HTMLGenerator::generateFirmwarePage(const String &updateStatus, bool signedOnly, const GatewayOta::View &gw,
-                                           const UpdateCheckView &c)
+                                           const UpdateCheckView &c, const AutoUpdate::View &au)
 {
     String html;
-    html.reserve(7680);
+    html.reserve(8704);
     addHtmlHeader(html, "Firmware", Page::Firmware);
     html += "<p id=msg class=w hidden></p>";
     // Update mode: the last session (while one runs, /firmware serves
@@ -1882,6 +1938,77 @@ String HTMLGenerator::generateFirmwarePage(const String &updateStatus, bool sign
                                      "</button> <small>(within " + left + ")</small>"
                                : "<p class=m>Only the login session that installed it can confirm it (within " +
                                      left + ").</p>";
+        html += "</section>";
+    }
+    // Automatic updates (Update/AutoUpdate.h): the switches and the window
+    // in both modes, the state details in Advanced
+    {
+        addf(html,
+                 "<section><h2>Automatic updates</h2><form method=post action='/firmware/auto'><input type=hidden name=f "
+                 "value=1><label class=c><input type=checkbox name=gw value=1%s> Gateway firmware</label><label "
+                 "class=c><input type=checkbox name=sn value=1%s> Sensor firmware</label><div class=g><div><label "
+                 "for=ws>Window from (hour)</label><input id=ws name=ws type=number min=0 max=23 value=%u></div><div>"
+                 "<label for=we>to (hour)</label><input id=we name=we type=number min=0 max=23 value=%u></div></div><p "
+                 "class=m>Only signed releases. Checked once a night inside the window (local time); sensors are "
+                 "updated one at a time.</p><button>Save</button></form>",
+                 au.s.gateway ? " checked" : "", au.s.sensors ? " checked" : "", au.s.startH, au.s.endH);
+        if (au.s.gateway || au.s.sensors)
+        {
+            html += "<p>";
+            if (!au.clockOk)
+            {
+                html += "Waiting for the time sync.";
+            }
+            else
+            {
+                html += au.next[0] ? "Next run: " : "No run planned.";
+                html += au.next;
+            }
+            if (au.last[0])
+            {
+                char when[20] = "";
+                const time_t t = au.lastAt;
+                struct tm tm;
+                localtime_r(&t, &tm);
+                if (au.lastAt)
+                {
+                    strftime(when, sizeof(when), " %Y-%m-%d %H:%M", &tm);
+                }
+                addf(html, "<br>Last run%s: %s", when, htmlEscape(au.last).c_str());
+            }
+            if (au.pendingGw)
+            {
+                addf(html, "<br>Gateway v%s waits for the window", versionText(au.pendingGw).c_str());
+            }
+            if (au.note[0])
+            {
+                addf(html, "%s%s", au.pendingGw ? " - " : "<br>", au.note);
+            }
+            html += "</p>";
+            if (adv())
+            {
+                html += "<p class=m>";
+                if (au.gwFails)
+                {
+                    addf(html, "Gateway v%s: %u of 3 failed automatic installs. ", versionText(au.gwVer).c_str(),
+                         au.gwFails);
+                }
+                if (au.s.sensors)
+                {
+                    const uint32_t id = au.job ? au.job : au.nextSensor;
+                    addf(html, "Sensors waiting for an update: %u", au.queue);
+                    if (id)
+                    {
+                        addf(html, ", %s %08lX", au.job ? "running" : "next", (unsigned long)id);
+                    }
+                    if (au.sensorNote[0])
+                    {
+                        addf(html, " (%s)", au.sensorNote);
+                    }
+                }
+                html += "</p>";
+            }
+        }
         html += "</section>";
     }
     html += "<section><h2>Upload</h2><form id=up><input type=file name=bin accept='.bin,application/octet-stream' "
@@ -2034,11 +2161,7 @@ String HTMLGenerator::generateSensorForm(const SensorData *s, int index)
                 (s ? String("placeholder='(unchanged)'") : String("required placeholder='DEADBEEF'")) +
                 "></div></div>";
     }
-    html += "<label for=customUrl>Forward to URL <small>(optional)</small></label><input id=customUrl name=customUrl "
-            "maxlength=200 placeholder='https://example.com/api?temp=*TEMP*&amp;hum=*HUM*' value='" +
-            (s ? htmlEscape(s->customUrl) : String("")) +
-            "'><p class=m>Placeholders: *TEMP* *HUM* *PRESS* *PPM* *LUX* *WIND_SPEED* *WIND_DIR* *RAIN* *DAILY_RAIN* "
-            "*RAIN_RATE* *BAT* *RSSI* *SN* *TYPE*</p>";
+    addForwardUrl(html, s ? s->customUrl : String(), false);
     if (s)
     {
         addCorrections(html, correctionsOf(s->qMask()), s->cal);

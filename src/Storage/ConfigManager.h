@@ -111,6 +111,10 @@ public:
     // take signed images only, whatever this says
     bool signedOnly = false;
 
+    // Automatic updates (S6, Preferences only): AutoUpdatePolicy::pack() of
+    // the two switches and the window; 0 = never set (both off, 02-05)
+    uint32_t autoUpdate = 0;
+
     // Web interface: Advanced (true) or Simple (default) - one setting for
     // everyone (config.json only)
     bool uiAdvanced = false;
@@ -171,6 +175,10 @@ public:
 
     // Set "signed images only"; false = not saved (the previous value is kept)
     bool setSignedOnly(bool on);
+
+    // Set the automatic updates (packed); false = not saved (the previous
+    // value is kept)
+    bool setAutoUpdate(uint32_t packed);
 
     // Set the web interface mode; false = not saved (the previous mode is kept)
     bool setUiAdvanced(bool advanced);

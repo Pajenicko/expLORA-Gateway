@@ -32,7 +32,7 @@ import explora_sigblock as sb  # noqa: E402
 import explora_manifest as em  # noqa: E402
 from gen_fixtures import gateway_image, sensor_image, write_key, c_array  # noqa: E402
 
-BASE = "https://example.com/explora/v1"
+BASE = "https://example.com/explora/v2"
 
 
 def tool(*args):

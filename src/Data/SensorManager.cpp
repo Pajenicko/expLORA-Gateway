@@ -23,6 +23,7 @@
 #include "SensorCalibration.h"
 #include "CalibrationJson.h"
 #include "SensorsJsonBudget.h"
+#include "ForwardUrl.h"
 static_assert(MAX_SENSORS == SensorsJson::MAX_GEN1, "SensorsJsonBudget.h: MAX_GEN1");
 static_assert(MAX_GEN2_SENSORS == SensorsJson::MAX_GEN2, "SensorsJsonBudget.h: MAX_GEN2");
 #include <ArduinoJson.h>
@@ -38,6 +39,8 @@ static_assert(MAX_GEN2_SENSORS == SensorsJson::MAX_GEN2, "SensorsJsonBudget.h: M
 #include "../Network/Uplink.h"
 #include "../Hardware/WatchdogPause.h"
 #include "../Hardware/HeapGuard.h"
+#include "../Update/AutoUpdatePolicy.h"
+#include "../Update/UpdateMode.h"
 
 // Constructor
 SensorManager::SensorManager(Logger &log, const char *file)
@@ -306,6 +309,34 @@ bool SensorManager::forwardSensorData(const SensorData &sensor)
         // No endpoint configured, nothing to do
         return true;
     }
+    // A forward without an answer less than 5 minutes ago: skipped (a dead
+    // URL would block the loop on every report)
+    if (fwdBackoff.skip(sensor.serialNumber, millis()))
+    {
+        return false;
+    }
+
+    // The placeholders (Data/ForwardUrl.h): only quantities with a current
+    // value - generation 2: carried by the UP being forwarded with a valid
+    // value (forwardGen2 puts ForwardUrl::gen2Valid into gen2QNow)
+    ForwardUrl::Values values;
+    values.valid = sensor.gen2 ? sensor.gen2QNow : sensor.qMask();
+    for (int q = 0; q < Qty::COUNT; q++)
+    {
+        values.v[q] = sensor.value((Qty::Id)q);
+    }
+    const String sn = sensor.idString();
+    values.sn = sn.c_str();
+    values.type = sensor.gen2 ? 0 : (unsigned)static_cast<uint8_t>(sensor.deviceType);
+    // Not on the loop stack (10 kB, the TLS handshake runs on it too); this
+    // runs on the loop task only
+    static char expanded[512];
+    if (ForwardUrl::expand(sensor.customUrl.c_str(), values, expanded, sizeof(expanded)) == 0)
+    {
+        logger.warning("Not forwarding data of sensor " + sensor.name + " - the URL with its values is too long");
+        return false;
+    }
+    const String url = expanded;
 
     // DNS has no timeout of its own and a TLS handshake can be slow; the
     // loop task stays off the watchdog for this request
@@ -320,64 +351,8 @@ bool SensorManager::forwardSensorData(const SensorData &sensor)
     http.setConnectTimeout(3000);
     http.setReuse(false);
 
-    // Format the custom URL by replacing placeholders
-    String url = sensor.customUrl;
-
-    // Skip if no URL is configured
-    if (url.length() == 0)
-    {
-        return true;
-    }
-
     // Check if HTTP or HTTPS
     bool isHttps = url.startsWith("https://");
-
-    // Process the URL - replace placeholders with actual values
-    if (sensor.hasTemperature())
-    {
-        url.replace("*TEMP*", String(sensor.temperature, 2));
-    }
-    if (sensor.hasHumidity())
-    {
-        url.replace("*HUM*", String(sensor.humidity, 2));
-    }
-    if (sensor.hasPressure())
-    {
-        url.replace("*PRESS*", String(sensor.pressure, 2));
-    }
-    if (sensor.hasPPM())
-    {
-        url.replace("*PPM*", String(sensor.ppm, 0));
-    }
-    if (sensor.hasLux())
-    {
-        url.replace("*LUX*", String(sensor.lux, 1));
-    }
-
-    // Added placeholders for METEO data
-    if (sensor.hasWindSpeed())
-    {
-        url.replace("*WIND_SPEED*", String(sensor.windSpeed, 1));
-    }
-    if (sensor.hasWindDirection())
-    {
-        url.replace("*WIND_DIR*", String(sensor.windDirection));
-    }
-    if (sensor.hasRainAmount())
-    {
-        url.replace("*RAIN*", String(sensor.rainAmount, 1));
-        url.replace("*DAILY_RAIN*", String(sensor.dailyRainTotal, 1)); // New placeholder
-    }
-    if (sensor.hasRainRate())
-    {
-        url.replace("*RAIN_RATE*", String(sensor.rainRate, 1));
-    }
-
-    // Replace other common placeholders
-    url.replace("*BAT*", String(sensor.batteryVoltage, 2));
-    url.replace("*RSSI*", String(sensor.rssi));
-    url.replace("*SN*", formatSN(sensor.serialNumber));
-    url.replace("*TYPE*", String(static_cast<uint8_t>(sensor.deviceType)));
 
     // Without the query: it may carry tokens (logs are shown on the web page)
     String urlForLog = url.indexOf('?') >= 0 ? url.substring(0, url.indexOf('?')) : url;
@@ -389,7 +364,15 @@ bool SensorManager::forwardSensorData(const SensorData &sensor)
         // A TLS session needs ~52 kB of the internal heap (HeapGuard.h)
         if (!HeapGuard::tlsFits(HeapGuard::tlsHeap()))
         {
-            logger.warning("Not forwarding to " + urlForLog + " - not enough memory for HTTPS");
+            // Logged at most every 10 minutes (it would repeat with every
+            // report while the memory is short, e.g. MQTT over TLS on the Pro)
+            static unsigned long lastWarnMs = 0;
+            if (lastWarnMs == 0 || millis() - lastWarnMs >= 10UL * 60 * 1000)
+            {
+                lastWarnMs = millis() | 1;
+                logger.warning("Not forwarding to " + urlForLog +
+                               " - not enough memory for HTTPS (next warning in 10 min)");
+            }
             return false;
         }
         secureClient.reset(new WiFiClientSecure());
@@ -405,21 +388,25 @@ bool SensorManager::forwardSensorData(const SensorData &sensor)
     // Send the request
     int httpCode = http.GET();
 
-    // Check result
+    // Check result. The body is not read: only the status matters, and an
+    // endpoint could send an unbounded (chunked) reply. No answer at all
+    // (DNS, connect, TLS, timeout - the requests that block for seconds):
+    // the sensor's forwards pause for 5 minutes
+    const bool ok = httpCode == HTTP_CODE_OK;
+    fwdBackoff.result(sensor.serialNumber, httpCode > 0, millis());
     if (httpCode > 0)
     {
         logger.debug("HTTP request sent, response code: " + String(httpCode));
-        // The body is not read: only the status matters, and an endpoint
-        // could send an unbounded (chunked) reply
     }
     else
     {
-        logger.warning("HTTP request failed: " + http.errorToString(httpCode));
+        logger.warning("Forward of sensor " + sensor.name + " failed (" + http.errorToString(httpCode) +
+                       ") - paused for 5 min");
     }
 
     http.end();
 
-    return (httpCode == HTTP_CODE_OK);
+    return ok;
 }
 
 // Update sensor configuration
@@ -568,6 +555,7 @@ static void gen2Row(const Gen2Sensor &g, SensorData &out)
     out.gen2 = true;
     out.serialNumber = g.devId;
     out.name = g.name;
+    out.customUrl = g.customUrl;
     out.gen2Q = g.qMask;
     out.gen2QNow = g.qNow;
     out.gen2QBad = g.qBad;
@@ -644,7 +632,7 @@ size_t SensorManager::readingCount(size_t *bytes) const
         {
             if (gen2[i].configured)
             {
-                b += textBytes(gen2[i].name);
+                b += textBytes(gen2[i].name) + textBytes(gen2[i].customUrl);
             }
         }
         *bytes = b;
@@ -679,6 +667,44 @@ bool SensorManager::takeGen2Mqtt(uint32_t &devId, bool &discover)
         }
     }
     return false;
+}
+
+bool SensorManager::forwardGen2()
+{
+    SensorData row;
+    {
+        std::lock_guard<std::mutex> lock(sensorMutex);
+        size_t i = 0;
+        while (i < gen2Count && !(gen2[i].configured && gen2[i].fwdDue))
+        {
+            i++;
+        }
+        if (i == gen2Count)
+        {
+            return false;
+        }
+        gen2[i].fwdDue = false;
+        gen2Row(gen2[i], row);
+        // Only the quantities of the UP being forwarded (still current)
+        row.gen2QNow = ForwardUrl::gen2Valid(gen2[i].fwdMask, gen2[i].qNow);
+        // Not while a sensor OTA job is starting or running (the request
+        // would block the timed OTA frames and responses): a queued start,
+        // Transfer, Swapping, Confirming. Waiting (no start out yet or the
+        // sensor has not accepted), Paused and Verified do not block
+        const OtaJob::State st = otaJobPtr ? otaJobPtr->state : OtaJob::State::None;
+        if (otaStartPending || st == OtaJob::State::Transfer || st == OtaJob::State::Swapping ||
+            st == OtaJob::State::Confirming)
+        {
+            return true; // dropped
+        }
+    }
+    // Not during an update-mode session (its TLS reserve), not offline;
+    // the request blocks the loop task like generation 1 (no lock held)
+    if (!UpdateMode::active() && uplink->isOnline())
+    {
+        forwardSensorData(row);
+    }
+    return true;
 }
 
 bool SensorManager::getSensorCopy(int index, SensorData &out) const
@@ -808,7 +834,7 @@ bool SensorManager::snapshotLocked(String &json)
     }
     for (size_t i = 0; i < gen2Count; i++)
     {
-        textSize += gen2[i].name.length() + 32 + 12; // + DevID, label and firmware version strings
+        textSize += gen2[i].name.length() + gen2[i].customUrl.length() + 1 + 32 + 12; // + DevID, label and firmware version strings
     }
     // Sized for the sensors present (one smaller block on a fragmented heap)
     DynamicJsonDocument doc(SensorsJson::writeCapacity(sensorCount, gen2Count, textSize));
@@ -861,6 +887,10 @@ bool SensorManager::snapshotLocked(String &json)
             JsonObject obj = gen2Array.createNestedObject();
             obj["devId"] = devId; // copied (char array)
             obj["name"] = g.name;
+            if (g.customUrl.length())
+            {
+                obj["customUrl"] = g.customUrl; // optional: an entry without it stays as before
+            }
             obj["label"] = label;
             if (g.hasDevNonce)
             {
@@ -894,6 +924,7 @@ bool SensorManager::snapshotLocked(String &json)
                 obj["revFw"] = g.revertedFw;
                 obj["revCrc"] = g.revertedCrc;
             }
+            AutoUpdatePolicy::writeAutoFail(obj, g.autoFailFw, g.autoFails);
             if (g.otaWatch.armed())
             {
                 JsonArray w = obj.createNestedArray("otaWatch");
@@ -1227,6 +1258,11 @@ int SensorManager::parseSensorsLocked(const String &fileContent, const char *pat
         g.configured = true;
         g.devId = devId;
         g.name = obj["name"] | "";
+        g.customUrl = obj["customUrl"] | "";
+        if (!ForwardUrl::valid(g.customUrl.c_str(), g.customUrl.length()))
+        {
+            g.customUrl = String(); // hand-edited: never sent
+        }
         memcpy(g.label, label, sizeof(label));
         if (obj.containsKey("devNonce"))
         {
@@ -1263,6 +1299,7 @@ int SensorManager::parseSensorsLocked(const String &fileContent, const char *pat
         g.hasReverted = obj.containsKey("revFw");
         g.revertedFw = obj["revFw"] | 0u;
         g.revertedCrc = obj["revCrc"] | 0u;
+        AutoUpdatePolicy::readAutoFail(obj, g.autoFailFw, g.autoFails);
         JsonArray w = obj["otaWatch"];
         if (!w.isNull() && w.size() == 5)
         {
@@ -1375,7 +1412,8 @@ bool SensorManager::isKnownGen2(uint32_t devId) const
     return findGen2Locked(devId) >= 0;
 }
 
-int SensorManager::addGen2Sensor(uint32_t devId, const uint8_t label[ep::kLabelKeyLen], const String &name)
+int SensorManager::addGen2Sensor(uint32_t devId, const uint8_t label[ep::kLabelKeyLen], const String &name,
+                                 const String &customUrl)
 {
     std::unique_lock<std::mutex> lock(sensorMutex);
     if (findGen2Locked(devId) >= 0)
@@ -1399,6 +1437,7 @@ int SensorManager::addGen2Sensor(uint32_t devId, const uint8_t label[ep::kLabelK
     g.configured = true;
     g.devId = devId;
     g.name = name;
+    g.customUrl = customUrl;
     memcpy(g.label, label, ep::kLabelKeyLen);
     Gen2Crypto::deriveJoinKeys(g);
     waiting.remove(devId);
@@ -1714,7 +1753,8 @@ bool SensorManager::handleGen2Frame(const RadioPacket &packet, const ep::FrameIn
         g.upDownlinkSnr = Gen2Link::NONE;
         OtaJob::Up ou;
         bool values = false;
-        const bool confirmed = Gen2Response::decodeUp(g, payload, payloadLen, nowMs, &ou, &values);
+        uint16_t fresh = 0;
+        const bool confirmed = Gen2Response::decodeUp(g, payload, payloadLen, nowMs, &ou, &values, &fresh);
         // Link history (spec 4.3): only while the sensor runs the desired
         // configuration, so the TX power of the sample is known
         if (Gen2Config::inSync(g.configVersion, g.cfgVersion))
@@ -1726,6 +1766,13 @@ bool SensorManager::handleGen2Frame(const RadioPacket &packet, const ep::FrameIn
         // MQTT only for an UP with readings (a status report or OTA status
         // alone would re-send the same values)
         g.mqttDue = g.mqttDue || values;
+        // Forward to URL: only an UP with a valid reading, and only what it
+        // carried (an older value of a quantity it left out is not sent)
+        if (g.customUrl.length() > 0 && ForwardUrl::gen2Due(fresh))
+        {
+            g.fwdDue = true;
+            g.fwdMask = fresh;
+        }
         if (g.qMask != qBefore)
         {
             scheduleGen2SaveLocked(nowMs); // the reported quantities are kept ("q")
@@ -1843,7 +1890,7 @@ int SensorManager::setGen2Config(uint32_t devId, const Gen2Config::Values &value
 }
 
 int SensorManager::setGen2Edit(uint32_t devId, const String *name, const SensorCalibration::Set *cal,
-                               const Gen2Config::Values *config)
+                               const Gen2Config::Values *config, const String *customUrl)
 {
     std::unique_lock<std::mutex> lock(sensorMutex);
     int i = findGen2Locked(devId);
@@ -1852,7 +1899,7 @@ int SensorManager::setGen2Edit(uint32_t devId, const String *name, const SensorC
         return -1;
     }
     Gen2Sensor &g = gen2[i];
-    const String oldName = g.name;
+    const String oldName = g.name, oldUrl = g.customUrl;
     const SensorCalibration::Set oldCal = g.cal;
     const Gen2Config::Values oldConfig = g.config;
     int changed = 0;
@@ -1860,6 +1907,11 @@ int SensorManager::setGen2Edit(uint32_t devId, const String *name, const SensorC
     {
         changed |= GEN2_EDIT_NAME;
         g.name = *name;
+    }
+    if (customUrl != nullptr && g.customUrl != *customUrl)
+    {
+        changed |= GEN2_EDIT_URL;
+        g.customUrl = *customUrl;
     }
     if (cal != nullptr && memcmp(g.cal.v, cal->v, sizeof(cal->v)) != 0)
     {
@@ -1895,7 +1947,7 @@ int SensorManager::setGen2Edit(uint32_t devId, const String *name, const SensorC
     }
     else
     {
-        snprintf(line, sizeof(line), "Generation 2 sensor %s: name / corrections saved (from the next uplink)",
+        snprintf(line, sizeof(line), "Generation 2 sensor %s: name / URL / corrections saved (from the next uplink)",
                  g.name.c_str());
     }
     logger.info(line);
@@ -1911,6 +1963,7 @@ int SensorManager::setGen2Edit(uint32_t devId, const String *name, const SensorC
     {
         Gen2Sensor &r = gen2[i];
         r.name = oldName;
+        r.customUrl = oldUrl;
         r.cal = oldCal;
         if (changed & GEN2_EDIT_CONFIG)
         {

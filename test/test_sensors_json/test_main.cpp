@@ -40,7 +40,7 @@ static std::string uniq(char fill, size_t len, size_t i)
 // members per entry and arrays of arrayLen (a newer firmware's file)
 static std::string buildFull(size_t extra, size_t arrayLen, bool &overflowed)
 {
-    // Longest values: name 32, URL 200, devId 8, label 16, fw "255.255.255"
+    // Longest values: name 32, URL 200 (both generations), devId 8, label 16, fw "255.255.255"
     size_t text = 0;
     for (size_t i = 0; i < MAX_GEN1; i++)
     {
@@ -48,7 +48,7 @@ static std::string buildFull(size_t extra, size_t arrayLen, bool &overflowed)
     }
     for (size_t i = 0; i < MAX_GEN2; i++)
     {
-        text += 32 + 32 + 12;
+        text += 32 + 200 + 1 + 32 + 12; // + the forward URL (S7)
     }
     size_t cap = SensorsJson::writeCapacity(MAX_GEN1, MAX_GEN2, text);
     if (extra)
@@ -88,6 +88,7 @@ static std::string buildFull(size_t extra, size_t arrayLen, bool &overflowed)
         snprintf(devId, sizeof(devId), "%08X", (unsigned)(0x4776B800u + i));
         o[std::string("devId")] = std::string(devId);
         o[std::string("name")] = uniq('M', 32, i);
+        o[std::string("customUrl")] = "https://" + uniq('v', 192, i); // S7
         o[std::string("label")] = uniq('L', 16, i);
         o[std::string("devNonce")] = 4294967295u;
         o[std::string("interval")] = 86400;
@@ -120,6 +121,9 @@ static std::string buildFull(size_t extra, size_t arrayLen, bool &overflowed)
         {
             a.add(4294967295u);
         }
+        JsonArray f = o.createNestedArray(std::string("autoFail"));
+        f.add(4294967295u);
+        f.add(255);
         for (size_t x = 0; x < extra; x++)
         {
             o[std::string("future") + std::to_string(x)] = 1;
@@ -151,7 +155,7 @@ static void test_full_configuration_fits_write_and_read(void)
 static void test_file_with_extra_members_loads(void)
 {
     bool overflowed = true;
-    std::string file = buildFull(4, 8, overflowed); // 21 / 33 members, arrays of 8
+    std::string file = buildFull(4, 8, overflowed); // 21 / 35 members, arrays of 8
     TEST_ASSERT_FALSE(overflowed);
     size_t factor = 0;
     TEST_ASSERT_TRUE(load(file, factor) == SensorsJson::Load::Ok);

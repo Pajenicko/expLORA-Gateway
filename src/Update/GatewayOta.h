@@ -59,6 +59,7 @@
 #include "../Data/Logging.h"
 #include "GatewayImage.h"
 #include "Manifest.h"
+#include "UpdateState.h"
 
 #include <esp_partition.h>
 
@@ -95,6 +96,10 @@ bool installRefused(String &why);
 // confirmation is dropped and erased
 void signedOnlyOn();
 
+// An image waits for the admin's confirmation (any task, no lock): the
+// automatic install defers (it would drop it)
+bool waitingConfirm();
+
 // Update check (S5): a downloaded manifest (Update/Manifest.h load():
 // signature, rules, replay floor = the highest seq accepted so far, kept
 // in /update/state.json); when it is accepted, its seq is stored if it is
@@ -104,6 +109,12 @@ Manifest::Result checkManifest(const char *file, size_t len, const Manifest::Lim
                                char *why, size_t whyCap);
 // The result of the last update check (Firmware page, /diag/heap)
 void recordCheck(const String &text);
+
+// Automatic updates (S6): their record in /update/state.json ("auto").
+// false: the state cannot be read now (out unchanged)
+bool autoRecord(UpdateState::Auto &out);
+// Stores it (in RAM even if the save fails; false then, logged)
+bool setAutoRecord(const UpdateState::Auto &a);
 
 struct Result;
 
@@ -128,6 +139,8 @@ public:
     // Done with the slot (conclude() calls it): the next writer may start
     void release();
     bool active() const { return handle_ != 0; }
+    // write() refused the image's header (another board, not an ESP32 image)
+    bool headRefused() const { return headRefused_; }
     uint64_t received() const { return received_; }
     const esp_partition_t *partition() const { return part_; }
 
@@ -148,6 +161,7 @@ private:
     std::unique_ptr<State> st_;
 
     bool owns_ = false; // holds the install slot (one writer at a time)
+    bool headRefused_ = false;
     bool writeFlash(const uint8_t *data, size_t len, String &error);
 };
 
@@ -194,6 +208,7 @@ struct View
 };
 View view(uint64_t session);
 
-// /diag/heap "update" object
-void printDiagJson(Print &out);
+// /diag/heap "update" object; extra (may be nullptr) prints more members
+// (",\"auto\":{...}") before it is closed
+void printDiagJson(Print &out, void (*extra)(Print &) = nullptr);
 } // namespace GatewayOta

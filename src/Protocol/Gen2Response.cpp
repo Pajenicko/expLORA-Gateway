@@ -139,11 +139,13 @@ bool buildDown(Gen2Sensor &g, uint32_t upFcnt32, bool ackRequested, bool confirm
     return true;
 }
 
-bool decodeUp(Gen2Sensor &g, const uint8_t *payload, size_t len, unsigned long nowMs, OtaJob::Up *ota, bool *values)
+bool decodeUp(Gen2Sensor &g, const uint8_t *payload, size_t len, unsigned long nowMs, OtaJob::Up *ota, bool *values,
+              uint16_t *fresh)
 {
     bool confirmed = false;
     bool pressure = false;  // a valid pressure in this UP (converted to the altitude below)
     bool hasValues = false; // a measured quantity (valid or invalid) in this UP
+    uint16_t freshMask = 0; // ... with a valid value
     g.value[Qty::Rssi] = g.rssi; // of this frame (set by the caller)
     g.qMask |= Qty::mask(Qty::Rssi);
     g.qNow |= Qty::mask(Qty::Rssi);
@@ -239,7 +241,7 @@ bool decodeUp(Gen2Sensor &g, const uint8_t *payload, size_t len, unsigned long n
         }
         // Corrected here, so the pages, /api and MQTT all see it; an invalid
         // value (sentinel) makes the quantity missing until the next value
-        const Gen2Values::Decoded d = Gen2Values::apply(g, t);
+        const Gen2Values::Decoded d = Gen2Values::apply(g, t, &freshMask);
         if (d != Gen2Values::Decoded::None)
         {
             hasValues = true;
@@ -271,6 +273,10 @@ bool decodeUp(Gen2Sensor &g, const uint8_t *payload, size_t len, unsigned long n
     if (values != nullptr)
     {
         *values = hasValues;
+    }
+    if (fresh != nullptr)
+    {
+        *fresh = freshMask;
     }
     return confirmed;
 }
