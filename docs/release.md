@@ -224,6 +224,86 @@ their keys, names, forward URLs and corrections) are unchanged, the
 interface starts in Simple mode, automatic updates are off, and the
 first **Check now** reads the 2.x manifest.
 
+## 7a. Lite partition layout (from 2.0.1)
+
+The Lite build uses layout v2 (`partitions/lite_8MB_v2.csv`, two 2752K app
+slots); units with layout v1 (1984K slots, firmware up to 2.0.0) migrate in
+place after 2.0.1 is validated (`docs/protocol-v2.md` §15.8). Rules for
+releases:
+
+- **2.0.1 steps**: sections 1-4 as usual (the manifest names
+  `gw-pro-2.0.1.bin`, `gw-lite-2.0.1.bin` and the current sensor files,
+  `--seq auto --prev <BASE>/packages.json`, i.e. above the published 100),
+  then the webflash files below, then the 1.x path.
+- **Size limit**: `explora_manifest.py build` refuses a Lite gateway file
+  above 1984K (`RELEASE_GATEWAY_MAX["lite"] = 0x1F0000`), because units
+  that are still on v1 (not yet on 2.0.1, a failed or skipped migration,
+  an unknown table) refuse a larger file as "larger than the OTA slot" -
+  the automatic update would count that as a strike and give the version
+  up. The gateway itself checks against its real slot (2752K once
+  migrated). **Raising it later** (an owner decision): only when the fleet
+  is on 2.0.1 or newer and migrated - e.g. after one or two releases that
+  all fit 1984K, and after the 1.x path (`explora-gw-lite-autoupdate.json`)
+  offers a 2.0.1+ release; then set `RELEASE_GATEWAY_MAX["lite"]` to
+  `0x2B0000` (one commit with a note in the release notes: "Lite units
+  that were never migrated must install 2.0.1 first / use the full
+  webflash image"). Never above the v2 slot. The limit covers more than
+  the manifest - two paths are not checked by any tool (the PlatformIO
+  build's own size check now allows 2752K for the Lite) and stay at or
+  below 1984K until no v1 unit is left:
+
+  - the **webflash update variant** (app at 0x10000 + `boot_app0.bin`): an
+    app above 1984K written at 0x10000 of a v1 unit runs past old app0
+    into old app1 at 0x200000 - the bootloader refuses ota_0 ("image
+    doesn't fit the partition"), ota_1 is damaged, and the unit starts
+    again only from a full image over USB. Above 1984K, webflash offers
+    the Lite only as the full image (v2 table).
+  - the **1.x JSON** (`explora-gw-lite-autoupdate.json`): every unit that
+    reads it runs 1.x and is on v1, so the file it names must fit 1984K
+    (point it at the last release that does, or at 2.0.1).
+
+- **Webflash full image** (Lite): bootloader at 0x0 (the framework's,
+  `.pio/build/lite/bootloader.bin`, unchanged), the **v2** table
+  (`.pio/build/lite/partitions.bin`, identical to
+  `gen_esp32part.py partitions/lite_8MB_v2.csv`) at 0x8000, `boot_app0.bin`
+  at 0xE000, the signed `gw-lite-<VER>.bin` at 0x10000, gaps 0xFF (the
+  merged file is 0x10000 + the app size). Like every full image written
+  without an erase it wipes the NVS (admin password, "Signed images only",
+  automatic update switches); `config.json` / `sensors.json` stay. A full
+  image of an older version (1.2.0 / 2.0.0 full) writes the v1 table back.
+- **Webflash update variant** (Lite): unchanged pattern - the app at
+  0x10000, then `boot_app0.bin` at 0xE000, no erase. On a v1 unit 2.0.1
+  starts from app0 without a rollback state and migrates at its first start
+  (only the table step: the write itself < 0.1 s, ~2 s with the restart);
+  on a v2 unit nothing changes. A Lite still on the table from before
+  2025-08-17 (one 3 MB app, no OTA slots) is classified unknown and stays
+  as it is ("partition layout unknown - no migration" on the
+  Firmware page): it gets v2 only from the full image.
+- **1.x path**: point `explora-gw-lite-autoupdate.json` to the 2.0.1 file
+  (section 5, same steps and backup): a 1.2.0 unit installs it into the
+  other slot, validates it (2 minutes) and migrates.
+- **Rollback / downgrade**: the migration removes the previous firmware;
+  after it there is no rollback target until the next install validates.
+  A crashing later release still rolls back to the running one as before
+  (both v2 slots are normal OTA slots). A manual downgrade to 2.0.0 or
+  1.2.0 on a migrated unit works (bench 2026-10-28: both installed by
+  upload, ran on v2 with all settings, and went back to 2.0.1 by upload);
+  the table stays v2.
+- **Table write failure**: if the v2 table does not read back, 2.0.1
+  writes v1 back and stays on it ("migration failed (table write)", not
+  tried again by 2.0.1). If even the v1 write-back fails (a failing flash),
+  the unit does not restart: the Firmware page shows "TABLE WRITE FAILED -
+  restarts blocked", restarts and installs are refused with that reason,
+  and the v1 write-back is retried every 10 minutes (at most 36 times);
+  once it succeeds everything works again (layout v1). Do not power such a
+  unit off before that; if it was reset anyway (watchdog, crash, power) and
+  does not start, write the full image over USB.
+
+Checks after a 2.0.1 release (in addition to section 7): the log shows
+"Partition layout migrated to v2 (2752K slots)" once, the Firmware page
+shows "partition layout v2 (2752K slots)", `/diag/heap` `update.layout` is
+"v2 (2752K slots)"; a unit that stays on v1 shows why ("not migrated: ...").
+
 ## 8. Key rotation / loss
 
 The firmware carries two key slots (`ReleaseKeys.h`; 2.0.0: slot 0 =

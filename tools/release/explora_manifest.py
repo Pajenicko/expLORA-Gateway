@@ -97,6 +97,14 @@ VERSION_RE = re.compile(r"([0-9]+)\.([0-9]+)\.([0-9]+)", re.ASCII)
 HW_RE = re.compile(r"[0-9A-F]{4}", re.ASCII)
 SHA_RE = re.compile(r"[0-9a-f]{64}", re.ASCII)
 BOARD_KEY = {sb.TARGET_PRO: "pro", sb.TARGET_LITE: "lite"}
+# Release rule (not a gateway rule - the gateway checks the size against its
+# own slot): the largest gateway file a release may offer per board. The
+# Lite stays at the 1984K slot of partition layout v1 while units with that
+# layout may still exist: from firmware 2.0.1 on they migrate to layout v2
+# (2752K slots) after the update, but a unit on 1.x / 2.0.0 that installs a
+# larger file refuses it (larger than its slot). Raising "lite" to 0x2B0000:
+# docs/release.md, "Lite partition layout".
+RELEASE_GATEWAY_MAX = {"pro": 0x400000, "lite": 0x1F0000}
 
 
 class ManifestError(Exception):
@@ -410,6 +418,9 @@ def cmd_build(a):
             k = BOARD_KEY[target]
             if k in gateway:
                 die(f"{f}: a second gateway file for the {k} board")
+            if entry["size"] > RELEASE_GATEWAY_MAX[k]:
+                die(f"{f}: {entry['size']} B - more than the {k} release limit {RELEASE_GATEWAY_MAX[k]} B "
+                    "(the app slot units in the field still have)")
             gateway[k] = entry
         else:
             k = f"{target:04X}"

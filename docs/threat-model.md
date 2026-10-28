@@ -1,4 +1,4 @@
-# Threat model - firmware updates (gateway 2.0.0)
+# Threat model - firmware updates (gateway 2.0.0, 2.0.1)
 
 Scope: how gateway firmware and sensor images reach a gateway and its
 generation 2 sensors (signed files, the package manifest, update mode,
@@ -175,6 +175,25 @@ Gateway images, activation, validation
 - A firmware whose version text is not maj.min.pat (development builds)
   sends every verified image through the confirmation, gets no automatic
   install and reports a false rollback for its own automatic install.
+
+Lite partition layout migration (2.0.1, `docs/protocol-v2.md` §15.8)
+- The firmware rewrites the partition table at 0x8000 once (layout v1 ->
+  v2). A power loss during that sector write (< 0.1 s) can leave the
+  unit unbootable; recovery needs USB (full image). Accepted by the owner:
+  rare, local, no attacker control over the timing beyond physical access.
+  A flash that fails the write and also the write-back of v1 leaves the
+  table sector undefined: the firmware then refuses every restart it
+  decides itself and retries the write-back every 10 minutes; a watchdog
+  reset or a crash in that state still needs USB.
+- Any firmware that can run on the gateway can rewrite the table (the
+  flash driver's table protection is bypassed in the same way an attacker's
+  firmware could); this adds nothing to what installed firmware can already
+  do (no secure boot, see above).
+- The migration drops the rollback image: right after it there is no
+  previous firmware to fall back to until the next install validates.
+- Only exactly the known v1 table is acted on (MD5 and every entry
+  checked); an unknown or damaged table is left alone, a failed table
+  write is reverted to v1 and not retried by that firmware version.
 
 Update mode
 - LoRa paused and MQTT held during every update session; heavy pages 503;

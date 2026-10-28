@@ -13,6 +13,8 @@
 #define BOARD_MANIFEST_KEY "lite"
 // Board id in a gateway signature block (Security/SigBlock.h: 1 Pro, 2 Lite)
 #define BOARD_SIGN_TARGET 2
+// Partition layout v1 -> v2 at boot (Update/LayoutMigration.h)
+#define LAYOUT_MIGRATION 1
 
 // Radio chip: RFM95W = SX1276
 #define RADIO_SX1276

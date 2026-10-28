@@ -130,6 +130,10 @@ private:
 // A constant text: nothing is allocated, so the answer cannot fail open
 const char *wouldRefuse(Reason reason = Reason::None);
 
+// Any task: a restart now would interrupt an upload or a sensor OTA job in
+// Transfer, Swapping or Confirming (or a queued start of one)
+bool restartWouldInterrupt();
+
 // Any task: a session is active (from the start of enter() to the end of leave())
 bool active();
 

@@ -22,6 +22,7 @@
 #include "Liveness.h"
 #include "LivenessPolicy.h"
 #include "RadioTask.h"
+#include "../Update/LayoutMigration.h"
 #include <atomic>
 #include <esp_attr.h>
 #include <esp_system.h>
@@ -83,8 +84,21 @@ void onRestartStuck(TimerHandle_t)
     abort();
 }
 
-[[noreturn]] void restartFor(uint32_t what, uint32_t age)
+// Returns only while a restart is refused (LayoutMigration::restartRefusal(),
+// printed once)
+void restartFor(uint32_t what, uint32_t age)
 {
+    if (const char *held = LayoutMigration::restartRefusal())
+    {
+        static bool printed = false;
+        if (!printed)
+        {
+            printed = true;
+            esp_rom_printf("\nLiveness: %s made no progress for %u ms - not restarting: %s\n", whatName(what),
+                           (unsigned)age, held);
+        }
+        return;
+    }
     restartMagic = RESTART_MAGIC;
     restartWhat = what;
     restartAgeMs = age;

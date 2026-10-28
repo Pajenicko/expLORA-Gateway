@@ -1938,7 +1938,8 @@ Failed / Aborted, Retry. While a job is in Transfer the sensor's "last heard"
 ### 14.7 Resources
 
 - **Gateway LittleFS**: Lite 1.31 MB (partition `spiffs` 0x150000 in
-  `partitions/huge_app_littlefs.csv`), Pro 8.06 MB (0x7E0000 in
+  `partitions/huge_app_littlefs.csv`, the same in layout v2
+  `partitions/lite_8MB_v2.csv`, §15.8), Pro 8.06 MB (0x7E0000 in
   `pro_16MB.csv`); today it holds only small files (`config.json`,
   `sensors.json` / `.bak`, `ncsi.txt`). One image ≤ 112 kB per HW type plus
   the upload temporary file: ≤ 4 types × 112 kB + 112 kB = 560 kB on the Lite.
@@ -2215,9 +2216,11 @@ exactly its size and SHA-256, Verified, its HW type and version.
 Automatic paths (§15.6) take Verified only, whatever **Signed images only**
 says.
 
-Size limits: a gateway file is at most the OTA slot (the manifest format
-allows up to 4 MiB for any board); a sensor file 512 B .. 114,816 B (image
-plus block).
+Size limits: a gateway file is at most the OTA slot the gateway writes
+(its real partition size: Pro 4096K, Lite 1984K with layout v1 and 2752K
+with layout v2, §15.8; the manifest format allows up to 4 MiB for any
+board); a sensor file 512 B .. 114,816 B (image plus block). The release
+tool keeps its own, lower per-board limit (§15.8).
 
 ### 15.4 Package manifest
 
@@ -2387,3 +2390,123 @@ atomically; unknown fields are dropped by the firmware that writes it.
 An unreadable file starts a new state (its `seq` salvaged when possible);
 the automatic updates wait for a readable record (retried every 5 minutes,
 one warning per hour).
+
+### 15.8 Lite partition layout v2 and its migration (gateway 2.0.1)
+
+Firmware up to 2.0.0 ran the Lite (8 MB flash) with **layout v1**
+(`partitions/huge_app_littlefs.csv`): two app slots of 1984K. From 2.0.1
+the Lite uses **layout v2** (`partitions/lite_8MB_v2.csv`); the Pro is
+unchanged.
+
+| Partition | v1 offset / size | v2 offset / size |
+|---|---|---|
+| nvs | 0x9000 / 0x5000 | same |
+| otadata | 0xE000 / 0x2000 | same |
+| app0 (ota_0) | 0x10000 / 0x1F0000 (1984K) | 0x10000 / 0x2B0000 (2752K) |
+| app1 (ota_1) | 0x200000 / 0x1F0000 | 0x550000 / 0x2B0000 (2752K) |
+| coredump | 0x3F0000 / 0x10000 | same |
+| spiffs (LittleFS) | 0x400000 / 0x150000 | same |
+| littlefs (never mounted) | 0x550000 / 0xB0000 | dropped |
+
+0x2C0000-0x3F0000 (1216K) is not declared: nothing writes it, and a later
+layout can use it without moving data (a declared reserve partition would
+protect nothing more - no firmware writes undeclared space either). Every
+firmware mounts only the partition labelled `spiffs` (`LittleFS.begin()`
+with the default label; checked in 1.1.13, 1.2.0 and 2.0.0), so settings, `sensors.json`, `/update/state.json`, sensor
+images and the NVS (password, switches) are untouched by the migration.
+
+**Migration** (`src/Update/LayoutMigration.{h,cpp}`, the rules in
+`src/Update/PartitionTable.h`, Lite build only). At every start, before the
+network, the radio and the web server (so no update session, upload,
+sensor job or install can write the flash meanwhile), the firmware reads
+the table at 0x8000 (entries and MD5 entry) and classifies it: exactly v1,
+exactly v2, Pro, unknown (valid MD5, other entries) or damaged (bad magic,
+bad MD5, no MD5 entry). A table without an MD5 entry is never acted on; it
+does not get that far anyway: the prebuilt framework is built with
+`CONFIG_PARTITION_TABLE_MD5=y` and on the bench refused such a table at
+start ("No MD5 found in partition table", `load_partitions` 0x105), so the
+firmware found no partition and did not start. Only exactly v1 on a chip
+with at least 8 MB (physical and configured) is migrated; anything else is
+left as it is (logged, `/diag/heap` `update.layout`). This includes the
+Lite table used before 2025-08-17 (one 3 MB app, no second slot): it is
+classified unknown, such a unit cannot install over the air at all and
+gets v2 only from the full webflash image (a webflash *update* of 2.0.1
+leaves it on its table: "partition layout unknown - no migration").
+Steps, each started only after a progress marker (`/update/layout.txt`) was
+written and read back:
+
+1. The running image must be validated: while it is PENDING_VERIFY
+   (the 120 s after an install) nothing happens; once it is validated and
+   the gateway is idle (no update session, upload, install, image waiting
+   for a confirmation, sensor job in Transfer..Confirming), the gateway
+   restarts ("Firmware validated - restarting for the partition layout
+   migration"). The same wait applies when the install record names an
+   activated image in the other slot (a rollback, or an activation that
+   did not start, is reported at this start): the Copy or Table step would
+   overwrite or drop that slot first, so it runs at the restart after the
+   record is settled (not at all in a run where the record could not be
+   saved).
+2. **Copy** (only when running from v1 app1, 0x200000 - v2 app0 covers it):
+   the running image (its verified length) is copied into v1 app0, read
+   back byte for byte, verified as an image and made the boot partition
+   (`esp_ota_set_boot_partition`, state NEW); restart. The bootloader
+   starts the copy as PENDING_VERIFY.
+3. **Accept**: running from app0 as PENDING_VERIFY with a copy marker, and
+   app0 holds exactly the image of the validated app1: marked valid at once
+   (`esp_ota_mark_app_valid_cancel_rollback`; it is the image that was
+   validated); the install record moves from app1 to app0. If it does not
+   match, the image is validated normally (120 s) first.
+4. **Table** (running from app0, otadata selects app0): the v2 table is
+   written at 0x8000 (sector erase + write, the bytes after the table kept),
+   read back and compared byte for byte (MD5 entry included); on a mismatch
+   once more, then the v1 table is written back, the layout stays v1 and
+   this firmware version does not try again (marker `fail <version>`).
+   If the v1 table cannot be written back either (5 attempts; only a
+   failing flash gets here) the firmware does not restart: it runs on from
+   its copy of the table in RAM, refuses every restart it decides itself
+   (heap fragmentation, liveness, update-mode restore, installs and their
+   activation, the automatic updates, restarts from the web UI - each
+   refusal names the reason) and writes the v1 table back again every 10
+   minutes (at most 36 times); once it reads back intact the restarts are
+   allowed again. The Firmware page and `/diag/heap` (`update.layout`
+   "... TABLE WRITE FAILED ...", `update.restartsBlocked`) show it. A task
+   watchdog or a crash still resets the chip (they cannot be held); if
+   that happens before the write-back succeeds, or the retries run out,
+   the unit needs a full image over USB.
+   otadata is left as it is: it selects app0, which is ota_0 at 0x10000 in
+   both tables, so the bootloader starts the same image and its VALID state
+   and the install record stay. Restart.
+5. First start on v2: "Partition layout migrated to v2 (2752K slots): the
+   previous firmware (rollback image) is gone ..." is logged once (the
+   marker is removed); `/diag/heap` `update.layout` and the Firmware page
+   show "v2 (2752K slots)".
+
+The prebuilt framework has `CONFIG_SPI_FLASH_DANGEROUS_WRITE_ABORTS`
+(`esp_flash_write` to the table region would `abort()`): the table write
+calls the normal `esp_flash_erase_region` / `esp_flash_write` with the
+default chip's OS hooks copied and only their `region_protected` check
+removed for that one call (the driver's cache, interrupt and other-CPU
+handling stay). The bootloader is not changed; it reads the table at
+0x8000 at every start and accepts v2 like any table (verified on the
+bench, never written at 0x0).
+
+**Consequences**: the migration drops the previous firmware - after it,
+the flash holds only the running firmware (no rollback target until the
+next install). Each step is repeated after a reset (the copy at most 3
+times, the table step at most 3 times, then given up for this version: a
+later firmware tries again). The only unsafe moment is the table sector
+write itself (< 0.1 s, power loss there accepted: the unit may not
+start any more and is recovered with a full image over USB / webflash),
+plus the flash-failure case above (the v1 table cannot be written back).
+Measured on the bench: copy ~11 s, accept ~1.3 s, table write < 0.1 s, the
+whole migration including the restarts ~20 s after the validation.
+
+**Other firmware on v2**: 2.0.0 and 1.2.0 run on layout v2 (they find
+their partitions by type and label; slots and LittleFS as above, verified
+by installing both on a migrated unit); their images must still fit 1984K
+of course. A full webflash image of 2.0.0 or 1.x writes the v1 table back
+(then a later 2.0.1+ migrates again); the update variant (app at 0x10000 +
+`boot_app0.bin`) keeps v2. A unit that stays on v1 (unknown table, failed
+migration, firmware older than 2.0.1) keeps 1984K slots: the release tool
+therefore offers Lite images only up to 1984K until the owner decides to
+raise it (`docs/release.md`, "Lite partition layout").

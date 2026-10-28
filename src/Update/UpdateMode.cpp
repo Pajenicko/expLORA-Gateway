@@ -23,6 +23,7 @@
 #include "../Hardware/RadioTask.h"
 #include "../Hardware/WatchdogPause.h"
 #include "../Network/Uplink.h"
+#include "LayoutMigration.h"
 #include "../Protocol/MQTTManager.h"
 
 extern Logger logger;
@@ -245,6 +246,8 @@ void abortEnter(const String &why)
     restore(true, "aborted: " + why);
 }
 
+} // namespace
+
 // Something a restart now would break
 bool restartWouldInterrupt()
 {
@@ -257,7 +260,6 @@ bool restartWouldInterrupt()
     OtaJob::State job = sensorManager ? sensorManager->otaJobState(pending) : OtaJob::State::None;
     return UpdateModePolicy::restartWouldInterrupt(busy, job, pending);
 }
-} // namespace
 
 bool enter(Reason reason, size_t extraHeap, String &error, uint32_t &gen)
 {
@@ -498,6 +500,12 @@ void process()
                            String((nowMs - watch.leftAt) / 60000) +
                            " min after the session - restart deferred while an upload or a sensor OTA job runs");
         }
+    }
+    else if (a == After::Reboot && LayoutMigration::restartRefusal())
+    {
+        watch.armed = false;
+        logger.error("Update mode: " + interfacesText(missing) + " not back " + String(RESTORE_LIMIT_MS / 60000) +
+                     " min after the session - not restarting: " + LayoutMigration::restartRefusal());
     }
     else if (a == After::Reboot)
     {

@@ -511,6 +511,29 @@ class Tools(unittest.TestCase):
         doc["sensor"] = {"00a3": doc["sensor"]["0001"]}
         self.assertEqual(em.check_json(doc)[1], ["sensor.00a3 (HW type key)"])
 
+    def test_manifest_release_slot_limit(self):
+        """Lite gateway files above the v1 slot (1984K) are refused by the release
+        tool even though the gateway format allows 4 MB (layout v1 units remain)."""
+        import explora_manifest as em
+        self.assertEqual(em.RELEASE_GATEWAY_MAX["lite"], 0x1F0000)
+        self.assertEqual(em.RELEASE_GATEWAY_MAX["pro"], 0x400000)
+        limit = em.RELEASE_GATEWAY_MAX["lite"]
+        r, ok = self.sign(gateway_image(chip=9, size=limit - 128), "--board", "lite", name="l1.bin", out="gw-lite-2.1.3.bin")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(read(ok)), limit)
+        r, _ = self.build([ok], out="ok.json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r, big = self.sign(gateway_image(chip=9, size=limit - 127), "--board", "lite", name="l2.bin", out="gw-lite-2.1.4.bin")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r, _ = self.build([big], out="big.json")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("release limit", r.stderr)
+        # The same size is fine for the Pro
+        r, pro = self.sign(gateway_image(size=limit - 127), "--board", "pro", name="p.bin", out="gw-pro-2.1.4.bin")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r, _ = self.build([pro], out="pro.json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
     def test_manifest_rules_mirror_the_gateway(self):
         """check_json as src/Update/Manifest.h (the native test_manifest
         corpus checks the firmware against the same function)."""

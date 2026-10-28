@@ -69,6 +69,18 @@ namespace GatewayOta
 // the running image (rollback, new firmware waiting for validation)
 void begin(Logger &logger);
 
+// setup(), before begin(): the running image was copied from slot "from"
+// into slot "to" by the layout migration (Update/LayoutMigration.h) and
+// runs there validated - the install record follows it (else begin() would
+// drop it as describing another slot)
+void runningMoved(const char *from, const char *to);
+
+// The install record names an activated image in a slot that does not run
+// (begin() reports it: a rollback, or an activation that did not start), or
+// a save of the record failed in this run (the file may still name one).
+// The layout migration defers its steps until it is settled
+bool activationElsewhere();
+
 // loop(), every pass: validation of a new firmware, expiry of an image
 // waiting for its confirmation
 void process(bool webUp, bool healthy);

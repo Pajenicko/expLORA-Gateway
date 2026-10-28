@@ -26,6 +26,7 @@
 #include "../Web/WebServer.h"
 #include "../config.h"
 #include "GatewayOta.h"
+#include "LayoutMigration.h"
 #include "UpdateCheck.h"
 #include "UpdateMode.h"
 
@@ -288,7 +289,9 @@ const char *sensorStep(const Settings &s, const Clock &c, View &v)
 void runNight(const Settings &s, const Clock &c, int32_t d, View &v)
 {
     const Defer df = sessionDefer(webPortal->autoActivity());
-    const char *why = df != Defer::None ? deferText(df) : UpdateMode::wouldRefuse(UpdateMode::Reason::Scheduled);
+    const char *why = df != Defer::None                        ? deferText(df)
+                      : LayoutMigration::restartRefusal()      ? LayoutMigration::restartRefusal()
+                                                               : UpdateMode::wouldRefuse(UpdateMode::Reason::Scheduled);
     Outcome o = Outcome::Deferred;
     String result;
     if (why)

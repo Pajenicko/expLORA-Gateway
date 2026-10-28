@@ -60,6 +60,28 @@ The gateway receives data from various wireless sensors via LoRa, processes the 
   - JSON and CSV formats
   - Query parameters for filtering
 
+## Release notes 2.0.1
+
+- **Lite: larger firmware slots.** The Lite's flash is re-partitioned in
+  place from two 1984K firmware slots to two 2752K slots (layout v2,
+  `partitions/lite_8MB_v2.csv`; `docs/protocol-v2.md` §15.8). It happens
+  by itself shortly after 2.0.1 has been installed and validated (about
+  2 minutes after the install the gateway restarts a few times within
+  ~20 s). Settings, sensors, the admin password and all files stay. **The
+  previous firmware is removed by it** (no rollback to the version that was
+  installed before 2.0.1). Do not cut the power while it runs; if a unit
+  does not start any more after a power cut at that moment, install the
+  full image over USB (webflash). The Firmware page shows the layout
+  ("partition layout v2 (2752K slots)").
+- 2.0.0 and 1.2.0 still run on a migrated Lite (a downgrade keeps the new
+  layout); a full webflash image of an older version writes the old
+  layout back, and 2.0.1 migrates again.
+- A Lite flashed before 2025-08-17 (one firmware slot, no over-the-air
+  updates) is not re-partitioned by 2.0.1 (Firmware page: "partition
+  layout unknown - no migration"); it gets the new layout from the full
+  webflash image.
+- The Pro is unchanged apart from the version number.
+
 ## Release notes 2.0.0
 
 2.0.0 is the protocol generation 2 release. Coming from 1.x, everything

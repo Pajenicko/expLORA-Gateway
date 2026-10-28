@@ -1,0 +1,15 @@
+# expLORA Gateway Lite - 8 MB flash, partition layout v2 (firmware 2.0.1+)
+# nvs, otadata, coredump and spiffs keep the offsets and sizes of layout v1
+# (partitions/huge_app_littlefs.csv), so settings and files survive the
+# in-place migration (src/Update/LayoutMigration.h). app1 takes the place of
+# the unused "littlefs" partition. 0x2C0000-0x3F0000 (1216K) is left
+# undeclared on purpose (reserve; nothing writes it).
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0x9000,   0x5000,
+otadata,    data, ota,     0xE000,   0x2000,
+# Two OTA slots of 2752K
+app0,       app,  ota_0,   0x10000,  0x2B0000,
+coredump,   data, coredump,0x3F0000, 0x10000,
+# Filesystem: LittleFS.begin() mounts the partition labelled "spiffs"
+spiffs,     data, spiffs,  0x400000, 0x150000,
+app1,       app,  ota_1,   0x550000, 0x2B0000,

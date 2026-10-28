@@ -32,6 +32,7 @@
 #include "../Hardware/FlashPermit.h"
 #include "../Security/Sha256.h"
 #include "../config.h"
+#include "LayoutMigration.h"
 #include "UpdateState.h"
 
 namespace GatewayOta
@@ -393,6 +394,10 @@ String activateLocked(const esp_partition_t *part, GatewayImage::Class cls, uint
     {
         return "no OTA partition";
     }
+    if (const char *held = LayoutMigration::restartRefusal())
+    {
+        return String("not activated: ") + held;
+    }
     loadLocked();
     UpdateState::Image p;
     p.set = true;
@@ -609,6 +614,37 @@ void begin(Logger &logger)
     }
 }
 
+void runningMoved(const char *from, const char *to)
+{
+    std::lock_guard<std::mutex> lock(mtx);
+    loadLocked();
+    if (stateLoaded && state.running.set && strcmp(state.running.part, from) == 0)
+    {
+        UpdateState::copyText(state.running.part, sizeof(state.running.part), to);
+        saveLocked();
+    }
+}
+
+bool activationElsewhere()
+{
+    std::lock_guard<std::mutex> lock(mtx);
+    loadLocked();
+    if (saveFailed)
+    {
+        return true;
+    }
+    if (!stateLoaded || !state.pending.set)
+    {
+        return false;
+    }
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *pp =
+        state.pending.part[0]
+            ? esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_ANY, state.pending.part)
+            : nullptr;
+    return !(pp && running && pp->address == running->address);
+}
+
 void process(bool webUp, bool healthy)
 {
     if (waitingFlag)
@@ -693,6 +729,11 @@ String validationRefusal()
 
 bool installRefused(String &why)
 {
+    if (const char *held = LayoutMigration::restartRefusal())
+    {
+        why = held;
+        return true;
+    }
     if (validationPending())
     {
         why = validationRefusal();
@@ -1317,7 +1358,9 @@ void printDiagJson(Print &out, void (*extra)(Print &))
             first = false;
         }
     }
-    out.print("]");
+    out.print("],\"layout\":");
+    jsonText(out, LayoutMigration::text());
+    out.print(LayoutMigration::restartRefusal() ? ",\"restartsBlocked\":true" : ",\"restartsBlocked\":false");
     if (extra)
     {
         extra(out);

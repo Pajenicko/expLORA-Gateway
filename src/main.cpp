@@ -48,6 +48,7 @@
 #include "Hardware/HeapGuard.h"
 #include "Security/VersionMarker.h"
 #include "Update/UpdateMode.h"
+#include "Update/LayoutMigration.h"
 #include "Update/GatewayOta.h"
 #include "Update/AutoUpdate.h"
 
@@ -229,6 +230,9 @@ void setup()
     }
     Liveness::logLastRestart(logger);
     UpdateMode::logLastRestart(logger);
+    // Partition table (Lite: layout v1 -> v2 migration, may restart), before
+    // the install record it may move (Update/LayoutMigration.h)
+    LayoutMigration::begin();
     // Gateway firmware install record: rollback, validation of a new firmware
     GatewayOta::begin(logger);
     AutoUpdate::begin(); // after the install record (its "auto" part)
@@ -389,6 +393,8 @@ void loop()
         }
         GatewayOta::process(webPortal && webPortal->started(), healthy);
     }
+    // Lite: restart for the partition layout migration once validated
+    LayoutMigration::process();
 
     // Process MQTT communication (settings changes are applied even offline)
     if (mqttManager)
@@ -466,6 +472,7 @@ void loop()
     static unsigned long lowBlockSince = 0;
     static unsigned long healthySince = 0;
     static bool fragGaveUp = false;
+    static bool fragHeldLogged = false;
     size_t largest8 = HeapGuard::usable().largest;
     bool tlsSessionUp = mqttManager && mqttManager->isConnected() && mqttManager->usesTls();
     if (largest8 < 8192)
@@ -479,6 +486,15 @@ void loop()
         {
             lowBlockSince = millis() | 1;
             logger.warning("Heap fragmented: largest free block " + String(largest8) + " B");
+        }
+        else if (millis() - lowBlockSince > 900000 && LayoutMigration::restartRefusal())
+        {
+            if (!fragHeldLogged)
+            {
+                fragHeldLogged = true;
+                logger.error("Heap fragmented for 15 minutes - not restarting: " +
+                             String(LayoutMigration::restartRefusal()));
+            }
         }
         else if (millis() - lowBlockSince > 900000 && heapFragRestarts < FRAG_RESTARTS_MAX)
         {

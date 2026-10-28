@@ -48,6 +48,7 @@
 #include "../Update/SensorFetch.h"
 #include "../Update/UpdateCheck.h"
 #include "../Update/AutoUpdate.h"
+#include "../Update/LayoutMigration.h"
 #include "../Data/ForwardUrl.h"
 #include <sys/time.h>
 #include <atomic>
@@ -631,6 +632,11 @@ void WebPortal::handleClient()
         sensorManager.applyTimezone(tz); // setenv/tzset, keeps today's rain totals
     }
 
+    if (restartRequested && (long)(millis() - restartAt) >= 0 && LayoutMigration::restartRefusal())
+    {
+        restartRequested = false;
+        logger.error(String("Deferred restart refused: ") + LayoutMigration::restartRefusal());
+    }
     if (restartRequested && (long)(millis() - restartAt) >= 0)
     {
         logger.info("Deferred restart firing now");
@@ -1073,6 +1079,14 @@ void WebPortal::handleConfigPost(AsyncWebServerRequest *request)
         return;
     }
 
+    if (const char *held = LayoutMigration::restartRefusal())
+    {
+        request->send(200, "text/html",
+                      HTMLGenerator::generateNoticePage(
+                          "Saved", String("The WiFi settings are saved but the gateway does not restart: ") + held + ".",
+                          30, "/"));
+        return;
+    }
     request->send(200, "text/html",
                   HTMLGenerator::generateNoticePage("Saved", "The WiFi settings are saved - the gateway restarts.",
                                                     10, "/"));
@@ -2469,6 +2483,15 @@ void WebPortal::handleAPI(AsyncWebServerRequest *request)
 void WebPortal::handleReboot(AsyncWebServerRequest *request)
 {
     logger.info("HTTP request: GET /reboot - Rebooting device");
+    if (const char *held = LayoutMigration::restartRefusal())
+    {
+        logger.error(String("Restart from the web UI refused: ") + held);
+        request->send(409, "text/html",
+                      HTMLGenerator::generateNoticePage("Not restarting",
+                                                        String("The gateway does not restart: ") + held + ".", 30,
+                                                        "/firmware"));
+        return;
+    }
 
     request->send(200, "text/html",
                   HTMLGenerator::generateNoticePage("Restarting", "The gateway restarts - this page reloads in 10 s.",
@@ -2852,6 +2875,15 @@ void WebPortal::handleNetworkPost(AsyncWebServerRequest *request)
         return;
     }
 
+    if (const char *held = LayoutMigration::restartRefusal())
+    {
+        request->send(200, "text/html",
+                      HTMLGenerator::generateNoticePage(
+                          "Saved", String("Saved, but the gateway does not restart (the change applies at the next start): ") +
+                                       held + ".",
+                          30, "/network"));
+        return;
+    }
     String html = "The gateway restarts in a few seconds.";
 #if defined(HAS_ETHERNET)
     if (section == "ethernet" && configManager.ethStatic)

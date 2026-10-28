@@ -32,6 +32,7 @@
 #include "../Hardware/RadioTask.h"
 #include "../Data/TimeZones.h"
 #include "../Protocol/OtaImageSigned.h"
+#include "../Update/LayoutMigration.h"
 #include "WebAssets.h"
 #include "ApiRow.h"
 #include "../Protocol/Gen2Values.h"
@@ -1830,7 +1831,19 @@ String HTMLGenerator::generateFirmwarePage(const String &updateStatus, bool sign
         html += "<section><h2>Update mode</h2><p>" + htmlEscape(updateStatus) + "</p></section>";
     }
     html += "<section><h2>Firmware</h2><p>Version <b>v" FIRMWARE_VERSION "</b> <small>(installed: " +
-            htmlEscape(gw.runningSig) + ")</small></p>";
+            htmlEscape(gw.runningSig) +
+#ifdef LAYOUT_MIGRATION
+            "; partition layout " + htmlEscape(LayoutMigration::text()) +
+#endif
+            ")</small></p>";
+#ifdef LAYOUT_MIGRATION
+    if (const char *held = LayoutMigration::restartRefusal())
+    {
+        html += String("<p class=e>Restarts and installs are blocked: ") + held +
+                ". The table is written back every 10 minutes; do not power the gateway off until this message "
+                "is gone.</p>";
+    }
+#endif
     if (gw.validating && gw.validateFailed)
     {
         html += "<p class=e>Validation failed (it could not be marked valid) - the next restart rolls back to the "
