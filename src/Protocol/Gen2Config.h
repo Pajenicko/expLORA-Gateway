@@ -43,6 +43,9 @@ struct Values
 {
     uint16_t intervalS = 600;
     uint16_t slotS = 0;
+    // The slot offset was never set by the admin: slotS follows the DevID
+    // (autoSlot, resolveSlot) - also after an interval change
+    bool slotAuto = true;
     int8_t txPowerDbm = DEFAULT_TX_POWER_DBM;
     uint8_t ackEvery = 6;
     uint8_t ackRetries = 3;
@@ -50,7 +53,7 @@ struct Values
 
     bool operator==(const Values &o) const
     {
-        return intervalS == o.intervalS && slotS == o.slotS && txPowerDbm == o.txPowerDbm &&
+        return intervalS == o.intervalS && slotS == o.slotS && slotAuto == o.slotAuto && txPowerDbm == o.txPowerDbm &&
                ackEvery == o.ackEvery && ackRetries == o.ackRetries && ackBackoffS == o.ackBackoffS;
     }
     bool operator!=(const Values &o) const { return !(*this == o); }
@@ -80,6 +83,46 @@ inline bool clamp(Values &v)
     return in == v;
 }
 
+// Default slot offset (spec 4.2, gateway 2.0.2): derived from the DevID, so
+// two sensors with the same interval do not transmit in the same second
+// (before, every sensor got slot 0). Stable and deterministic: a mix of the
+// 32 DevID bits (murmur3 finalizer) modulo the interval, always < interval.
+// Sensors with the same interval still meet with a chance of about 1 in
+// the interval per pair; the admin can set a slot by hand.
+inline uint16_t autoSlot(uint32_t devId, uint16_t intervalS)
+{
+    if (intervalS == 0)
+    {
+        return 0;
+    }
+    uint32_t h = devId;
+    h ^= h >> 16;
+    h *= 0x85EBCA6Bu;
+    h ^= h >> 13;
+    h *= 0xC2B2AE35u;
+    h ^= h >> 16;
+    return (uint16_t)(h % intervalS);
+}
+
+// slotS of an automatic slot follows the DevID and the interval (call after
+// clamp and after every interval change); an explicit slot stays as it is
+inline void resolveSlot(Values &v, uint32_t devId)
+{
+    if (v.slotAuto)
+    {
+        v.slotS = autoSlot(devId, v.intervalS);
+    }
+}
+
+// Is a slot stored by firmware before 2.0.2 (no "slotAuto" in sensors.json)
+// automatic? Those firmwares wrote the default 0 for every sensor whose slot
+// the admin never changed; a non-zero slot was set by the admin. An admin
+// who wanted exactly 0 sets it again (the form then stores it as explicit).
+inline bool legacySlotAuto(uint16_t slotS)
+{
+    return slotS == 0;
+}
+
 // Gateway versions are 1-15 (0 = the sensor reverted or has none). The
 // next version never equals the one the sensor reports, so 15 changes while
 // it is offline cannot wrap back to a number it already runs.
@@ -97,6 +140,26 @@ inline uint8_t nextVersion(uint8_t v, uint8_t reported)
 inline bool validVersion(uint8_t v)
 {
     return v >= 1 && v <= 15;
+}
+
+// At load: an automatic slot that moves (an entry stored with the old
+// default 0, or by firmware before 2.0.2) is a configuration change, so it
+// gets a new version. lastRun = the version the sensor last reported
+// (sensors.json "cfgRun", else the stored desired version): since the last
+// save the sensor can only have moved to the desired version, so the new
+// number differs from both and the sensor never counts as in sync with a
+// configuration it did not get. Returns true when the slot (and the
+// version) changed.
+inline bool resolveSlotAtLoad(Values &v, uint32_t devId, uint8_t &cfgVersion, uint8_t lastRun)
+{
+    const uint16_t stored = v.slotS;
+    resolveSlot(v, devId);
+    if (v.slotS == stored)
+    {
+        return false;
+    }
+    cfgVersion = nextVersion(cfgVersion, lastRun);
+    return true;
 }
 
 // The sensor runs the desired configuration

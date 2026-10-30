@@ -114,6 +114,7 @@ private:
     void otaScheduleSaveLocked(unsigned long nowMs);
     void otaApplyLocked(Gen2Sensor &g, const OtaJob::Result &r, const OtaJob::Up &u, unsigned long nowMs);
     OtaJob::Down otaOnUpLocked(Gen2Sensor &g, OtaJob::Up &u, unsigned long nowMs);
+    OtaJob::Down otaOnUpJobLocked(Gen2Sensor &g, OtaJob::Up &u, unsigned long nowMs);
     bool otaSaveJob();
     void otaRunStart();
     void otaBuildFrame(unsigned long nowMs);

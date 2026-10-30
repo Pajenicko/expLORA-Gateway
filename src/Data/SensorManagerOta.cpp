@@ -420,6 +420,32 @@ void SensorManager::otaApplyLocked(Gen2Sensor &g, const OtaJob::Result &r, const
 
 OtaJob::Down SensorManager::otaOnUpLocked(Gen2Sensor &g, OtaJob::Up &u, unsigned long nowMs)
 {
+    const OtaJob::Down d = otaOnUpJobLocked(g, u, nowMs);
+    // After the job (a revert in this UP writes the record first; it never
+    // comes with boot state 2): the record of a version that now runs
+    // confirmed ends, persisted (spec 14.5)
+    if (g.hasReverted && OtaJob::confirmedRunning(g.revertedFw, u, g.bootState))
+    {
+        logger.info("Generation 2 sensor " + g.name + ": v" + versionText(g.revertedFw) +
+                    " runs confirmed - the record \"reverted on this sensor before\" is cleared");
+        g.hasReverted = false;
+        g.revertedFw = 0;
+        g.revertedCrc = 0;
+        scheduleGen2SaveLocked(nowMs);
+    }
+    // The revert watch only on a status report: after a reinstall of the
+    // running version the stored boot state may still be the CONFIRMED of
+    // the image before the swap, and a JOIN_REQ brings the same version
+    if (g.otaWatch.armed() && u.hasStatus && OtaJob::confirmedRunning(g.otaWatchFw, u, g.bootState))
+    {
+        g.otaWatch.clear(); // that image can no longer revert
+        scheduleGen2SaveLocked(nowMs);
+    }
+    return d;
+}
+
+OtaJob::Down SensorManager::otaOnUpJobLocked(Gen2Sensor &g, OtaJob::Up &u, unsigned long nowMs)
+{
     u.curFw = g.hasFw ? g.fwVersion() : 0;
     if (!otaJobPtr || otaJobPtr->devId != g.devId)
     {
@@ -958,6 +984,18 @@ SensorManager::OtaCheck SensorManager::otaCheckStart(uint32_t devId, bool reques
             c.confirm += "This image reverted on this sensor before. ";
         }
     }
+    // A sensor with the development identity (JOIN_REQ caps bit 4, sensor
+    // 1.0.1+) cannot run an image that needs a provisioned identity (spec 14.5)
+    if (meta.valid && (g.caps & ep::kCapDevIdentity) && OtaImage::needsProvisionedIdentity(meta.flags, meta.isSigned()))
+    {
+        c.confirm += ep::ota::imageIdentity(meta.flags) == ep::ota::kImageIdentityProvisioned
+                         ? "The sensor runs a development identity (no identity record) and this image needs a "
+                           "provisioned one: the sensor will refuse to install it after the transfer. Provision it "
+                           "first (never during a transfer). "
+                         : "The sensor runs a development identity (no identity record) and this signed release "
+                           "image needs a provisioned one: it would reset at its first start and be reverted after "
+                           "three boots. ";
+    }
     // Signature (M4c S2): an unsigned image (incl. one signed with a key this
     // firmware does not know) needs the admin's confirmation; with "Signed
     // images only" on it cannot be started at all (it may have been stored
@@ -1224,6 +1262,7 @@ size_t SensorManager::otaAutoSensors(AutoUpdatePolicy::SensorInfo *out, size_t m
         s.fw = g.fwVersion();
         s.hasReverted = g.hasReverted;
         s.revertedFw = g.revertedFw;
+        s.devIdentity = g.caps & ep::kCapDevIdentity;
         s.failFw = g.autoFailFw;
         s.fails = g.autoFails;
     }

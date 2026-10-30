@@ -93,11 +93,13 @@ static std::string buildFull(size_t extra, size_t arrayLen, bool &overflowed)
         o[std::string("devNonce")] = 4294967295u;
         o[std::string("interval")] = 86400;
         o[std::string("slot")] = 86399;
+        o[std::string("slotAuto")] = false; // 2.0.2
         o[std::string("txPower")] = -9;
         o[std::string("ackEvery")] = 255;
         o[std::string("ackRetries")] = 15;
         o[std::string("ackBackoff")] = 15;
         o[std::string("cfgVersion")] = 65535;
+        o[std::string("cfgRun")] = 15; // 2.0.2, only while not in sync
         o[std::string("q")] = 65535;
         const char *cal[] = {"temperatureCorrection", "humidityCorrection", "pressureCorrection", "ppmCorrection",
                              "luxCorrection", "windSpeedCorrection", "windDirectionCorrection",
@@ -155,7 +157,7 @@ static void test_full_configuration_fits_write_and_read(void)
 static void test_file_with_extra_members_loads(void)
 {
     bool overflowed = true;
-    std::string file = buildFull(4, 8, overflowed); // 21 / 35 members, arrays of 8
+    std::string file = buildFull(4, 8, overflowed); // 21 / 37 members, arrays of 8
     TEST_ASSERT_FALSE(overflowed);
     size_t factor = 0;
     TEST_ASSERT_TRUE(load(file, factor) == SensorsJson::Load::Ok);

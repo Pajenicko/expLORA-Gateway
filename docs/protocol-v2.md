@@ -123,7 +123,7 @@ retransmissions, uses a new FCnt (§7).
 | 7 | 4 | devNonce |
 | 11 | 2 | HW type (as in the image trailer, 0x0003 = lorasen v3 core) |
 | 13 | 3 | firmware version major, minor, patch |
-| 16 | 1 | capabilities: bit 0 class C, bit 1 RX2, bits 2–3 OTA transfer version received (0 none; M4b, §14.2) |
+| 16 | 1 | capabilities: bit 0 class C, bit 1 RX2, bits 2–3 OTA transfer version received (0 none; M4b, §14.2), bit 4 development identity (sensor 1.0.1+, §14.12) |
 | 17 | 1 | config version (low 4 bits) |
 | 18 | 4 | MIC (K_join_mic) |
 
@@ -301,6 +301,28 @@ the old radio parameters and old version, and the gateway resends.
 - Slot: when the sensor has the time, it sends at unix times t with
   t mod interval = slot offset (never sooner than its duty-cycle gap);
   without the time it simply sleeps one interval.
+- **Default slot offset (gateway 2.0.2):** a slot the admin never set is
+  *automatic*: derived from the DevID, `Gen2Config::autoSlot` = murmur3
+  finalizer of the 32 DevID bits mod the interval (stable, deterministic,
+  always < interval), and it follows the interval when that changes. Until
+  2.0.1 every sensor got slot 0, so two sensors with the same interval
+  transmitted in the same second (a lost UP was observed on the bench). Only
+  the gateway decides it – the JOIN_ACC always carries the complete
+  configuration and the sensor transmits data only after a join – so the
+  sensor is unchanged. The form field "slot offset" empty = automatic (the
+  page shows the effective slot), a number = set by the admin and kept.
+  `sensors.json` keeps the effective `"slot"` (what older firmware reads)
+  and `"slotAuto"`; an entry without `"slotAuto"` (written before 2.0.2) is
+  automatic when its slot is 0 (the old default), else set by the admin.
+  When the automatic slot differs from the stored one at load, the
+  configuration gets a new version (sent with the next join or UP) and is
+  saved. The new number differs from the stored desired version and from
+  the version the sensor last reported: `sensors.json` keeps that one as
+  `"cfgRun"` while the sensor is not in sync (absent = in sync, or a file
+  written before), so a restart does not lose it; every later change uses it
+  too (`Gen2Config::nextVersion`). Two sensors still share a second with a
+  chance of about 1 in the interval per pair; the admin can then set one by
+  hand.
 
 ### 4.3 TX power recommendation (gateway UI)
 
@@ -644,7 +666,9 @@ Identity record (start of the identity page, little endian): u32 magic
 "EXID" ‖ u32 DevID ‖ u8 label key[8] ‖ u16 HW revision ‖ u16 reserved ‖
 u32 CRC-32 over bytes 0–19. Development boards without a record derive a
 DevID and key from the chip UID and announce them as a development identity
-(never for production).
+(never for production); a bench build uses a valid record when the page
+holds one. `scripts/provision_identity.py` (sensor repository) writes the
+record over SWD (§14.12).
 
 ### 10.0 Configuration store
 
@@ -699,14 +723,17 @@ size, multiple of 8) is stored in the unused vector table entry 8 (offset
 | 8 | 4 | firmware version major << 16 \| minor << 8 \| patch |
 | 12 | 4 | image size |
 | 16 | 4 | load address (slot A) |
-| 20 | 4 | flags (M4b): bit 0 OTA-capable (the image contains the OTA receiver), bits 8–11 OTA transfer version (1); 0 in images built before M4b |
+| 20 | 4 | flags (M4b): bit 0 OTA-capable (the image contains the OTA receiver), bits 4–5 the identity the image needs (sensor 1.0.1+, §14.12: 0 not declared, 1 any – bench build, 2 a provisioned identity record – production build, 3 reserved = 2), bits 8–11 OTA transfer version (1); 0 in images built before M4b |
 | 24 | 4 | reserved (0) |
 | 28 | 4 | CRC-32/ISO-HDLC over image ‖ trailer[0..27] |
 
 `scripts/image_trailer.py` (sensor repository) writes the flags from the
 project option `custom_ota_transfer` (the transfer version, set to 1 in the
-`[env]` section once the receiver is in the firmware; 0 = flags 0). The
-flags are inside the CRC. The bootloader ignores them; the gateway accepts
+`[env]` section once the receiver is in the firmware; 0 = OTA bits 0) and
+the identity bits from the build itself: an environment with
+`-DEP_DEV_IDENTITY` (e77_bench) writes 1, every other one (the production
+e77) writes 2. The flags are inside the CRC (and so inside the signature).
+Older gateways and sensors ignore bits 4–5. The bootloader ignores them; the gateway accepts
 for OTA only images with bit 0 set and 1 ≤ transfer version ≤ the version it knows (§14.5; the sensor checks the same at completion),
 so every image it installs can be replaced over the air again. Downgrades
 to such an image are allowed (D5), confirmed and logged.
@@ -1289,7 +1316,9 @@ are ignored so future forms must use other lengths):
   idle-like, 7 RTC not usable, 6 battery below 2.4 V, 8 flash erase failed), 3
   complete (image verified, `PENDING` written, the sensor restarts into the
   swap), 4 failed (arg: 1 CRC, 2 trailer – including the OTA flags –, 3
-  identity differs from the start, 4 flash; the progress is discarded), 5 left
+  identity differs from the start, 4 flash, 5 the image needs a provisioned
+  identity and the sensor runs the development identity – sensor 1.0.1+,
+  §14.12; the progress is discarded), 5 left
   (arg: 1 silence – also the time base failing: LSE stopped or a failed
   schedule wait, §10.3 –, 2 battery below 2.3 V, 3 OTA end; 4 is reserved –
   a new session needs no "left", the gateway sees the join; the progress is kept
@@ -1512,7 +1541,10 @@ unchanged throughout.
    vector), HW type = identity, image length / CRC / version = the start,
    trailer flags: bit 0 set and 1 ≤ transfer version ≤ its own
    (`trailerFlagsOk`) – else END(failed), status "failed", slot B left as it
-   is (the next transfer erases it);
+   is (the next transfer erases it); sensor 1.0.1+: trailer identity bits =
+   2 (or 3) while the sensor runs the development identity
+   (`ep::ota::refuseForIdentity`) – END(failed), status "failed 5", no swap
+   (§14.12);
 2. page 117 erased if it is not empty (allowed: the state is idle-like,
    condition 4 still holds) – before END(verified), so a `REVERTED` / `KEPT`
    found later was written after this verification (the shortcut refusal of
@@ -1683,11 +1715,20 @@ another job that is not terminal on this gateway (one at a time); the image is
 the one that reverted on this sensor (a per-sensor record in `sensors.json`:
 version + CRC of the last reverted image; after `REVERTED` the gateway never
 retries automatically, the admin may start it again explicitly, with a
-warning). Warnings that do not block: flag bit 1 (IWDG off); uplink or
+warning; gateway 2.0.2: the record ends once that version runs confirmed on
+the sensor – a status report with the version and boot state 2, which is
+also what ends a job Done, or a JOIN_REQ with the version while the last
+status report said boot state 2 for it – and is saved without it; a revert
+watch of that version ends on such a status report only – after a reinstall
+of the running version the stored boot state can still be the CONFIRMED of
+the image before the swap; KEPT (6) keeps the record).
+Warnings that do not block: flag bit 1 (IWDG off); uplink or
 downlink margin (§4.3) below 10 dB ("expect many repeats"); a report interval
 above 1 h ("the start and every resume wait for the sensor's next report"). A
 downgrade (D5) and a reinstall of the running version need a confirmation and
-are logged. At job start the gateway re-verifies the stored image's CRC. The
+are logged, as does (gateway 2.0.2, §14.12) an image that needs a provisioned
+identity for a sensor whose last JOIN_REQ reported the development identity
+(caps bit 4). At job start the gateway re-verifies the stored image's CRC. The
 page shows the estimated duration before the start.
 
 **Transfer state machine** (`SensorManager`, RAM + `/ota/job.json`). The job
@@ -2108,6 +2149,125 @@ apply.** Each with the recommended default:
   an OTA; a reinstall of the running version; Abort / Pause / Clear job in
   every state; the attack suite; the skip rate with LTE on (Pro).
 
+### 14.12 Production images and development identities (gateway 2.0.2, sensor 1.0.1)
+
+**Why.** The release image 1.0.0 is a production build (env `e77`): it
+runs only with a valid identity record (§10). On 2026-10-29 it reached two
+bench sensors that had no record (bench builds, UID-derived development
+identity) through the automatic night update: the new image found no
+identity at its first boot, reset ("Unconfirmed image without identity"),
+and the bootloader reverted it after three boots – about 3 h of airtime and
+1.4 mAh per sensor for nothing, no damage. Nothing on the wire told the
+gateway that the sensor could not run the image. Sensors at customers are
+always provisioned; this is about bench and development units, and about
+making the failure visible and cheap.
+
+**The sensor says what it runs: JOIN_REQ caps bit 4** = the sensor runs
+the development identity (no valid identity record; only an `e77_bench`
+build can, a bench build with a valid record reports 0). The caps byte and
+not the status flags: the identity source changes only at a boot (a record
+written over SWD resets the chip; the identity is read at start-up), every
+boot starts with a JOIN_REQ, and the gateway already gates OTA on the caps
+of the last JOIN_REQ (§14.2) – so the bit is always as fresh as the OTA
+version bits, also right after a gateway restart (sessions are not stored,
+the sensor rejoins). The status flags keep their spare bits.
+
+**The image says what it needs: trailer flags bits 4–5** (§10.1), written
+by `scripts/image_trailer.py` from the build itself (`-DEP_DEV_IDENTITY` →
+1 "any identity", otherwise 2 "provisioned identity record"). This is the
+primary rule because it describes the image, not who signed it: it is
+covered by the image CRC and by the signature, an unsigned production build
+(e.g. a local `pio run -e e77` uploaded by hand) is recognised as well as a
+signed one, a bench image signed with a bench key is not mistaken for a
+release, and the sensor can check the same field itself before its swap
+(it never sees the signature – the gateway keeps only the image). The key
+alone would be wrong in both directions: unsigned production builds exist,
+and nothing but the release procedure stops a bench build from being
+signed. `explora_sign.py sign --kind sensor` therefore refuses an image
+that does not declare 2 (bench builds and images built before 1.0.1)
+unless `--test-image` is given, and `--test-image` refuses a key that is in
+the gateway's release key table (`src/Security/ReleaseKeys.h`, matched by
+key id or point; an unreadable table, or one with a slot the tool cannot
+parse, refuses too) – a bench or undeclared image can never carry a release
+signature through the tool. For images built before 1.0.1 (field 0, "not
+declared"), the gateway falls back to the signature: such an image counts
+as needing a provisioned identity when it is verified with a release key
+(every release image is a production build, `docs/release.md`; 1.0.0 is
+the only one); an undeclared unsigned image is unknown and allowed as
+before. `OtaImage::needsProvisionedIdentity(flags, verified)`.
+
+**Gateway (2.0.2).** For a sensor whose last JOIN_REQ had caps bit 4 and an
+image that needs a provisioned identity:
+
+- automatic updates skip it (`AutoUpdatePolicy::Skip::DevIdentity`, one log
+  line per sensor and reason, §15.6);
+- a manual start shows the reason and needs the admin's confirmation (the
+  same confirm token as a downgrade or an unsigned image): "The sensor runs
+  a development identity (no identity record) and this image needs a
+  provisioned one: the sensor will refuse to install it after the transfer.
+  Provision it first (never during a transfer)" (for an undeclared release
+  image: "... it would reset at its first start and be reverted after three
+  boots"). The way out is to provision the sensor **before** the start
+  (`scripts/provision_identity.py` of the sensor repository), never during a
+  transfer: every SWD connect resets the sensor, and a record with another
+  DevID or key (`--new-key`, `--devid`) no longer matches the gateway's
+  pairing – the sensor must then be deleted and added again with the new
+  DevID / label key (a new sensor for the gateway; the old job does not
+  carry over). After provisioning the sensor rejoins with caps bit 4 = 0
+  and the start needs no identity confirmation;
+- the gen 2 page shows "development identity" next to the firmware;
+- failure 5 is shown as "the image needs a provisioned identity, the sensor
+  runs a development identity - not installed".
+
+**Sensor (1.0.1).** Defence in depth, no bootloader change: at completion
+step 1 (§14.4), after slot B verified, a sensor running the development
+identity does not install an image whose trailer declares 2 (or 3): it
+writes END(failed) and reports "failed 5" (the job ends Failed with that
+reason) instead of writing `PENDING` – no swap, no three boots, no revert.
+It costs the transfer time when a gateway sends it anyway (an older gateway,
+or a start the admin confirmed), and it is not kept: END(failed) discards
+the verified slot B like any failed verification, so after the sensor has
+been provisioned the same image needs a new job and a **full** transfer
+again (no "already verified" shortcut, about 3.5 h at a 600 s interval).
+An undeclared image (built before 1.0.1) is installed as before – the
+sensor cannot know what it needs.
+
+**Compatibility.**
+
+| Gateway | Sensor | Behaviour |
+|---|---|---|
+| ≤ 2.0.1 | ≤ 1.0.0 | unchanged (the 1.0.0 case above can happen) |
+| ≤ 2.0.1 | 1.0.1+ | caps bit 4 and trailer bits 4–5 are ignored by the gateway (it masks the caps, checks only bit 0 and bits 8–11 of the flags); a development-identity sensor still refuses a declared production image at completion ("failed", shown as an unknown reason); an automatic job costs up to two nights of transfer (two failures, then that version is given up) |
+| 2.0.2 | ≤ 1.0.0 | no caps bit 4: such a sensor is treated as provisioned (unknown) – behaviour unchanged, the 1.0.0 case can still happen with a sensor running an old bench build (see below) |
+| 2.0.2 | 1.0.1+ | skip / confirmation as above, refusal on the sensor as the last line |
+
+Images: a 1.0.1+ image on an older gateway is stored and installed as
+before (unknown flag bits are ignored); an older sensor firmware installs a
+1.0.1+ image as before (`trailerFlagsOk` ignores bits 4–5).
+
+**Old bench sensors are not protected.** A sensor running a bench build up
+to 1.0.0 with the development identity cannot set caps bit 4, so gateway
+2.0.2 treats it as provisioned: with automatic sensor updates on it is
+offered every new production image (the first one is 1.0.1) and the 1.0.0
+night repeats – transfer, reset at the first start, revert after three
+boots. Before a manifest with a new production sensor image is published
+(`docs/release.md` section 4), every such sensor on a gateway with
+automatic sensor updates on must be provisioned or brought to a 1.0.1+
+build (`e77_bench` 1.0.1+ over SWD reports the bit), or that gateway's
+automatic sensor updates switched off. The same holds later, while the
+manifest names a production sensor image: such a sensor is not added to
+(paired with, or rejoined to after an SWD reflash) a gateway with
+automatic sensor updates on until it is provisioned or updated (or that
+gateway's automatic sensor updates are switched off first). Sensors at
+customers are provisioned and not affected.
+
+**Bench sensors** must be provisioned (identity record) to test production
+images – `scripts/provision_identity.py` in the sensor repository writes the
+record over SWD (`--uid-key` keeps a bench sensor's DevID and key);
+`-DBENCH_IGNORE_IDENTITY` (e77_bench only, added by hand) makes a bench
+build ignore a record, to test the development-identity paths without
+erasing it.
+
 ## 15. Signed packages and automatic updates (M4c, gateway 2.0.0)
 
 Everything in this section runs on the gateway and over HTTPS; the sensor,
@@ -2363,8 +2523,11 @@ Verified images from the manifest, whatever **Signed images only** says.
   reported its firmware (JOIN_REQ), the image is Verified and newer than
   its firmware, it did not revert to this version before (by version, not
   CRC), it has fewer than 2 automatic failures with this version
-  (`sensors.json` `autoFail`), `otaCheckStart` has no blocker and an empty
-  confirm list; start through `otaRequestStart(devId, 0)`. Failed and an
+  (`sensors.json` `autoFail`), it does not report the development identity
+  while the image needs a provisioned one (gateway 2.0.2, §14.12 – skipped
+  with one log line per sensor and reason: "Automatic update of <DevID> not
+  started: the sensor runs a development identity ..."), `otaCheckStart`
+  has no blocker and an empty confirm list; start through `otaRequestStart(devId, 0)`. Failed and an
   abort by the gateway count as a failure; an abort by the admin does not
   (the sensor is left alone for 24 h), nor does a start refused before the
   job existed (30 min). Jobs may start at any time of day, but never while

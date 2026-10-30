@@ -11,7 +11,14 @@ target and version come from the file itself: a sensor image's trailer
 version (esp_app_desc_t.version when it is maj.min.pat, else the image's
 EXPLORA_FW_VERSION marker). --version is only a cross-check against that;
 an image whose version cannot be read is refused. A pre-release version
-("2.0.0-dev") is refused unless --force.
+("2.0.0-dev") is refused unless --force. A sensor image must declare in its
+trailer that it needs a provisioned identity (the production build e77 from
+sensor 1.0.1 on): a bench build (e77_bench) or an image built before 1.0.1
+is refused unless --test-image - gateways treat every release-signed image
+without the declaration as a production build, so --test-image refuses a
+key that is in the gateway's release key table (src/Security/ReleaseKeys.h
+of this repository, --release-keys PATH for another copy; a table that
+cannot be read refuses as well).
 
 The private key: --key PATH, else the EXPLORA_SIGN_KEY environment
 variable (a path). It must not be readable by group or others. Keys are
@@ -34,6 +41,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import explora_sigblock as sb  # noqa: E402
 
 BOARD_NAME = {sb.TARGET_PRO: "pro", sb.TARGET_LITE: "lite"}
+RELEASE_KEYS = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..",
+                                             "src", "Security", "ReleaseKeys.h"))
 
 
 def die(msg, code=1):
@@ -65,6 +74,20 @@ def check_key_mode(path):
         if fmode & (stat.S_IWGRP | stat.S_IWOTH):
             die(f"the key folder {folder} is writable by group or others (mode {stat.S_IMODE(fmode):03o}) "
                 "- the key could be replaced; chmod 700 it")
+
+
+def check_not_release_key(public_key, table_path):
+    """--test-image: the key must not be one the gateways trust as a release key
+    (matched by key id or by point; an unreadable or unparsable table refuses)."""
+    try:
+        table = sb.release_key_table(table_path)
+    except OSError as e:
+        die(f"--test-image: cannot read the release key table {table_path} ({e.strerror}) - "
+            "pass --release-keys PATH (src/Security/ReleaseKeys.h)")
+    kid, point = sb.key_id(public_key), sb.public_point(public_key)
+    if kid in table or point in table.values():
+        die(f"--test-image with a release key (key id {kid:08x}, in {table_path}) - "
+            "test images are signed with bench keys only")
 
 
 def describe(kind, target, version):
@@ -132,6 +155,11 @@ def cmd_sign(a):
                 die("--version / --board apply to gateway images only")
             target, version = sb.sensor_image_info(data)
             text = sb.version_text(version)
+            identity = sb.sensor_image_identity(data)
+            print(f"identity: {sb.SENSOR_IDENTITY_TEXT[identity]}")
+            if identity != 2 and not a.test_image:
+                die("not a production sensor image (the trailer does not declare a provisioned identity) - "
+                    "release images come from env e77; --test-image signs it anyway (bench keys only)")
         else:
             target, version, text, source = sb.gateway_image_info(data, a.version)
             if a.board and sb.BOARDS[a.board] != target:
@@ -143,6 +171,8 @@ def cmd_sign(a):
         path = key_path(a.key)
         check_key_mode(path)
         key = sb.load_private_key(path)
+        if a.test_image:
+            check_not_release_key(key.public_key(), a.release_keys)
     except sb.FormatError as e:
         die(str(e))
     block = sb.build_block(kind, target, version, data, key)
@@ -201,6 +231,12 @@ def main():
     s.add_argument("--board", choices=sorted(sb.BOARDS), help="gateway only: expected board (checked)")
     s.add_argument("--force", action="store_true",
                    help="replace an existing output / stale .tmp, sign a pre-release version")
+    s.add_argument("--test-image", action="store_true",
+                   help="sensor only: sign a bench build or an image without the identity declaration "
+                        "(refused with a key from the release key table)")
+    s.add_argument("--release-keys", default=RELEASE_KEYS,
+                   help="--test-image: the gateway's release key table (default: this repository's "
+                        "src/Security/ReleaseKeys.h)")
     s.add_argument("input")
     s.add_argument("output")
     v = sub.add_parser("verify", help="check a signed file")

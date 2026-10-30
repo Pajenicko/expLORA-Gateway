@@ -638,6 +638,7 @@ struct SensorInfo
     uint32_t fw = 0;
     bool hasReverted = false;
     uint32_t revertedFw = 0;
+    bool devIdentity = false; // JOIN_REQ caps bit 4: no provisioned identity record (sensor 1.0.1+)
     uint32_t failFw = 0; // auto failures: of this version
     uint8_t fails = 0;
 };
@@ -647,6 +648,7 @@ struct ImageInfo
     bool stored = false;
     uint32_t fw = 0;
     bool verified = false; // signed with a release key this firmware carries
+    bool needsIdentity = false; // needs a provisioned identity (OtaImage::needsProvisionedIdentity)
 };
 
 enum class Skip : uint8_t
@@ -658,6 +660,7 @@ enum class Skip : uint8_t
     NotNewer,  // the image is not newer than the sensor's firmware
     Reverted,  // this version reverted on the sensor before (by version, also a rebuild)
     Failed,    // SENSOR_TRIES automatic failures of this version
+    DevIdentity, // the sensor runs a development identity, the image needs a provisioned one
 };
 
 inline const char *skipText(Skip k)
@@ -678,6 +681,9 @@ inline const char *skipText(Skip k)
         return "this version reverted on it before";
     case Skip::Failed:
         return "failed twice with this version";
+    case Skip::DevIdentity:
+        return "the sensor runs a development identity (no identity record) - the image needs a provisioned "
+               "identity";
     }
     return "?";
 }
@@ -707,6 +713,10 @@ inline Skip sensorSkip(const SensorInfo &s, const ImageInfo &img)
     if (s.failFw == img.fw && s.fails >= SENSOR_TRIES)
     {
         return Skip::Failed;
+    }
+    if (s.devIdentity && img.needsIdentity)
+    {
+        return Skip::DevIdentity;
     }
     return Skip::None;
 }

@@ -60,6 +60,40 @@ The gateway receives data from various wireless sensors via LoRa, processes the 
   - JSON and CSV formats
   - Query parameters for filtering
 
+## Release notes 2.0.2
+
+- **Report slots spread by DevID.** A generation 2 sensor whose slot offset
+  was never set by hand gets an automatic slot derived from its DevID (it
+  follows the interval) instead of 0 for everyone - two sensors with the
+  same interval no longer transmit in the same second (a lost report was
+  the result). Existing sensors with slot 0 move to their automatic slot
+  under a new configuration version, sent with the sensor's next join or
+  report after the update; a slot set by hand stays. On the sensor's page
+  (Advanced): slot offset empty = automatic (the effective slot is shown),
+  a number = set by hand. After a downgrade to 2.0.1 and back, non-zero
+  automatic slots read as set by hand (`docs/release.md` section 6).
+- **"Reverted on this sensor before" ends** once that version runs
+  confirmed on the sensor (a successful update, or a report that it runs
+  the version confirmed); before, the mark stayed for good and the
+  automatic update skipped that version on the sensor forever.
+- **Production images and development identities** (`docs/protocol-v2.md`
+  §14.12): a sensor with firmware 1.0.1 or newer reports when it runs the
+  development identity of a test build (no identity record). The gateway
+  then skips it in automatic updates for images that need a provisioned
+  identity (log line with the reason) and asks for a confirmation on a
+  manual start; the sensor page shows "development identity". Sensor 1.0.1
+  itself refuses to install such an image after the transfer ("failed:
+  the image needs a provisioned identity") instead of resetting three
+  times and reverting. Sensors with a provisioned identity (every sensor
+  that leaves production) are not affected; older sensor firmware does not
+  report it and behaves as before - a bench sensor with an old test build
+  must be provisioned or updated before it is offered a production image:
+  before a manifest with a new production sensor image is published, and
+  before such a sensor is added to a gateway with automatic sensor updates
+  on while the manifest names a production image. In both cases the other
+  way is to switch that gateway's automatic sensor updates off first
+  (`docs/release.md` section 4).
+
 ## Release notes 2.0.1
 
 - **Lite: larger firmware slots.** The Lite's flash is re-partitioned in
@@ -576,8 +610,11 @@ over LoRa from its detail page (`/sensors/gen2?devId=…`, docs/protocol-v2.md
    image, no OTA receiver, no status report yet, RTC not usable, an
    unconfirmed image running, another job – one at a time, an unsigned image
    with "Signed images only" on) and warnings (weak link, long report
-   interval); a downgrade, a reinstall, an unsigned image or an image that
-   reverted on this sensor before needs a confirmation. The stored image is
+   interval); a downgrade, a reinstall, an unsigned image, an image that
+   reverted on this sensor before (the mark ends once that version runs
+   confirmed on the sensor) or a production image for a sensor that runs
+   the development identity of a test build (sensor firmware 1.0.1+; it
+   would refuse to install it) needs a confirmation. The stored image is
    re-checked first, then the start goes with the sensor's next report.
 3. **Transfer**: one 232-byte block every 26 s in scheduled windows, a
    progress status every 32 blocks (about 14 min; the sensor's reports ride in

@@ -421,6 +421,8 @@ inline const char *failureText(uint8_t r)
         return "image differs from the start";
     case 4:
         return "flash error";
+    case 5:
+        return "the image needs a provisioned identity, the sensor runs a development identity - not installed";
     }
     return "unknown reason";
 }
@@ -490,6 +492,28 @@ inline const char *whyText(Why w)
 inline bool flaggedRevert(uint8_t boot, uint8_t flags)
 {
     return (boot == 3 || boot == 4 || boot == 5 || boot == 7) && (flags & 0x08);
+}
+
+// The per-sensor revert record ("this image reverted on this sensor
+// before", spec 14.5) of version markFw ends once that version runs
+// confirmed on the sensor (gateway 2.0.2): a status report with the version
+// and boot state 2 (CONFIRMED - a job ends Done on such a report), or a
+// JOIN_REQ with the version while the last status report (storedBoot, kept
+// for the running version) said CONFIRMED - safe for the record, which is
+// written only from a revert report (boot state 3/4/5/7 stored with it).
+// KEPT (6) and every other boot state keep the record. A revert watch ends
+// only on the status report form (the caller checks hasStatus).
+inline bool confirmedRunning(uint32_t markFw, const Up &u, uint8_t storedBoot)
+{
+    if (!u.hasFw || u.fw != markFw)
+    {
+        return false;
+    }
+    if (u.hasStatus)
+    {
+        return u.boot == 2;
+    }
+    return u.joinReq && storedBoot == 2;
 }
 
 inline uint32_t waitingDeadlineS(const Job &j)

@@ -127,6 +127,8 @@ enum Failure : uint8_t
     kFailTrailer = 2,  // trailer (magic, version, size, load address, vectors) invalid
     kFailIdentity = 3, // image length / CRC / version / HW type differ from the start
     kFailFlash = 4,    // programming failed and the page could not be erased
+    kFailNeedsIdentity = 5, // sensor 1.0.1+: the image needs a provisioned identity, the sensor runs a
+                            // development identity - verified, but not installed (spec 14.4)
 };
 
 enum LeaveReason : uint8_t
@@ -155,6 +157,41 @@ size_t encodeStatus(const Status &s, uint8_t *out, size_t cap);
 bool decodeStatus(const uint8_t *v, size_t len, Status &s);
 
 // --- block math ------------------------------------------------------------------
+
+// Image trailer flags bits 4-5 (spec 10.1, sensor 1.0.1+): the identity the
+// image needs to run. 0 = not declared (every image built before sensor
+// 1.0.1), 1 = any identity (bench build e77_bench: a provisioned record or
+// the UID-derived development identity), 2 = a provisioned identity record
+// (production build e77: without one it stops - an unconfirmed image resets
+// and the bootloader reverts it). 3 is reserved and read as 2.
+constexpr uint32_t kTrailerIdentityShift = 4;
+constexpr uint32_t kTrailerIdentityMask = 0x30;
+enum ImageIdentity : uint8_t
+{
+    kImageIdentityUndeclared = 0,
+    kImageIdentityAny = 1,
+    kImageIdentityProvisioned = 2,
+};
+
+inline uint8_t imageIdentity(uint32_t trailerFlags)
+{
+    const uint8_t v = (uint8_t)((trailerFlags & kTrailerIdentityMask) >> kTrailerIdentityShift);
+    return v > kImageIdentityProvisioned ? (uint8_t)kImageIdentityProvisioned : v;
+}
+
+inline uint32_t trailerIdentityFlags(uint8_t identity)
+{
+    return ((uint32_t)identity << kTrailerIdentityShift) & kTrailerIdentityMask;
+}
+
+// The sensor's check before the swap (spec 14.4 completion step 1): an image
+// declared for a provisioned identity is not installed on a sensor that runs
+// a development identity (it would reset at its first boot and revert after
+// three boots). An undeclared image is installed as before (unknown)
+inline bool refuseForIdentity(uint32_t trailerFlags, bool provisioned)
+{
+    return !provisioned && imageIdentity(trailerFlags) == kImageIdentityProvisioned;
+}
 
 inline uint16_t blockCount(uint32_t imageLen, uint8_t blockSize)
 {

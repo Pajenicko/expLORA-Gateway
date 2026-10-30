@@ -100,6 +100,11 @@ constexpr uint8_t kCapClassC = 0x01;
 constexpr uint8_t kCapRx2 = 0x02;
 constexpr uint8_t kCapOtaMask = 0x0C; // bits 2-3: OTA transfer version the firmware receives (0 none)
 constexpr uint8_t kCapOtaShift = 2;
+// bit 4 (sensor 1.0.1+): the sensor runs a development identity - no valid
+// provisioned identity record, the UID-derived bench identity of an e77_bench
+// build; an image that needs a provisioned identity cannot run on it (spec
+// 3.3, 10.1, 14.5). Older firmware sends 0 (unknown)
+constexpr uint8_t kCapDevIdentity = 0x10;
 
 // Payload limit of an UP / DOWN: OTA session DOWNs carry one 232-byte block
 inline size_t maxPayload(FrameType type, uint8_t fctrl)

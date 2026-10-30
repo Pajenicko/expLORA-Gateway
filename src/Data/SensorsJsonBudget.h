@@ -36,19 +36,19 @@ namespace SensorsJson
     constexpr size_t MAX_GEN2 = 10;
 
     // Written per entry (SensorManager::snapshotLocked): a generation 1
-    // sensor has at most 17 members (budget 20); a generation 2 sensor 31
-    // members (customUrl, S7) with the otaWatch (5), otaAbort (3) and autoFail (2, S6)
+    // sensor has at most 17 members (budget 20); a generation 2 sensor 33
+    // members (customUrl, S7; slotAuto + cfgRun, 2.0.2) with the otaWatch (5), otaAbort (3) and autoFail (2, S6)
     // arrays: 19, the reported quantities "q" and up to 10 corrections (only
     // the ones that correct something are written)
     constexpr size_t GEN1_WRITE = JSON_OBJECT_SIZE(20);
     constexpr size_t GEN2_WRITE =
-        JSON_OBJECT_SIZE(31) + JSON_ARRAY_SIZE(5) + JSON_ARRAY_SIZE(3) + JSON_ARRAY_SIZE(2);
+        JSON_OBJECT_SIZE(33) + JSON_ARRAY_SIZE(5) + JSON_ARRAY_SIZE(3) + JSON_ARRAY_SIZE(2);
 
     // Read per entry, with slack: a file from another firmware version
     // (members added later, a downgrade) is still a valid configuration.
     // The arrays' 16 slots cover the 5 + 3 + 2 written today
     constexpr size_t GEN1_READ = JSON_OBJECT_SIZE(24);
-    constexpr size_t GEN2_READ = JSON_OBJECT_SIZE(35) + 2 * JSON_ARRAY_SIZE(8);
+    constexpr size_t GEN2_READ = JSON_OBJECT_SIZE(37) + 2 * JSON_ARRAY_SIZE(8);
 
     // A sensors.json larger than this is damage, not a configuration
     constexpr size_t MAX_FILE_BYTES = 32768;

@@ -20,6 +20,7 @@
  */
 
 #include "SensorManager.h"
+#include "Gen2Json.h"
 #include "SensorCalibration.h"
 #include "CalibrationJson.h"
 #include "SensorsJsonBudget.h"
@@ -897,12 +898,13 @@ bool SensorManager::snapshotLocked(String &json)
                 obj["devNonce"] = g.lastDevNonce;
             }
             obj["interval"] = g.config.intervalS;
-            obj["slot"] = g.config.slotS;
+            Gen2Json::writeSlot(obj, g.config);
             obj["txPower"] = g.config.txPowerDbm;
             obj["ackEvery"] = g.config.ackEvery;
             obj["ackRetries"] = g.config.ackRetries;
             obj["ackBackoff"] = g.config.ackBackoffS;
             obj["cfgVersion"] = g.cfgVersion;
+            Gen2Json::writeCfgRun(obj, g.cfgVersion, g.lastCfgRun);
             if (g.qMask)
             {
                 obj["q"] = g.qMask;
@@ -919,11 +921,7 @@ bool SensorManager::snapshotLocked(String &json)
             {
                 obj["bootState"] = g.bootState;
             }
-            if (g.hasReverted)
-            {
-                obj["revFw"] = g.revertedFw;
-                obj["revCrc"] = g.revertedCrc;
-            }
+            Gen2Json::writeRevert(obj, g.hasReverted, g.revertedFw, g.revertedCrc);
             AutoUpdatePolicy::writeAutoFail(obj, g.autoFailFw, g.autoFails);
             if (g.otaWatch.armed())
             {
@@ -1271,7 +1269,7 @@ int SensorManager::parseSensorsLocked(const String &fileContent, const char *pat
         }
         // Configuration (defaults for entries written before M3)
         g.config.intervalS = obj["interval"] | g.config.intervalS;
-        g.config.slotS = obj["slot"] | g.config.slotS;
+        Gen2Json::readSlot(obj, g.config);
         g.config.txPowerDbm = obj["txPower"] | g.config.txPowerDbm;
         g.config.ackEvery = obj["ackEvery"] | g.config.ackEvery;
         g.config.ackRetries = obj["ackRetries"] | g.config.ackRetries;
@@ -1283,7 +1281,20 @@ int SensorManager::parseSensorsLocked(const String &fileContent, const char *pat
         {
             g.cfgVersion = 1;
         }
+        g.lastCfgRun = Gen2Json::readCfgRun(obj, g.cfgVersion);
         Gen2Config::clamp(g.config);
+        {
+            // An automatic slot follows the DevID: a sensor stored with the old
+            // default 0 gets its own slot under a new configuration version
+            // (sent with the next join or UP; never the version the sensor
+            // last reported), saved after the load
+            if (Gen2Config::resolveSlotAtLoad(g.config, g.devId, g.cfgVersion, g.lastCfgRun))
+            {
+                scheduleGen2SaveLocked(millis());
+                logger.info("Generation 2 sensor " + g.name + ": automatic report slot " + String(g.config.slotS) +
+                            " s (from the DevID) - configuration v" + String(g.cfgVersion));
+            }
+        }
         // "maj.min.pat" as written by snapshotLocked (no sscanf: it would
         // link newlib's floating-point scanf, ~9 kB of flash)
         uint32_t fw = 0;
@@ -1296,9 +1307,7 @@ int SensorManager::parseSensorsLocked(const String &fileContent, const char *pat
             g.hwType = obj["hw"] | 0u;
         }
         g.bootState = obj["bootState"] | 0xFF;
-        g.hasReverted = obj.containsKey("revFw");
-        g.revertedFw = obj["revFw"] | 0u;
-        g.revertedCrc = obj["revCrc"] | 0u;
+        Gen2Json::readRevert(obj, g.hasReverted, g.revertedFw, g.revertedCrc);
         AutoUpdatePolicy::readAutoFail(obj, g.autoFailFw, g.autoFails);
         JsonArray w = obj["otaWatch"];
         if (!w.isNull() && w.size() == 5)
@@ -1439,6 +1448,7 @@ int SensorManager::addGen2Sensor(uint32_t devId, const uint8_t label[ep::kLabelK
     g.name = name;
     g.customUrl = customUrl;
     memcpy(g.label, label, ep::kLabelKeyLen);
+    Gen2Config::resolveSlot(g.config, devId); // the default slot follows the DevID (spec 4.2)
     Gen2Crypto::deriveJoinKeys(g);
     waiting.remove(devId);
     char id[9];
@@ -1649,6 +1659,7 @@ bool SensorManager::handleGen2Frame(const RadioPacket &packet, const ep::FrameIn
         g.fwPatch = jr.fwPatch;
         g.caps = jr.caps;
         g.configVersion = jr.configVersion;
+        g.lastCfgRun = g.configVersion & ep::kFctrlCfgMask;
         g.lastJoinDevNonce = jr.devNonce;
         g.joinRequests++;
         {
@@ -1747,6 +1758,7 @@ bool SensorManager::handleGen2Frame(const RadioPacket &packet, const ep::FrameIn
             Gen2Link::lostBetween(use != SessionUse::Promoted && g.upFrames > 1, g.lastFcnt, fcnt32);
         g.lastFcnt = fcnt32;
         g.configVersion = info.fctrl & ep::kFctrlCfgMask; // version the sensor runs
+        g.lastCfgRun = g.configVersion;
         const uint8_t bootStateBefore = g.bootState;
         const uint16_t qBefore = g.qMask;
         g.upDownlinkRssi = Gen2Link::NONE;
@@ -1920,11 +1932,12 @@ int SensorManager::setGen2Edit(uint32_t devId, const String *name, const SensorC
     }
     Gen2Config::Values v = config != nullptr ? *config : g.config;
     Gen2Config::clamp(v);
+    Gen2Config::resolveSlot(v, g.devId); // an automatic slot follows the interval
     if (config != nullptr && !(v == g.config))
     {
         changed |= GEN2_EDIT_CONFIG;
         g.config = v;
-        g.cfgVersion = Gen2Config::nextVersion(g.cfgVersion, g.configVersion);
+        g.cfgVersion = Gen2Config::nextVersion(g.cfgVersion, g.lastCfgRun);
         // The reported power belongs to the old configuration (spec 4.3);
         // after a power change, or when a reported power is forgotten, the
         // next UP brings a fresh status report
@@ -1942,8 +1955,10 @@ int SensorManager::setGen2Edit(uint32_t devId, const String *name, const SensorC
     if (changed & GEN2_EDIT_CONFIG)
     {
         snprintf(line, sizeof(line),
-                 "Generation 2 sensor %s: configuration v%u (interval %u s, TX %d dBm) - sent with the next uplink",
-                 g.name.c_str(), (unsigned)g.cfgVersion, (unsigned)v.intervalS, (int)v.txPowerDbm);
+                 "Generation 2 sensor %s: configuration v%u (interval %u s, slot %u s%s, TX %d dBm) - sent with the "
+                 "next uplink",
+                 g.name.c_str(), (unsigned)g.cfgVersion, (unsigned)v.intervalS, (unsigned)v.slotS,
+                 v.slotAuto ? " auto" : "", (int)v.txPowerDbm);
     }
     else
     {
@@ -1971,7 +1986,7 @@ int SensorManager::setGen2Edit(uint32_t devId, const String *name, const SensorC
             // raised version, so the old values get yet another version: a
             // number is never reused for different content (spec 4.2)
             r.config = oldConfig;
-            r.cfgVersion = Gen2Config::nextVersion(r.cfgVersion, r.configVersion);
+            r.cfgVersion = Gen2Config::nextVersion(r.cfgVersion, r.lastCfgRun);
             if (r.reportedTx != INT8_MAX)
             {
                 r.statusRequested = true;

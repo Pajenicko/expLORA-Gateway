@@ -126,6 +126,60 @@ def c_table_entry(public_key, comment="release key"):
             "        {\n" + "\n".join(rows) + "\n        }},")
 
 
+def release_key_table(path):
+    """Filled slots of src/Security/ReleaseKeys.h as {key id: 65-byte point}.
+
+    Parses the initializers c_table_entry() writes ({0xKEYIDu, {0x04, ...}});
+    an empty slot ({0, {}}) is skipped. A file that is not UTF-8 text, has
+    no KEYS table or SLOTS count, has more than one of either or any
+    preprocessor conditional, has a slot in another form (the number of
+    parsed slots must equal SLOTS), or a slot whose point is not 65 bytes /
+    whose key id does not match its point is a FormatError (the caller must
+    not guess)."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except UnicodeDecodeError:
+        raise FormatError(f"{path}: not a UTF-8 text file")
+    # one pass, so a // inside a block comment (or a /* after //) is harmless
+    text = re.sub(r"/\*.*?\*/|//[^\n]*", "", text, flags=re.S)
+    # the tool cannot tell which branch the compiler takes, nor which of two
+    # tables the gateway uses: refuse instead of reading the first one
+    if re.search(r"^[ \t]*#[ \t]*(if|ifdef|ifndef|elif|elifdef|elifndef|else)\b", text, re.M):
+        raise FormatError(f"{path}: preprocessor conditional in the key table header")
+    if len(re.findall(r"\bSLOTS\s*=(?!=)", text)) > 1:
+        raise FormatError(f"{path}: more than one SLOTS declaration")
+    if len(re.findall(r"\bKEYS\s*\[[^\]]*\]\s*=(?!=)", text)) > 1:
+        raise FormatError(f"{path}: more than one KEYS table")
+    # the SLOTS declaration (a use such as KEYS[SLOTS] has no "=")
+    n = re.search(r"\bSLOTS\s*=\s*(\d+)\s*;", text)
+    if not n:
+        raise FormatError(f"{path}: no SLOTS count")
+    # the KEYS body up to its own "};" (slots end in "}}" / "},", never "};"),
+    # so a later array's initializers are not counted as slots
+    m = re.search(r"\bKEYS\s*\[[^\]]*\]\s*=\s*\{(.*?)\};", text, re.S)
+    if not m:
+        raise FormatError(f"{path}: no KEYS table")
+    slots = re.findall(r"\{\s*(0x[0-9A-Fa-f]+|0)u?\s*,\s*\{([^{}]*)\}\s*\}", m.group(1))
+    if not slots:
+        raise FormatError(f"{path}: no slots in the KEYS table")
+    if len(slots) != int(n.group(1)):
+        raise FormatError(f"{path}: {len(slots)} of {n.group(1)} KEYS slots parsed - "
+                          "write every slot as {0xKEYIDu, {0x04, ...}} or {0, {}}")
+    table = {}
+    for kid_text, body in slots:
+        kid = int(kid_text, 16) if kid_text.lower().startswith("0x") else 0
+        point = bytes(int(b, 16) for b in re.findall(r"0x([0-9A-Fa-f]{2})", body))
+        if kid == 0:
+            continue
+        if len(point) != 65 or point[0] != 0x04:
+            raise FormatError(f"{path}: slot {kid:08x} does not hold a 65-byte point")
+        if struct.unpack(">I", hashlib.sha256(point).digest()[:4])[0] != kid:
+            raise FormatError(f"{path}: slot {kid:08x} does not match its point")
+        table[kid] = point
+    return table
+
+
 # ---------------------------------------------------------------- block
 
 def build_block(kind, target, version, payload, private_key, claimed_key_id=None):
@@ -195,6 +249,20 @@ def sensor_image_info(data):
     if zlib.crc32(data[:-4]) & 0xFFFFFFFF != crc:
         raise FormatError("sensor image CRC mismatch")
     return hw, fw
+
+
+# Trailer flags bits 4-5 (protocol-v2.md 10.1, sensor 1.0.1+): the identity the
+# image needs - 0 not declared (built before 1.0.1), 1 any (bench build
+# e77_bench), 2 a provisioned identity record (production build e77), 3 = 2
+SENSOR_IDENTITY_TEXT = {0: "not declared (built before sensor 1.0.1)",
+                        1: "any identity (bench build e77_bench)",
+                        2: "provisioned identity record (production build e77)"}
+
+
+def sensor_image_identity(data):
+    """Identity class from the trailer flags of a checked sensor image"""
+    flags = struct.unpack_from("<I", data, len(data) - 32 + 20)[0]
+    return min((flags >> 4) & 3, 2)
 
 
 # src/Security/VersionMarker.cpp - interim, until esp_app_desc_t carries

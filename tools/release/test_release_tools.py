@@ -37,13 +37,18 @@ def gateway_image(desc_version=b"2.1.3", marker=None, chip=0, size=1024):
     return bytes(img)
 
 
-def sensor_image(hw=3, fw=0x00020C, size=256):
+def sensor_image(hw=3, fw=0x00020C, size=256, flags=0x121):
+    """flags: 0x121 = OTA v1 + needs a provisioned identity (production e77, sensor 1.0.1+)"""
     img = bytearray((i * 13 + 1) & 0xFF for i in range(size))
     struct.pack_into("<I", img, sb.SENSOR_SIZE_WORD, size - 32)
-    t = struct.pack("<IHHIIII", sb.SENSOR_TRAILER_MAGIC, 1, hw, fw, size - 32, sb.SENSOR_LOAD, 0x101)
+    t = struct.pack("<IHHIIII", sb.SENSOR_TRAILER_MAGIC, 1, hw, fw, size - 32, sb.SENSOR_LOAD, flags)
     img[size - 32:size - 4] = t + bytes(28 - len(t))
     struct.pack_into("<I", img, size - 4, zlib.crc32(bytes(img[:size - 4])))
     return bytes(img)
+
+
+def sb_release_keys():
+    return os.path.join(HERE, "..", "..", "src", "Security", "ReleaseKeys.h")
 
 
 def read(path):
@@ -188,6 +193,133 @@ class Tools(unittest.TestCase):
         r, out = self.sign(sensor_image(), kind="sensor")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.verify(out).returncode, 0)
+
+    def test_sensor_sign_needs_production_identity(self):
+        r, _ = self.sign(sensor_image(), kind="sensor", out="p.bin")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("provisioned identity record", r.stdout)
+        for flags, name in ((0x111, "bench"), (0x101, "undeclared")):
+            r, out = self.sign(sensor_image(flags=flags), kind="sensor", out=name + ".bin")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("not a production sensor image", r.stderr)
+            self.assertFalse(os.path.lexists(out))
+            r, out = self.sign(sensor_image(flags=flags), "--test-image", kind="sensor", out=name + "-t.bin")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(self.verify(out).returncode, 0)
+        self.assertEqual(sb.sensor_image_identity(sensor_image(flags=0x131)), 2)  # 3 reserved = 2
+
+    def test_test_image_refuses_release_keys(self):
+        bench = sensor_image(flags=0x111)
+        pub = sb.load_public_key(self.pub)
+        # the real table (key 76091636) does not hold the throwaway key: allowed (above)
+        self.assertNotIn(sb.key_id(pub), sb.release_key_table(sb_release_keys()))
+        # the throwaway key as a release key (slot 0 or slot 1, matched by key id)
+        for i, slots in enumerate(((sb.c_table_entry(pub), "    {0, {}},"),
+                                   ("    {0, {}},", sb.c_table_entry(pub, "next key")))):
+            table = self.file("ReleaseKeys.h", ("namespace ReleaseKeys {\nconstexpr size_t SLOTS = 2;\n"
+                                                "constexpr Key KEYS[SLOTS] = {\n"
+                                                + "\n".join(slots) + "\n};\n}\n").encode())
+            r, out = self.sign(bench, "--test-image", "--release-keys", table, kind="sensor", out="rk.bin")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("--test-image with a release key", r.stderr)
+            self.assertFalse(os.path.lexists(out))
+            # a production image needs no --test-image: signed with the release key as usual
+            r, out = self.sign(sensor_image(), "--release-keys", table, kind="sensor", out=f"rk-p{i}.bin")
+            self.assertEqual(r.returncode, 0, r.stderr)
+        # a table that cannot be read or parsed refuses --test-image
+        # (a short point, a point that does not hash to its key id)
+        def one_slot(entry):
+            return f"constexpr size_t SLOTS = 1;\nconstexpr Key KEYS[SLOTS] = {{\n{entry}\n}};\n".encode()
+        wrong = sb.c_table_entry(pub).replace(f"0x{sb.key_id(pub):08X}u", "0x12345678u")
+        for i, (content, why) in enumerate(((None, "cannot read the release key table"),
+                                            (b"// no table\n", "no SLOTS count"),
+                                            (one_slot("    {0x12345678u, {0x04, 0x01}},"), "65-byte point"),
+                                            (one_slot(wrong), "does not match its point"))):
+            path = os.path.join(self.d, "missing.h") if content is None else self.file(f"bad{i}.h", content)
+            r, out = self.sign(bench, "--test-image", "--release-keys", path, kind="sensor", out=f"bad{i}.bin")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn(path, r.stderr)
+            self.assertIn(why, r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertFalse(os.path.lexists(out))
+
+    def test_release_key_table_strict(self):
+        bench = sensor_image(flags=0x111)
+        pub = sb.load_public_key(self.pub)
+        kid = sb.key_id(pub)
+        real = read(sb_release_keys()).decode()
+        self.assertIn("{0x76091636u,", real)
+        entry = sb.c_table_entry(pub)
+        literal = f"{{0x{kid:08X}u,"
+        self.assertIn(literal, entry)
+        # the real header with the throwaway key in the release slot: refused as a release key
+        start = real.index("    // production release key")
+        end = real.index("    {0, {}},")
+        mine = real[:start] + entry + "\n" + real[end:]
+        table = self.file("ReleaseKeys.h", mine.encode())
+        self.assertIn(kid, sb.release_key_table(table))
+        r, out = self.sign(bench, "--test-image", "--release-keys", table, kind="sensor", out="rk.bin")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--test-image with a release key", r.stderr)
+        # the same slot in another literal form must not be skipped: the table is refused
+        for i, form in enumerate((f"{{0x{kid:08X}U,", f"{{{kid},", f"{{UINT32_C(0x{kid:08X}),")):
+            path = self.file(f"form{i}.h", mine.replace(literal, form).encode())
+            with self.assertRaises(sb.FormatError):
+                sb.release_key_table(path)
+            r, out = self.sign(bench, "--test-image", "--release-keys", path, kind="sensor", out=f"form{i}.bin")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("KEYS slots parsed", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertFalse(os.path.lexists(out))
+        # the KEYS body ends at its own "};": the real release slot in a form the tool
+        # skips plus a later array with an empty slot must not add up to SLOTS
+        later = real.replace("{0x76091636u,", "{0x76091636U,") + "constexpr Key OTHER[1] = {\n    {0, {}},\n};\n"
+        path = self.file("later.h", later.encode())
+        with self.assertRaises(sb.FormatError):
+            sb.release_key_table(path)
+        r, out = self.sign(bench, "--test-image", "--release-keys", path, kind="sensor", out="later.bin")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("KEYS slots parsed", r.stderr)
+        self.assertFalse(os.path.lexists(out))
+        # the first of two KEYS tables is not taken on trust: an inactive #ifdef table with
+        # empty slots before the real one in #else (the compiler uses the real one)
+        decl = real.index("constexpr Key KEYS")
+        close = real.index("};", decl) + 2
+        ifdef = (real[:decl] + "#ifdef BENCH_ONLY\nconstexpr Key KEYS[SLOTS] = {{0, {}}, {0, {}}};\n#else\n"
+                 + real[decl:close] + "\n#endif" + real[close:])
+        # a second SLOTS declaration (and a second KEYS table without any #if)
+        slots2 = real.replace("namespace", "namespace A {\nconstexpr size_t SLOTS = 2;\n}\nnamespace", 1)
+        keys2 = real[:close] + "\nconstexpr Key KEYS[1] = {\n    {0, {}},\n};" + real[close:]
+        for name, text, why in (("ifdef.h", ifdef, "preprocessor conditional"),
+                                ("slots2.h", slots2, "more than one SLOTS declaration"),
+                                ("keys2.h", keys2, "more than one KEYS table")):
+            path = self.file(name, text.encode())
+            with self.assertRaises(sb.FormatError):
+                sb.release_key_table(path)
+            r, out = self.sign(bench, "--test-image", "--release-keys", path, kind="sensor", out=name + ".bin")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn(why, r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertFalse(os.path.lexists(out))
+        # a // inside a block comment does not hide the table (and the key is still found):
+        # stripping // first would leave "/* see http:" open up to the "*/" after the table
+        decl = mine.index("constexpr Key KEYS")
+        close = mine.index("};", decl) + 2
+        commented = (mine[:decl] + "/* see http://example.com/keys */\n" + mine[decl:close]
+                     + "\n/* end of table */" + mine[close:])
+        path = self.file("comment.h", commented.encode())
+        self.assertIn(kid, sb.release_key_table(path))
+        r, out = self.sign(bench, "--test-image", "--release-keys", path, kind="sensor", out="comment.bin")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("--test-image with a release key", r.stderr)
+        # a table that is not UTF-8: a clean refusal, no traceback
+        path = self.file("latin1.h", b"// \xff\xfe not UTF-8\n" + real.encode())
+        r, out = self.sign(bench, "--test-image", "--release-keys", path, kind="sensor", out="latin1.bin")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn(path, r.stderr)
+        self.assertIn("not a UTF-8 text file", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertFalse(os.path.lexists(out))
 
     def test_version_from_marker_and_cross_check(self):
         img = gateway_image(desc_version=b"6671d0b", marker=b"2.0.0")

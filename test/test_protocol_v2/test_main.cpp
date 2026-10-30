@@ -610,6 +610,30 @@ static void test_ota_down_payload_limit_and_binding(void)
     TEST_ASSERT_EQUAL(1, (kCapOtaMask >> kCapOtaShift) & ota::kTransferVersion);
 }
 
+// Trailer flags bits 4-5 and JOIN_REQ caps bit 4 (sensor 1.0.1+, spec 3.3 / 10.1 / 14.4)
+static void test_image_identity_flags(void)
+{
+    // the existing flag bits are untouched: bit 0 OTA, bits 8-11 transfer version
+    TEST_ASSERT_EQUAL_HEX32(0, ota::kTrailerIdentityMask & (0x1u | 0xF00u));
+    TEST_ASSERT_EQUAL_HEX8(0, kCapDevIdentity & (kCapClassC | kCapRx2 | kCapOtaMask));
+    const uint32_t ota1 = 0x101; // OTA-capable, transfer version 1 (images before 1.0.1)
+    TEST_ASSERT_EQUAL(ota::kImageIdentityUndeclared, ota::imageIdentity(ota1));
+    TEST_ASSERT_EQUAL(ota::kImageIdentityAny, ota::imageIdentity(ota1 | ota::trailerIdentityFlags(1)));
+    TEST_ASSERT_EQUAL(ota::kImageIdentityProvisioned, ota::imageIdentity(ota1 | ota::trailerIdentityFlags(2)));
+    TEST_ASSERT_EQUAL(ota::kImageIdentityProvisioned, ota::imageIdentity(ota1 | 0x30)); // 3 reserved -> 2
+    TEST_ASSERT_EQUAL_HEX32(0x20, ota::trailerIdentityFlags(ota::kImageIdentityProvisioned));
+    TEST_ASSERT_EQUAL_HEX32(0x10, ota::trailerIdentityFlags(ota::kImageIdentityAny));
+    TEST_ASSERT_EQUAL_HEX32(0, ota::trailerIdentityFlags(4)); // out of the field: nothing
+    // the sensor's check before the swap: only a declared production image on a development identity
+    for (uint32_t cls = 0; cls < 4; cls++)
+    {
+        const uint32_t flags = ota1 | cls << 4;
+        TEST_ASSERT_FALSE(ota::refuseForIdentity(flags, true)); // a provisioned sensor installs everything
+        TEST_ASSERT_EQUAL(cls >= 2, ota::refuseForIdentity(flags, false));
+    }
+    TEST_ASSERT_EQUAL(5, ota::kFailNeedsIdentity);
+}
+
 static void test_ota_session_tlv_rules(void)
 {
     uint8_t buf[32];
@@ -928,6 +952,7 @@ int main(int, char **)
     RUN_TEST(test_ota_start_codec_and_check);
     RUN_TEST(test_ota_session_tlv_rules);
     RUN_TEST(test_ota_status_codec);
+    RUN_TEST(test_image_identity_flags);
     RUN_TEST(test_ota_block_codec_limits);
     RUN_TEST(test_ota_block_math);
     RUN_TEST(test_ota_bitmap_window);

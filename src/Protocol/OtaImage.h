@@ -227,6 +227,20 @@ inline Error validate(const Streamer &s, Trailer &t)
     return Error::None;
 }
 
+// The image needs a provisioned identity record on the sensor (gateway
+// 2.0.2, spec 10.1 / 14.5): its trailer declares it (flags bits 4-5 = 2, the
+// production build e77 from sensor 1.0.1 on), or it declares nothing (built
+// before 1.0.1) and is verified - signed with a release key this firmware
+// carries: every release image is a production build (docs/release.md never
+// signs a bench build), the first one being 1.0.0. The trailer field is the
+// primary source: it is written by the build itself, covered by the image
+// CRC and the signature, and the sensor checks the same field before its swap.
+inline bool needsProvisionedIdentity(uint32_t flags, bool verified)
+{
+    const uint8_t id = ep::ota::imageIdentity(flags);
+    return id == ep::ota::kImageIdentityProvisioned || (id == ep::ota::kImageIdentityUndeclared && verified);
+}
+
 inline void versionText(uint32_t fw, char *out, size_t cap)
 {
     snprintf(out, cap, "%u.%u.%u", (unsigned)(fw >> 16 & 0xFF), (unsigned)(fw >> 8 & 0xFF), (unsigned)(fw & 0xFF));

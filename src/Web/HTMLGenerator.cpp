@@ -1536,7 +1536,9 @@ String HTMLGenerator::generateGen2DetailPage(const Gen2Sensor &g, const String &
         if (g.hasFw)
         {
             kvRow(html, "Firmware",
-                  "HW " + String(g.hwType) + ", " + String(g.fwMajor) + "." + String(g.fwMinor) + "." + String(g.fwPatch));
+                  "HW " + String(g.hwType) + ", " + String(g.fwMajor) + "." + String(g.fwMinor) + "." + String(g.fwPatch) +
+                      ((g.caps & ep::kCapDevIdentity) ? " <small class=w>(development identity - test build)</small>"
+                                                      : ""));
         }
         html += "</table>";
         addGen2EditForm(html, g, id, true);
@@ -1565,8 +1567,12 @@ String HTMLGenerator::generateGen2DetailPage(const Gen2Sensor &g, const String &
     html += "</td></tr>";
     if (g.hasFw)
     {
-        addf(html, "<tr><td>Hardware / firmware</td><td>HW %u, FW %u.%u.%u</td></tr>", g.hwType, g.fwMajor, g.fwMinor,
-             g.fwPatch);
+        addf(html, "<tr><td>Hardware / firmware</td><td>HW %u, FW %u.%u.%u%s</td></tr>", g.hwType, g.fwMajor, g.fwMinor,
+             g.fwPatch,
+             (g.caps & ep::kCapDevIdentity)
+                 ? " <small class=w>(development identity: no identity record - images that need a provisioned "
+                   "identity are not installed)</small>"
+                 : "");
     }
     html += "<tr><td>Boot state</td><td>" + bootStateText(g.bootState);
     if (g.blVersion)
@@ -1678,11 +1684,20 @@ String HTMLGenerator::generateGen2DetailPage(const Gen2Sensor &g, const String &
          "</p><form method='post' action='/sensors/gen2/config'><input type='hidden' name='devId' value='%s'><label "
          "for='interval'>Report interval (s, %u&ndash;%u):</label><input type='number' id='interval' name='interval' "
          "min='%u' max='%u' value='%u' required><small>Below %u s the sensor stretches the interval to its 0.1 %% "
-         "duty-cycle limit.</small><label for='slot'>Slot offset within the interval (s):</label><input "
-         "type='number' id='slot' name='slot' min='0' max='%u' value='%u'>",
+         "duty-cycle limit.</small>",
          id, (unsigned)Gen2Config::MIN_INTERVAL_S, (unsigned)Gen2Config::MAX_INTERVAL_S,
          (unsigned)Gen2Config::MIN_INTERVAL_S, (unsigned)Gen2Config::MAX_INTERVAL_S, (unsigned)c.intervalS,
-         (unsigned)Gen2Config::DUTY_SAFE_INTERVAL_S, (unsigned)(Gen2Config::MAX_INTERVAL_S - 1), (unsigned)c.slotS);
+         (unsigned)Gen2Config::DUTY_SAFE_INTERVAL_S);
+    char slotValue[8] = "";
+    if (!c.slotAuto)
+    {
+        snprintf(slotValue, sizeof(slotValue), "%u", (unsigned)c.slotS);
+    }
+    addf(html,
+         "<label for='slot'>Slot offset within the interval (s; empty = automatic from the DevID):</label><input "
+         "type='number' id='slot' name='slot' min='0' max='%u' value='%s' placeholder='%u'><small>%s %u s.</small>",
+         (unsigned)(Gen2Config::MAX_INTERVAL_S - 1), slotValue, (unsigned)c.slotS,
+         c.slotAuto ? "Automatic slot:" : "Set by hand:", (unsigned)c.slotS);
     addf(html,
          "<label for='txPower'>Sensor TX power (dBm, %d to %d, default %d):</label><input type='number' id='txPower' "
          "name='txPower' min='%d' max='%d' value='%d' oninput='txWarn.hidden=this.value<=%d'><p id=txWarn class=e%s>",

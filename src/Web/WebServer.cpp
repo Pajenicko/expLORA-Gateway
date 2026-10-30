@@ -1697,7 +1697,18 @@ void WebPortal::handleGen2Config(AsyncWebServerRequest *request)
         return value;
     };
     v.intervalS = (uint16_t)number("interval", Gen2Config::MIN_INTERVAL_S, Gen2Config::MAX_INTERVAL_S, v.intervalS);
-    v.slotS = (uint16_t)number("slot", 0, Gen2Config::MAX_INTERVAL_S - 1, v.slotS);
+    // Slot: empty = automatic (from the DevID, follows the interval), a
+    // number = set by the admin, not posted = kept
+    if (request->hasParam("slot", true))
+    {
+        String slotText = request->getParam("slot", true)->value();
+        slotText.trim();
+        v.slotAuto = slotText.length() == 0;
+        if (!v.slotAuto)
+        {
+            v.slotS = (uint16_t)number("slot", 0, Gen2Config::MAX_INTERVAL_S - 1, v.slotS);
+        }
+    }
     v.txPowerDbm = (int8_t)number("txPower", Gen2Config::MIN_TX_POWER_DBM, Gen2Config::MAX_TX_POWER_DBM, v.txPowerDbm);
     v.ackEvery = (uint8_t)number("ackEvery", 0, 255, v.ackEvery);
     v.ackRetries = (uint8_t)number("ackRetries", 0, Gen2Config::MAX_RETRIES, v.ackRetries);
@@ -1707,7 +1718,7 @@ void WebPortal::handleGen2Config(AsyncWebServerRequest *request)
         sendGen2Detail(request, devId, "Not saved: a value is out of range", 400);
         return;
     }
-    if (v.slotS >= v.intervalS)
+    if (!v.slotAuto && v.slotS >= v.intervalS)
     {
         sendGen2Detail(request, devId, "Not saved: the slot offset must be smaller than the interval", 400);
         return;

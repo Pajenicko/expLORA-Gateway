@@ -246,7 +246,13 @@ const char *sensorStep(const Settings &s, const Clock &c, View &v)
         img.stored = si.hasFw && OtaStore::get(si.hw, meta) && meta.valid;
         img.fw = meta.fw;
         img.verified = meta.isSigned();
-        if (sensorSkip(si, img) != Skip::None || held(si.devId))
+        img.needsIdentity = img.stored && OtaImage::needsProvisionedIdentity(meta.flags, img.verified);
+        const Skip skip = sensorSkip(si, img);
+        if (skip == Skip::DevIdentity)
+        {
+            noteRefusal(si.devId, skipText(skip)); // visible: one log line per sensor and reason
+        }
+        if (skip != Skip::None || held(si.devId))
         {
             continue;
         }

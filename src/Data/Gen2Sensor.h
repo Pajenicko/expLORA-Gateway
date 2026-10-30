@@ -81,6 +81,10 @@ struct Gen2Sensor
     // Desired configuration (sent in JOIN_ACC and, on a version mismatch, in a DOWN)
     Gen2Config::Values config;
     uint8_t cfgVersion = 1;    // 1-15, raised on every change of config
+    // Last configuration version the sensor reported (configVersion, kept
+    // across restarts: sensors.json "cfgRun" while not in sync); a new
+    // version never equals it (Gen2Config::nextVersion)
+    uint8_t lastCfgRun = 0;
 
     // Derived at load, RAM only
     ep::KeyPair joinKeys = {};

@@ -41,9 +41,15 @@ pio run -e e77 -t clean && pio run -e e77   # .pio/build/e77/firmware.bin (HW 0x
 The gateway version is `FIRMWARE_VERSION` in `src/version.h` (plain
 maj.min.pat, no suffix: the sign tool refuses a pre-release without
 `--force`, and a gateway cannot compare such a version). The sensor build
-writes the image trailer (`EXLT`, HW type, version, CRC) itself. Only the
-normal environments: never sign a bench build (`e77_bench`, bench CA,
-bench keys).
+writes the image trailer (`EXLT`, HW type, version, CRC, and since sensor
+1.0.1 the identity the image needs) itself. Only the normal environments:
+never sign a bench build (`e77_bench`, bench CA, bench keys). The sign tool
+refuses a sensor image whose trailer does not declare "provisioned identity
+record" (the `e77` build from 1.0.1 on; a bench build or an older image is
+refused unless `--test-image`, which is for bench keys only: it refuses a
+key that is in `src/Security/ReleaseKeys.h`) and prints the
+declaration (`identity: provisioned identity record (production build
+e77)`).
 
 Record the commit hashes of both repositories and the SHA-256 of the
 three unsigned files.
@@ -116,12 +122,63 @@ under 4096 bytes (checked).
    correct `Content-Length` and nothing after it (a gateway refuses a body
    longer or shorter than announced). Never verify a file name before it
    is uploaded.
-3. **Then the manifest**: upload `packages.json` under a temporary name
+3. **Mandatory sensor image test** (every new `hw<HHHH>-<SVER>.bin`,
+   before any manifest names it): install **the published file** on a bench
+   sensor through the gateway's own fetch path and see it confirmed:
+   - the sensor: at least one sensor of that HW type with a **provisioned
+     identity record** (a production image does not run on the development
+     identity – `docs/protocol-v2.md` §14.12; bench sensors are provisioned
+     with `scripts/provision_identity.py` of the sensor repository,
+     `--check` shows the record, and the gen 2 page must not say
+     "development identity"), running the previous released version;
+   - on a bench gateway with the release firmware (Advanced mode, the
+     sensor's gen 2 page): **From a URL** with `<BASE>/hw<HHHH>-<SVER>.bin`
+     (the exact published file over HTTPS; the page must say "verified"
+     with the release key id). This path checks the signature but not a
+     manifest entry (the manifest is not published yet). The tested file
+     is tied to the manifest in two checks: step 2 (the published file's
+     size and SHA-256 equal the local `dist/` file) and this one (the
+     local file's size and SHA-256 equal its `"size"` / `"sha256"` in
+     `dist/packages.json`:
+     `python3 -c "import json; print(json.load(open('dist/packages.json'))['sensor']['<HHHH>'])"`).
+     Then **Update** (no confirmation other than the usual ones may be
+     asked – a "development identity" confirmation means the sensor is not
+     provisioned: stop);
+   - the job must end **Done** and the sensor must report boot state 2
+     (CONFIRMED) with the new version – about 3.5 h at a 600 s interval.
+     Any Failed, Reverted or a boot state other than 2: do not publish the
+     manifest; fix forward with a new version.
+
+   **Old bench sensors** (every manifest with a new production sensor
+   image): a bench or development sensor that cannot report the
+   development identity – a bench build up to 1.0.0 (`e77_bench`) with no
+   identity record – looks provisioned to gateway 2.0.2 (no JOIN_REQ caps
+   bit 4, `docs/protocol-v2.md` §14.12) and would get the new image
+   automatically in its next night: transfer, reset at the first start,
+   revert after three boots (the 1.0.0 case). Before the manifest goes
+   out, on every gateway with automatic **sensor** updates on, each such
+   sensor is provisioned (`scripts/provision_identity.py`) or brought to an
+   `e77_bench` 1.0.1+ build over SWD (a production `e77` build does not
+   run without an identity record), or that gateway's automatic sensor
+   updates are switched off until it is (Firmware page, Advanced). Check
+   the gen 2 page of each sensor: firmware version, and "development
+   identity" shown only for 1.0.1+ bench builds without a record (those
+   are skipped). The rule also holds after the release, for as long as
+   the manifest names a production sensor image: such a sensor is not
+   added to (paired with, or rejoined to after an SWD reflash) a gateway
+   with automatic sensor updates on until it is provisioned or updated;
+   the other way is to switch that gateway's automatic sensor updates off
+   first.
+
+   For a gateway image the bench checks before the release stay as they
+   are (installed on both bench gateways through the normal web path,
+   validated, check / UI / attack / integration suites).
+4. **Then the manifest**: upload `packages.json` under a temporary name
    (e.g. `packages.json.new`), check it over HTTPS
    (`explora_manifest.py verify --pub <PUB> --min-seq <SEQ> <BASE>/packages.json.new`),
    then rename it to `packages.json` on the server (an atomic rename: a
    gateway never sees half a file).
-4. **Post-upload verification**:
+5. **Post-upload verification**:
    ```
    python3 tools/release/explora_manifest.py verify --pub <PUB> --min-seq <SEQ> <BASE>/packages.json
    curl -fsS -o /tmp/chk.json "<BASE>/packages.json?v=$(date +%s)" && cmp /tmp/chk.json dist/packages.json
@@ -205,12 +262,26 @@ to do instead:
   for the confirmation (downgrade) and is then installed. Settings and
   `sensors.json` are kept; a firmware older than 2.0.0 drops the 2.x
   fields it does not know (`docs/protocol-v2.md` §15.7).
+  **Report slots after a 2.0.2 -> 2.0.1 (or older) -> 2.0.2 cycle**: the
+  older firmware rewrites `sensors.json` with the effective slot and
+  without `"slotAuto"` (§4.2), so back on 2.0.2 every gen 2 sensor with a
+  non-zero automatic slot reads as "set by hand": it keeps that second but
+  no longer follows interval changes (and a shorter interval may make the
+  form refuse it). To make a slot automatic again: the sensor's gen 2 page
+  (Advanced) -> Configuration -> empty the "Slot offset" field -> save
+  (the page then says "Automatic slot"). Sensors whose slot was 0 are
+  automatic anyway.
 - **Bad sensor image**: publish a manifest without it (or with a fixed
   `<SVER+1>`). A sensor that does not confirm the new image reverts by
   itself (§10.3) and never gets that version automatically again; the
   automatic job of a version stops after two failures per sensor. An
   older sensor image can be installed by the admin (a downgrade needs the
-  confirmation on the gen 2 page).
+  confirmation on the gen 2 page). Example: in the night of 2026-10-29
+  (bench gateways on 2.0.1, automatic updates on) the production sensor
+  image 1.0.0 reached two bench sensors without an identity record and
+  was reverted on both - the reason for the mandatory test in section 4
+  step 3 and for the development-identity rules of gateway 2.0.2 / sensor
+  1.0.1.
 - Never re-sign a different build under a version that was published, and
   never lower the seq.
 
