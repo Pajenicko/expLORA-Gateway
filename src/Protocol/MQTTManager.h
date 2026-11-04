@@ -21,6 +21,8 @@
 
 #pragma once
 
+#include <atomic>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -43,7 +45,9 @@ class MQTTManager
 {
 private:
     WiFiClient wifiClient;              // WiFi client for MQTT
-    WiFiClientSecure wifiClientSecure;  // WiFi client for MQTTS
+    // MQTTS client: its TLS context (~2 kB) exists only while TLS is configured,
+    // created by the first TLS connect()
+    std::unique_ptr<WiFiClientSecure> wifiClientSecure;
     PubSubClient mqttClient;            // MQTT client
     SensorManager &sensorManager;       // Reference to sensor manager
     ConfigManager &configManager;       // Reference to configuration
@@ -65,17 +69,10 @@ private:
     // Connect to MQTT broker
     bool connect();
 
-    // Create discovery topic for sensor
-    String buildDiscoveryTopic(const SensorData &sensor, const String &valueType);
-
-    // Create configuration JSON for Home Assistant discovery
-    String buildDiscoveryJson(const SensorData &sensor, const String &valueType, const String &stateTopic);
-
-    // Helper function to capitalize first letter
-    String capitalizeFirst(const String &input);
-
-    // Discovery config of one sensor
+    // Discovery config of one sensor (generation 1 or 2), its current values
+    static constexpr size_t HA_PAYLOAD_MAX = 900; // < the 1 kB PubSubClient buffer with the topic
     void publishSensorDiscovery(const SensorData &sensor);
+    void publishState(const SensorData &sensor);
     bool publishRetained(const String &topic, const String &payload);
     volatile bool haRestarted = false; // "online" on <haPrefix>/status
 
@@ -84,11 +81,15 @@ private:
     {
         enum Type : uint8_t
         {
-            Discovery,
-            Removal,
+            Discovery,   // generation 1 sensor (serial number)
+            Removal,     // its entities (serial number or DevID)
+            Gen2Publish, // readings of a generation 2 sensor, discovery first when 'discover'
         } type;
-        uint32_t serialNumber;
+        bool gen2;
+        bool discover;
+        uint32_t id; // serial number or DevID
     };
+    void queue(const PendingOp &op);
     std::mutex pendingMutex;
     std::vector<PendingOp> pending;
     bool reinitRequested = false;
@@ -119,12 +120,15 @@ public:
     // Publish sensor data
     void publishSensorData(int sensorIndex);
 
-    // Remove discovery for deleted sensor
-    void removeDiscoveryForSensor(uint32_t serialNumber);
+    // Remove the entities of a deleted sensor (its ID: 6 or 8 hex digits)
+    void removeDiscoveryForSensor(const String &id);
 
     // Thread-safe requests (any task), carried out by process()
     void requestSensorDiscovery(uint32_t serialNumber);
-    void requestSensorRemoval(uint32_t serialNumber);
+    void requestSensorRemoval(uint32_t id, bool gen2 = false);
+    // A generation 2 sensor: publish its readings; discover: send its
+    // discovery first (new quantities, renamed)
+    void requestGen2Publish(uint32_t devId, bool discover);
     // Copy of the MQTT configuration taken by init() (loop task), so the
     // strings in use - PubSubClient keeps the host pointer - never change
     // under it when the web task saves new settings
@@ -153,6 +157,41 @@ public:
     bool isConnected();
     bool usesTls() const { return cfg.tls; }
 
+    // Connection state for the MQTT page and /diag/heap (any task)
+    enum class Status : uint8_t
+    {
+        Disabled,
+        Waiting,      // not tried yet (uplink offline, first attempt pending)
+        Connected,
+        Failed,       // the broker refused / was unreachable, statusState() has the code
+        Disconnected, // was connected, reconnects
+        TlsLowMemory, // TLS needs more free memory than there is; not tried
+        HeldForAp,    // TLS dropped / held back while the access point cannot start
+        HeldForUpdate // disconnected for an update-mode session (Update/UpdateMode.h)
+    };
+    // Update mode (loop task): true disconnects and keeps MQTT off, false
+    // reconnects at once
+    void holdForUpdate(bool hold);
+    Status status() const { return statusCode.load(); }
+    // A TLS session is up (any task: atomics only - the TLS client itself
+    // belongs to the loop task, which may replace it)
+    bool tlsSessionUp() const { return statusCode.load() == Status::Connected && connectedWithTls.load(); }
+    int statusState() const { return statusMqttState.load(); }
+    // Human readable, with the reason when not connected
+    String statusText() const;
+    // Short machine name of status() (diagnostics JSON)
+    static const char *statusName(Status s);
+
     // Disconnect from MQTT broker
     void disconnect();
+
+private:
+    std::atomic<Status> statusCode{Status::Disabled};
+    std::atomic<int> statusMqttState{0};  // PubSubClient state of the last failed attempt
+    std::atomic<bool> connectedWithTls{false}; // the last connect used TLS
+    std::atomic<uint32_t> tlsLowFree{0};  // internal heap at the last TLS refusal
+    std::atomic<uint32_t> tlsLowLargest{0};
+    bool heldForUpdate = false;           // loop task only
+    bool tlsLowLogged = false;            // the refusal is logged once per episode,
+    unsigned long tlsLowLoggedAt = 0;     // then at most every TLS_LOW_LOG_INTERVAL
 };

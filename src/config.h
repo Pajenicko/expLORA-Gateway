@@ -25,10 +25,10 @@
 #include <WiFi.h>
 #include <esp_mac.h>
 
-// Firmware version
-#define FIRMWARE_VERSION "1.2.0"
+// Firmware version (FIRMWARE_VERSION)
+#include "version.h"
 
-// OTA Configuration: FIRMWARE_UPDATE_URL is per board (board_config.h)
+// Update check: UPDATE_MANIFEST_URL and BOARD_MANIFEST_KEY are in board_config.h
 #include "board_config.h"
 
 // LoRa radio parameters - must match the sensors (receive only)
@@ -38,11 +38,17 @@
 #define LORA_CODING_RATE 5      // 4/5
 #define LORA_SYNC_WORD 0x12     // private network (SX126x: 0x1424)
 #define LORA_PREAMBLE_LENGTH 16
+// Protocol v2 downlink (docs/protocol-v2.md section 1): 869.525 MHz, same
+// modulation; power per board in board_config.h (LORA_DOWNLINK_POWER_DBM)
+#define LORA_DOWNLINK_MHZ 869.525
 
 // Application configuration
 #define MAX_SENSORS 20                // Maximum number of sensors
-#ifndef LOG_BUFFER_SIZE
-#define LOG_BUFFER_SIZE 150           // Size of log buffer (entries)
+#ifndef LOG_RING_BYTES
+#define LOG_RING_BYTES 16384          // Log ring (bytes): ~190 typical entries
+#endif
+#ifndef WEB_HEAVY_RESPONSES_MAX
+#define WEB_HEAVY_RESPONSES_MAX 4     // pages / API responses sent at once, more get 503 (HeapGuard.h)
 #endif
 #define AP_TIMEOUT 300000             // AP mode timeout (5 minutes in milliseconds)
 #define WIFI_RECONNECT_INTERVAL 60000 // WiFi reconnect attempt interval (1 minute in milliseconds)
@@ -51,6 +57,7 @@
 // File system configuration
 #define CONFIG_FILE "/config.json"   // Configuration file
 #define SENSORS_FILE "/sensors.json" // Sensors file
+#define SENSORS_BACKUP_FILE "/sensors.bak" // last good copy of SENSORS_FILE
 
 // NTP configuration
 // Format uint32_t as zero-padded uppercase hex string
@@ -92,15 +99,7 @@ inline String makeApName()
 #define NTP_SERVER_2 "time.cloudflare.com"
 #define NTP_SERVER_3 "time.google.com"
 #define TIME_STALE_AFTER_S (24 * 3600) // no successful sync for this long = stale
-// Timezones offered in the WiFi form (POSIX TZ, label)
-#define TIMEZONE_OPTIONS                                                  \
-    {                                                                     \
-        {"GMT0", "GMT/UTC (00:00)"},                                      \
-        {"WET0WEST,M3.5.0/1,M10.5.0", "Western European (WET/WEST)"},     \
-        {"CET-1CEST,M3.5.0,M10.5.0/3", "Central European (CET/CEST)"},    \
-        {"EET-2EEST,M3.5.0/3,M10.5.0/4", "Eastern European (EET/EEST)"},  \
-        {"MSK-3", "Moscow Time (MSK)"},                                   \
-    }
+// Time zone: the list of names is in Data/TimeZones.h (default Europe/Prague)
 #define DEFAULT_TIMEZONE "CET-1CEST,M3.5.0,M10.5.0/3" // Central European Time with auto DST
 
 // MQTT Configuration
@@ -110,10 +109,20 @@ inline String makeApName()
 #define MQTT_DEFAULT_PASS ""
 #define MQTT_DEFAULT_ENABLED false
 #define MQTT_DEFAULT_TLS false
+#ifndef MQTT_RECONNECT_INTERVAL
 #define MQTT_RECONNECT_INTERVAL 30000 // 30 seconds in milliseconds
+#endif
 #define MQTT_DEFAULT_PREFIX "explora"
 #define HA_DISCOVERY_DEFAULT_ENABLED true
 #define HA_DISCOVERY_DEFAULT_PREFIX "homeassistant"
+
+// "Enable WiFi" switch: only on boards with another local access (ethernet),
+// which keeps the gateway reachable with WiFi off (Network/Uplink.h). The
+// Lite has WiFi as its only uplink, so the setting does not exist there.
+#if defined(HAS_ETHERNET)
+#define HAS_WIFI_SWITCH
+#endif
+#define WIFI_DEFAULT_ENABLED true
 
 // LTE defaults (boards with HAS_LTE)
 #define LTE_DEFAULT_ENABLED false
@@ -129,12 +138,11 @@ inline String makeApName()
 
 // Sensor type definitions - easily extendable for additional types
 #define SENSOR_TYPE_UNKNOWN  0x00
-#define SENSOR_TYPE_BME280   0x01  // Temperature, humidity, pressure
-#define SENSOR_TYPE_SCD40    0x02  // Temperature, humidity, CO2
-#define SENSOR_TYPE_METEO    0x03  // Meteorological station
-#define SENSOR_TYPE_VEML7700 0x04  // Light sensor (LUX)
-#define SENSOR_TYPE_SHT40    0x05  // Temperature, humidity
-#define SENSOR_TYPE_DIY_TEMP 0x51  // Temperature
+#define SENSOR_TYPE_BME280   0x01  // Temperature, humidity, pressure (= SensorTypeIds::CLIMA)
+#define SENSOR_TYPE_SCD40    0x02  // Temperature, humidity, CO2 (= SensorTypeIds::CARBON)
+#define SENSOR_TYPE_METEO    0x03  // Meteorological station (= SensorTypeIds::METEO)
+// (0x04 VEML7700, 0x05 SHT40 and 0x51 DIY_TEMP were removed in 2.0.0: a
+// sensors.json entry of such a type is dropped at load, Data/SensorTypeIds.h)
 // Add additional sensor types here...
 
 // PSRAM configuration for web server

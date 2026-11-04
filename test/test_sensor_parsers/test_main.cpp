@@ -135,88 +135,6 @@ static void test_scd40_max_ppm_uint16(void)
 }
 
 // ---------------------------------------------------------------------------
-// parseDIYTemp
-// ---------------------------------------------------------------------------
-
-static void test_diytemp_too_short_returns_false(void)
-{
-    const uint8_t buf[9] = {0};
-    SensorParsers::DIYTempData d{};
-    TEST_ASSERT_FALSE(SensorParsers::parseDIYTemp(buf, sizeof(buf), d));
-}
-
-static void test_diytemp_decodes_typical_values(void)
-{
-    // temp = -10.50 (-1050 = 0xFBE6)
-    const uint8_t buf[] = {
-        0x00, 0x51, 0x12, 0x34, 0x56, 0x0E, 0xEC, 0x01,
-        0xFB, 0xE6,
-    };
-    SensorParsers::DIYTempData d{};
-    TEST_ASSERT_TRUE(SensorParsers::parseDIYTemp(buf, sizeof(buf), d));
-    TEST_ASSERT_EQUAL_FLOAT(-10.50f, d.temperature);
-}
-
-// ---------------------------------------------------------------------------
-// parseSHT40
-// ---------------------------------------------------------------------------
-
-static void test_sht40_too_short_returns_false(void)
-{
-    const uint8_t buf[11] = {0};
-    SensorParsers::SHT40Data d{};
-    TEST_ASSERT_FALSE(SensorParsers::parseSHT40(buf, sizeof(buf), d));
-}
-
-static void test_sht40_decodes_typical_values(void)
-{
-    // temp = -5.25 (-525 = 0xFDF3), hum = 87.50 (8750 = 0x222E)
-    const uint8_t buf[] = {
-        0x00, 0x05, 0x12, 0x34, 0x56, 0x0B, 0xB8, 0x02,
-        0xFD, 0xF3, 0x22, 0x2E,
-    };
-    SensorParsers::SHT40Data d{};
-    TEST_ASSERT_TRUE(SensorParsers::parseSHT40(buf, sizeof(buf), d));
-    TEST_ASSERT_EQUAL_FLOAT(-5.25f, d.temperature);
-    TEST_ASSERT_EQUAL_FLOAT(87.50f, d.humidity);
-}
-
-// ---------------------------------------------------------------------------
-// parseVEML7700 — uint32 lux value, big-endian
-// ---------------------------------------------------------------------------
-
-static void test_veml7700_too_short_returns_false(void)
-{
-    const uint8_t buf[11] = {0};
-    SensorParsers::VEML7700Data d{};
-    TEST_ASSERT_FALSE(SensorParsers::parseVEML7700(buf, sizeof(buf), d));
-}
-
-static void test_veml7700_decodes_typical_lux(void)
-{
-    // lux = 543.21 (raw 54321 = 0x0000_D431)
-    const uint8_t buf[] = {
-        0x00, 0x04, 0x12, 0x34, 0x56, 0x0E, 0xEC, 0x01,
-        0x00, 0x00, 0xD4, 0x31,
-    };
-    SensorParsers::VEML7700Data d{};
-    TEST_ASSERT_TRUE(SensorParsers::parseVEML7700(buf, sizeof(buf), d));
-    TEST_ASSERT_EQUAL_FLOAT(543.21f, d.lux);
-}
-
-static void test_veml7700_decodes_high_lux_value(void)
-{
-    // lux = 100000 (raw 10_000_000 = 0x0098_9680) — bright daylight
-    const uint8_t buf[] = {
-        0x00, 0x04, 0x12, 0x34, 0x56, 0x0E, 0xEC, 0x01,
-        0x00, 0x98, 0x96, 0x80,
-    };
-    SensorParsers::VEML7700Data d{};
-    TEST_ASSERT_TRUE(SensorParsers::parseVEML7700(buf, sizeof(buf), d));
-    TEST_ASSERT_EQUAL_FLOAT(100000.0f, d.lux);
-}
-
-// ---------------------------------------------------------------------------
 // parseMETEO — basic (20 bytes) vs extended (22 bytes with rain rate)
 // ---------------------------------------------------------------------------
 
@@ -305,15 +223,6 @@ int main(int, char **)
     RUN_TEST(test_scd40_decodes_typical_values);
     RUN_TEST(test_scd40_max_ppm_uint16);
 
-    RUN_TEST(test_diytemp_too_short_returns_false);
-    RUN_TEST(test_diytemp_decodes_typical_values);
-
-    RUN_TEST(test_veml7700_too_short_returns_false);
-    RUN_TEST(test_veml7700_decodes_typical_lux);
-    RUN_TEST(test_veml7700_decodes_high_lux_value);
-
-    RUN_TEST(test_sht40_too_short_returns_false);
-    RUN_TEST(test_sht40_decodes_typical_values);
     RUN_TEST(test_meteo_too_short_returns_false);
     RUN_TEST(test_meteo_basic_packet_decodes_and_lacks_rain_rate);
     RUN_TEST(test_meteo_extended_packet_includes_rain_rate);

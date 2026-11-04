@@ -34,16 +34,22 @@ SPIManager::~SPIManager()
 }
 
 // SPI initialization
-bool SPIManager::init()
+bool SPIManager::init(bool quiet)
 {
-    logger.debug("Initializing SPI interface: SCK=" + String(sckPin) +
-                 ", MISO=" + String(misoPin) + ", MOSI=" + String(mosiPin));
+    if (!quiet)
+    {
+        logger.debug("Initializing SPI interface: SCK=" + String(sckPin) + ", MISO=" + String(misoPin) +
+                     ", MOSI=" + String(mosiPin));
+    }
 
     spi = new SPIClass(HSPI);
 
     if (spi == nullptr)
     {
-        logger.error("Failed to create SPI instance");
+        if (!quiet)
+        {
+            logger.error("Failed to create SPI instance");
+        }
         return false;
     }
 
@@ -51,7 +57,10 @@ bool SPIManager::init()
     spi->begin(sckPin, misoPin, mosiPin);
 
     initialized = true;
-    logger.info("SPI interface initialized successfully");
+    if (!quiet)
+    {
+        logger.info("SPI interface initialized successfully");
+    }
     return true;
 }
 

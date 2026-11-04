@@ -104,7 +104,7 @@ class Config:
     # [wifi]
     home_ssid: str = ""
     home_password: str = ""
-    timezone: str = "CET-1CEST,M3.5.0,M10.5.0/3"
+    timezone: str = "Europe/Prague"
     # [test_sensor]
     sensor_sn: str = ""
     sensor_key: str = ""
@@ -357,7 +357,7 @@ def wifi_switch_macos(interface: str, ssid: str, password: str = "") -> bool:
 def wifi_switch_prompt(ssid: str, password: str = ""):
     """Cross-platform fallback: tell the user what to do, wait for confirmation."""
     if password:
-        print(f"  {YELLOW}>>{RESET} Please connect this computer to WiFi {BOLD}{ssid!r}{RESET} (password: {password!r})")
+        print(f"  {YELLOW}>>{RESET} Please connect this computer to WiFi {BOLD}{ssid!r}{RESET} (password from the [wifi] section of your config)")
     else:
         print(f"  {YELLOW}>>{RESET} Please connect this computer to the open WiFi {BOLD}{ssid!r}{RESET}")
     input(f"  Press {BOLD}ENTER{RESET} once connected … ")
@@ -802,21 +802,96 @@ def t_sensors_page_empty(r: Runner) -> str:
     resp = r.get("/sensors")
     assert_status(resp, [200])
     html = resp.text
-    assert_in("Configured Sensors", html, "sensors page heading")
+    assert_in("<h2>Sensors", html, "sensors page heading")
     assert_in("No sensors", html, "empty-state message")
     return "OK (empty state)"
 
 
+def ui_mode(r: Runner) -> str:
+    """'Simple' or 'Advanced' (the footer of every page names it)."""
+    return "Advanced" if "Advanced mode</footer>" in r.get("/password").text else "Simple"
+
+
+def set_ui_mode(r: Runner, mode: str) -> None:
+    resp = r.post("/system/mode", data={"mode": mode.lower()}, allow_redirects=False)
+    assert_status(resp, [302, 303])
+
+
 def t_sensors_page_with_columns(r: Runner) -> str:
-    """When at least one sensor exists the table renders, and the new
-    health columns must be present (regression guard for 1.1.11)."""
-    resp = r.get("/sensors")
-    assert_status(resp, [200])
-    html = resp.text
-    assert_in("Configured Sensors", html, "sensors page heading")
-    assert_in("Status", html, "Status column header (added in 1.1.11)")
-    assert_in("24h",    html, "24h column header (added in 1.1.11)")
-    return "OK + has health columns"
+    """When at least one sensor exists the table renders with the Status
+    column in both modes; the 24h column (health window) in Advanced only."""
+    before = ui_mode(r)
+    try:
+        set_ui_mode(r, "Simple")
+        html = r.get("/sensors").text
+        assert_in("<h2>Sensors", html, "sensors page heading (Simple)")
+        assert_in("<th>Status</th>", html, "Status column header (Simple)")
+        if "<th>24h</th>" in html:
+            raise TestFailed("24h column in Simple mode")
+        set_ui_mode(r, "Advanced")
+        html = r.get("/sensors").text
+        assert_in("<th>Status</th>", html, "Status column header (Advanced)")
+        assert_in("<th>24h</th>", html, "24h column header (Advanced)")
+    finally:
+        set_ui_mode(r, before)
+    return f"OK in both modes (left in {before})"
+
+
+def t_assets_public_cached(r: Runner) -> str:
+    """/a.css and /a.js: no login, cached for a year (versioned URL)."""
+    for path, kind in (("/a.css", "css"), ("/a.js", "javascript")):
+        resp = requests.get(r.base + path + "?v=1", allow_redirects=False, timeout=5)
+        assert_status(resp, [200])
+        if kind not in resp.headers.get("Content-Type", ""):
+            raise TestFailed(f"{path}: Content-Type {resp.headers.get('Content-Type')!r}")
+        if "max-age=31536000" not in resp.headers.get("Cache-Control", ""):
+            raise TestFailed(f"{path}: Cache-Control {resp.headers.get('Cache-Control')!r}")
+    return "OK"
+
+
+def t_api_gen2_rows(r: Runner) -> str:
+    """Generation 2 sensors in /api: same keys as v1, "gen":2, the DevID as
+    serialNumber, typeName GEN2 (skipped without a gen 2 sensor)."""
+    body = r.get("/api?format=json").json()
+    gen2 = [s for s in body["sensors"] if s.get("gen") == 2]
+    if not gen2:
+        return "no gen 2 sensor on this gateway - skipped"
+    for s in gen2:
+        if not re.match(r"^[0-9A-F]{8}$", str(s.get("serialNumber", ""))) or s.get("typeName") != "GEN2":
+            raise TestFailed(f"bad gen 2 row: {s}")
+        for key in ("deviceType", "name", "batteryVoltage", "rssi", "lastSeen"):
+            if key not in s:
+                raise TestFailed(f"gen 2 row without {key!r}: {s}")
+    one = r.get(f"/api?format=json&sensor={gen2[0]['serialNumber']}").json()["sensors"]
+    if len(one) != 1 or one[0].get("gen") != 2:
+        raise TestFailed(f"?sensor=<DevID> returned {one}")
+    csv = r.get("/api?format=csv").text
+    if gen2[0]["serialNumber"] not in csv:
+        raise TestFailed("gen 2 DevID not in the CSV")
+    return f"{len(gen2)} gen 2 row(s), e.g. {gen2[0]['serialNumber']}"
+
+
+def t_simple_hides_advanced(r: Runner) -> str:
+    """Simple mode shows no gen 2 radio / security internals and no Logs in
+    the navigation; Advanced does (both modes, the mode restored)."""
+    before = ui_mode(r)
+    try:
+        set_ui_mode(r, "Simple")
+        pages = {p: r.get(p).text for p in ("/", "/sensors", "/firmware", "/mqtt")}
+        ids = re.findall(r"devId=([0-9A-F]{8})", pages["/sensors"])
+        if ids:
+            pages["gen2"] = r.get(f"/sensors/gen2?devId={ids[0]}").text
+        for path, html in pages.items():
+            for word in ("devNonce", "MIC failed", "FCnt", "href='/logs'", "Firmware update over the air",
+                         "Signed images only"):
+                if word in html:
+                    raise TestFailed(f"{word!r} on {path} in Simple mode")
+        set_ui_mode(r, "Advanced")
+        if "href='/logs'" not in r.get("/").text:
+            raise TestFailed("no Logs entry in the Advanced navigation")
+    finally:
+        set_ui_mode(r, before)
+    return f"OK (left in {before})"
 
 
 def t_config_page(r: Runner) -> str:
@@ -1025,10 +1100,6 @@ def t_validate_decoded_values(r: Runner, sn: str, sensor_type: int) -> str:
         ppm = sensor.get("ppm", 0)
         if not (300.0 <= float(ppm) <= 10000.0):
             issues.append(f"CO2 {ppm} ppm outside (300, 10000)")
-    elif sensor_type == 4:  # VEML7700
-        lux = sensor.get("lux", 0)
-        if not (0.0 <= float(lux) <= 200000.0):
-            issues.append(f"lux {lux} outside (0, 200k)")
 
     if issues:
         raise TestFailed("; ".join(issues))
@@ -1044,14 +1115,20 @@ def t_validate_decoded_values(r: Runner, sn: str, sensor_type: int) -> str:
 
 
 def t_sensor_visible_in_sensors_page(r: Runner, sn: str) -> str:
-    """Verify the sensor's SN shows up on the /sensors HTML page."""
-    resp = r.get("/sensors")
+    """Verify the sensor's SN shows up on the /sensors HTML page (the ID
+    column of the Advanced mode; Simple shows no serial numbers)."""
+    before = ui_mode(r)
+    try:
+        set_ui_mode(r, "Advanced")
+        resp = r.get("/sensors")
+    finally:
+        set_ui_mode(r, before)
     assert_status(resp, [200])
     sn_upper = sn.upper().lstrip("0")
     # The HTML uses formatSN which uppercases and zero-pads to 6 chars
     if sn_upper not in resp.text.upper():
-        raise TestFailed(f"SN {sn_upper} not present in /sensors HTML")
-    return f"SN {sn_upper} visible on /sensors page"
+        raise TestFailed(f"SN {sn_upper} not present in /sensors HTML (Advanced)")
+    return f"SN {sn_upper} visible on /sensors page (Advanced)"
 
 
 def t_sensor_health_badge_after_packet(r: Runner, sn: str) -> str:
@@ -1062,13 +1139,12 @@ def t_sensor_health_badge_after_packet(r: Runner, sn: str) -> str:
     resp = r.get("/sensors")
     assert_status(resp, [200])
     html = resp.text
-    # The badge HTML looks like `>Healthy</span>` regardless of inline
-    # styling — that substring is unique to renderHealthBadge()'s output.
-    if ">Healthy</span>" not in html:
+    # renderHealthBadge(): `<span class=ok>OK</span>` for a healthy sensor
+    if "<span class=ok>OK</span>" not in html:
         raise TestFailed(
-            "no 'Healthy' badge on /sensors — recordSensorSuccess didn't fire?"
+            "no 'OK' status on /sensors — recordSensorSuccess didn't fire?"
         )
-    return "Healthy badge present in HTML"
+    return "OK status present in HTML"
 
 
 # ----------------------------------------------------------------- login
@@ -1210,8 +1286,7 @@ def main():
         "--test-sensor-type",
         type=int,
         default=1,
-        help="Sensor type code: 1=BME280, 2=SCD40, 3=METEO, 4=VEML7700, "
-        "0x51=DIY_TEMP (default: 1)",
+        help="Sensor type code: 1=CLIMA (BME280), 2=CARBON (SCD40), 3=METEO (default: 1)",
     )
     parser.add_argument(
         "--admin-password",
@@ -1358,6 +1433,9 @@ def main():
     r.run("firmware version JSON", lambda: t_firmware_version(r))
     r.run("/api?format=json shape", lambda: t_api_json(r))
     r.run("/api?format=csv basics", lambda: t_api_csv(r))
+    r.run("/api gen 2 rows", lambda: t_api_gen2_rows(r))
+    r.run("/a.css and /a.js public and cached", lambda: t_assets_public_cached(r))
+    r.run("Simple mode hides the Advanced content", lambda: t_simple_hides_advanced(r))
     if sensor_sn:
         r.run("/sensors page (has health columns)", lambda: t_sensors_page_with_columns(r))
     else:
@@ -1395,7 +1473,7 @@ def main():
             lambda: t_sensor_visible_in_sensors_page(r, sensor_sn),
         )
         r.run(
-            "/sensors page shows Healthy badge after packet",
+            "/sensors page shows the OK status after packet",
             lambda: t_sensor_health_badge_after_packet(r, sensor_sn),
         )
     else:

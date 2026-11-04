@@ -1,0 +1,225 @@
+/**
+ * expLORA Gateway
+ *
+ * Radio task - the only code that talks to the LoRa radio after setup()
+ *
+ * A statically created FreeRTOS task (core 1, priority RADIO_TASK_PRIORITY,
+ * above AsyncTCP, below esp_timer) owns the radio driver and its SPI bus:
+ * it reads every packet right after the RxDone interrupt, together with
+ * RSSI, SNR, frequency error and the interrupt time, and queues it for
+ * loop(). It also runs the periodic radio health check. A stalled loop()
+ * (LTE modem, TLS handshake) therefore no longer loses or delays packets in
+ * the radio. The task never takes sensorMutex, never touches LittleFS/NVS
+ * and never logs (protocol v2, docs/protocol-v2.md section 7).
+ *
+ * Timed responses (protocol v2 downlink): for a frame with the generation 2
+ * marker and a reliable timestamp the task takes the flash write permit at
+ * RxDone (FlashPermit::tryHoldForRadio) and gives the packet a responseSlot.
+ * loop() must then answer the slot - respond() with the finished frames
+ * (built from the sensor model, well before RX1 - 20 ms) or cancel(). The
+ * task only checks the duty cycle, stages and launches the frame on the
+ * downlink channel and reports the outcome through takeResult().
+ *
+ * OTA frames (protocol v2, docs/protocol-v2.md 14.5): one 255-byte frame
+ * slot with its slot time, built by loop() >= 300 ms before the slot. At
+ * launch - 20 ms the task checks that no header is being received, that no
+ * RX1 / RX2 window of a generation 2 UP of the last ~2.4 s overlaps the
+ * frame, the OTA share of the duty cycle and its OTA -> OTA pacing, holds
+ * the flash permit to the launch and skips a launch more than 15 ms late.
+ * OTA is the lowest priority: it never pre-empts a reception or a response.
+ *
+ * Copyright Pajenicko s.r.o., Igor Sverma (C) 2026
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ */
+
+#pragma once
+
+#include <Arduino.h>
+#include "../Data/Logging.h"
+#include "LoRaRadio.h"
+
+constexpr UBaseType_t RADIO_TASK_PRIORITY = 14;
+constexpr BaseType_t RADIO_TASK_CORE = 1;
+// Stack: at most 1.6 kB used (Pro and Lite, incl. downlinks). Queue: never
+// more than one packet waiting in the bench history (radio.queueHigh), but
+// loop() can stall for seconds (MQTT TLS connect, update check, URL update,
+// custom-URL forwarding, sensors.json writes) - 8 packets (~2.1 kB) ride
+// that out
+constexpr uint32_t RADIO_TASK_STACK = 4096;     // bytes
+constexpr UBaseType_t RADIO_QUEUE_LENGTH = 8;   // packets
+constexpr uint32_t RADIO_HEALTH_CHECK_MS = 600000; // radio working
+constexpr uint32_t RADIO_RETRY_MS = 30000;         // radio not initialized / not answering
+constexpr size_t RADIO_TX_MAX = 96;                // longest downlink frame staged by the task
+constexpr size_t RADIO_OTA_MAX = 255;              // OTA session frame (one block)
+
+// One received packet with its reception metadata
+struct RadioPacket
+{
+    uint8_t data[255];
+    uint8_t length;
+    int16_t rssi;      // dBm
+    float snr;         // dB
+    float freqError;   // Hz (transmitter vs. gateway)
+    int64_t rxTimeUs;  // esp_timer time of the RxDone interrupt
+    bool timeReliable; // false: RxDone may have been held off by a flash write
+    uint32_t responseSlot; // != 0: a timed response is possible; loop() must respond() or cancel()
+};
+
+// A response for one responseSlot, built by loop()
+struct TxRequest
+{
+    uint32_t slot;
+    uint32_t devId;
+    bool priority; // JOIN_ACC, REJOIN, event ACK: may pre-empt a reception in progress
+    bool join;     // counts against the JOIN_ACC share of the duty cycle
+    uint8_t len1;  // RX1 frame (T + 1000 ms)
+    uint8_t len2;  // RX2 frame (T + 2000 ms; the time TLV one second later), 0 = no RX2
+    uint8_t frame1[RADIO_TX_MAX];
+    uint8_t frame2[RADIO_TX_MAX];
+};
+
+enum class TxOutcome : uint8_t
+{
+    Rx1,         // sent in RX1
+    Rx2,         // sent in RX2
+    LateRequest, // the request came after the last window could be prepared
+    Busy,        // a reception was in progress in both windows
+    Budget,      // duty cycle: data share exhausted
+    JoinBudget,  // duty cycle: JOIN_ACC share exhausted
+    Pacing,      // duty cycle: off-time after the previous downlink too short
+    NoHold,      // a flash write was running at T2 - 20 ms
+    Late,        // the launch would have been > 40 ms late (flash stall, preemption)
+    Failed,      // driver error
+};
+
+enum class OtaKind : uint8_t
+{
+    Block,
+    End, // OTA end (pause / abort of the admin) in a block slot
+};
+
+// One OTA session frame for the radio task
+struct OtaFrame
+{
+    uint32_t seq;      // != 0, chosen by loop()
+    uint32_t devId;
+    int64_t slotUs;    // esp_timer time of the sensor's slot (the task subtracts its chip offset)
+    OtaKind kind;
+    uint16_t index;    // block index
+    uint8_t len;
+    uint8_t frame[RADIO_OTA_MAX];
+};
+
+enum class OtaOutcome : uint8_t
+{
+    Sent,
+    Busy,        // a header was being received
+    Response,    // an RX1 / RX2 window of a recent UP overlaps
+    Budget,      // data share exhausted
+    OtaBudget,   // OTA share (60 % of the data share) exhausted
+    Pacing,      // 9 x t after the previous OTA frame not over
+    NoHold,      // a flash write was running at launch - 20 ms
+    Late,        // more than 15 ms late
+    Failed,      // driver error
+    Cancelled,   // loop() withdrew it (session ended)
+};
+
+struct OtaResult
+{
+    uint32_t seq;
+    uint32_t devId;
+    OtaKind kind;
+    uint16_t index;
+    OtaOutcome outcome;
+    uint16_t airtimeMs;
+    int32_t lateUs; // launch vs plan (sent frames)
+};
+
+struct TxResult
+{
+    uint32_t slot;
+    uint32_t devId;
+    TxOutcome outcome;
+    bool join;
+    uint16_t airtimeMs; // 0 when nothing was sent
+};
+
+
+namespace RadioTask
+{
+struct Stats
+{
+    uint32_t received;      // packets queued
+    uint32_t crcErrors;     // RxDone with a CRC error
+    uint32_t readErrors;    // RxDone without a valid packet (read error, length)
+    uint32_t queueDrops;    // queue full (loop() stalled for more than RADIO_QUEUE_LENGTH packets): newest dropped
+    uint32_t queueHigh;     // most packets waiting at once
+    uint32_t maxLatencyMs;  // longest RxDone -> loop() pickup (packets received after loop() started)
+    uint32_t resetsOk;      // health check re-initializations that worked
+    uint32_t resetsFailed;  // ... that failed (retried every RADIO_RETRY_MS)
+    uint32_t selfHeals;     // RxDone found by polling the DIO line (missed interrupt edge)
+    uint32_t unreliableTime; // RxDone during / right after a flash write (no timed response possible)
+    uint32_t holdFails;     // gen2 frame, reliable time, but the permit could not be taken at RxDone
+    uint32_t slotsBusy;     // gen2 frame while another response was pending (no timed response)
+    uint32_t txRx1, txRx2;  // responses sent per window
+    uint32_t txBusy, txBudget, txPacing, txLate, txNoHold, txFailed, txLateRequest; // responses not sent
+    uint32_t txDoneTimeouts; // no TxDone within airtime + 100 ms
+    uint32_t dutyUsedMs;    // downlink airtime in the last hour (all)
+    uint32_t joinUsedMs;    // ... JOIN_ACC / REJOIN share
+    uint32_t otaUsedMs;     // ... OTA frames
+    uint32_t otaSent;       // OTA frames launched
+    uint32_t otaSkipped[10]; // per OtaOutcome (index 0 unused)
+    int32_t otaMaxLateUs;   // latest launch of a sent OTA frame
+    RadioError lastError;   // last driver error (read or reset)
+    uint32_t stackFree;     // task stack high-water mark, bytes
+};
+
+// Start the task for an initialized radio (once, from setup())
+bool start(LoRaRadio *radio, Logger &logger);
+
+// loop(): next queued packet, false when none. The first call marks the
+// start of loop(): packets received while setup() was still running (up to
+// ~1 s after the task started) are not counted in maxLatencyMs.
+bool receive(RadioPacket &packet);
+
+Stats stats();
+
+// Heartbeat for Hardware/Liveness.cpp: the task runs, and a counter it
+// advances on every pass of its loop (any task)
+bool running();
+uint32_t beats();
+
+// loop(): answer a responseSlot. false: queue full (the slot then expires)
+bool respond(const TxRequest &request);
+// loop(): no response to this slot (releases the flash permit at once)
+void cancel(uint32_t slot);
+// loop(): outcome of a respond(), false when none is waiting
+bool takeResult(TxResult &result);
+const char *txOutcomeName(TxOutcome outcome);
+
+// loop(): the one OTA frame slot to fill (static, shared with the task),
+// nullptr while the previous frame is still with the task
+OtaFrame *otaFrameSlot();
+// loop(): hand the filled slot over
+void otaSubmit();
+// loop(): withdraw the frame with this seq if it has not been launched
+void otaCancel(uint32_t seq);
+// loop(): outcome of an OTA frame, false when none is waiting
+bool otaTakeResult(OtaResult &result);
+const char *otaOutcomeName(OtaOutcome outcome);
+
+// Update mode (Update/UpdateMode.h): ask the task to put the radio in
+// standby (true) or back to receive (false), any task. paused() is true
+// once the radio is in standby; a response in progress is finished first
+// (<= ~3 s). Paused, the task keeps its liveness heartbeat
+void setPaused(bool paused);
+bool paused();
+
+// loop(): log what the radio task counted since the last call (the task
+// itself never logs - Logger formats Strings and takes the UART lock)
+void logEvents(Logger &logger);
+} // namespace RadioTask

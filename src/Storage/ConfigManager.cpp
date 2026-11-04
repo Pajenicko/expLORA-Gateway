@@ -24,6 +24,8 @@
 #include <WiFi.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
+#include "../Hardware/FlashPermit.h"
+#include "../Data/TimeZones.h"
 
 // Constructor
 ConfigManager::ConfigManager(Logger &log, const char *file)
@@ -47,7 +49,8 @@ ConfigManager::~ConfigManager()
 // Initialization
 bool ConfigManager::init()
 {
-    // Initialize Preferences
+    // Initialize Preferences (creates the namespace on the first boot)
+    FlashWriteGuard flashGuard; // see Hardware/FlashPermit.h
     preferencesInitialized = preferences.begin("sverio", false);
 
     if (!preferencesInitialized)
@@ -66,9 +69,15 @@ bool ConfigManager::init()
 // Load configuration from both sources
 bool ConfigManager::load()
 {
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
     std::lock_guard<std::recursive_mutex> guard(configMutex);
     bool fsSuccess = loadFromFS();
     bool prefSuccess = loadFromPreferences();
+    if (resolveTimezone() && (fsSuccess || prefSuccess))
+    {
+        logger.info("Time zone setting updated to " + (timezoneName.length() ? timezoneName : String("custom")) + ", saving");
+        save();
+    }
 
     if (fsSuccess)
     {
@@ -86,6 +95,7 @@ bool ConfigManager::load()
 // Save configuration to both sources
 bool ConfigManager::save()
 {
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
     std::lock_guard<std::recursive_mutex> guard(configMutex);
     bool fsSuccess = saveToFS();
     bool prefSuccess = saveToPreferences();
@@ -114,6 +124,7 @@ bool ConfigManager::save()
 // Loading from LittleFS
 bool ConfigManager::loadFromFS()
 {
+    FlashWriteGuard flashGuard; // see Hardware/FlashPermit.h
     // Power lost between removing the old file and renaming the new one
     String tmpFile = String(configFile) + ".tmp";
     if (!LittleFS.exists(configFile) && LittleFS.exists(tmpFile))
@@ -153,6 +164,8 @@ bool ConfigManager::loadFromFS()
     wifiPassword = doc["password"].as<String>();
     configMode = doc["configMode"] | true;
     timezone = doc["timezone"] | DEFAULT_TIMEZONE;
+    timezoneName = doc["tzName"] | "";
+    timezoneNamePosix = doc["tzNamePosix"] | "";
 
     // MQTT configuration
     mqttHost = doc["mqttHost"] | MQTT_DEFAULT_HOST;
@@ -164,6 +177,7 @@ bool ConfigManager::loadFromFS()
     mqttPrefix = doc["mqttPrefix"] | MQTT_DEFAULT_PREFIX;
     mqttHAPrefix = doc["mqttHAPrefix"] | HA_DISCOVERY_DEFAULT_PREFIX;
     mqttHAEnabled = doc["mqttHAEnabled"] | HA_DISCOVERY_DEFAULT_ENABLED;
+    uiAdvanced = doc["uiAdvanced"] | false;
 
     logger.debug("Loaded config - SSID: " + wifiSSID +
                  ", Password length: " + String(wifiPassword.length()) +
@@ -189,6 +203,8 @@ bool ConfigManager::saveToFS()
     doc["configMode"] = configMode;
     doc["logLevel"] = logger.levelToString(logLevel);
     doc["timezone"] = timezone;
+    doc["tzName"] = timezoneName;
+    doc["tzNamePosix"] = timezoneNamePosix;
     doc["mqttHost"] = mqttHost;
     doc["mqttPort"] = mqttPort;
     doc["mqttUser"] = mqttUser;
@@ -198,6 +214,7 @@ bool ConfigManager::saveToFS()
     doc["mqttPrefix"] = mqttPrefix;
     doc["mqttHAEnabled"] = mqttHAEnabled;
     doc["mqttHAPrefix"] = mqttHAPrefix;
+    doc["uiAdvanced"] = uiAdvanced;
     if (doc.overflowed())
     {
         logger.error("Configuration does not fit the JSON document - not saved");
@@ -205,6 +222,7 @@ bool ConfigManager::saveToFS()
     }
 
     String tmpFile = String(configFile) + ".tmp";
+    FlashWriteGuard flashGuard; // see Hardware/FlashPermit.h
     File file = LittleFS.open(tmpFile, "w");
     if (!file)
     {
@@ -251,6 +269,14 @@ bool ConfigManager::loadFromPreferences()
     {
         timezone = preferences.getString("timezone", DEFAULT_TIMEZONE);
     }
+    if (preferences.isKey("tzName"))
+    {
+        timezoneName = preferences.getString("tzName", "");
+    }
+    if (preferences.isKey("tzNamePosix"))
+    {
+        timezoneNamePosix = preferences.getString("tzNamePosix", "");
+    }
 
     // MQTT configuration from preferences
     if (preferences.isKey("mqttHost"))
@@ -291,12 +317,17 @@ bool ConfigManager::loadFromPreferences()
         mqttHAPrefix = preferences.getString("mqttHAPrefix", HA_DISCOVERY_DEFAULT_PREFIX);
     }
 
+#if defined(HAS_WIFI_SWITCH)
+    wifiEnabled = preferences.getBool("wifiEnabled", WIFI_DEFAULT_ENABLED);
+#endif
     lteEnabled = preferences.getBool("lteEnabled", LTE_DEFAULT_ENABLED);
     lteApn = preferences.getString("lteApn", LTE_DEFAULT_APN);
     ltePin = preferences.getString("ltePin", "");
     ltePinRejected = preferences.getBool("ltePinBad", false);
 
     adminPasswordHash = preferences.getString("adminPwd", "");
+    signedOnly = preferences.getBool("signedOnly", false);
+    autoUpdate = preferences.getUInt("autoUpd", 0);
 
     ethStatic = preferences.getBool("ethStatic", false);
     ethIp = preferences.getString("ethIp", "");
@@ -320,6 +351,7 @@ bool ConfigManager::loadFromPreferences()
 // Saving to Preferences
 bool ConfigManager::saveToPreferences()
 {
+    FlashWriteGuard flashGuard; // see Hardware/FlashPermit.h
     if (!preferencesInitialized)
     {
         return false;
@@ -329,6 +361,8 @@ bool ConfigManager::saveToPreferences()
     String logLevelStr = logger.levelToString(logLevel);
     preferences.putString("logLevel", logLevelStr);
     preferences.putString("timezone", timezone);
+    preferences.putString("tzName", timezoneName);
+    preferences.putString("tzNamePosix", timezoneNamePosix);
 
     // Save MQTT configuration
     preferences.putString("mqttHost", mqttHost);
@@ -341,6 +375,11 @@ bool ConfigManager::saveToPreferences()
     preferences.putBool("mqttHAEnabled", mqttHAEnabled);
     preferences.putString("mqttHAPrefix", mqttHAPrefix);
 
+#if defined(HAS_WIFI_SWITCH)
+    preferences.putBool("wifiEnabled", wifiEnabled);
+#endif
+    preferences.putBool("signedOnly", signedOnly);
+    preferences.putUInt("autoUpd", autoUpdate);
     preferences.putBool("lteEnabled", lteEnabled);
     preferences.putString("lteApn", lteApn);
     preferences.putString("ltePin", ltePin);
@@ -361,8 +400,71 @@ bool ConfigManager::saveToPreferences()
 }
 
 // Add a new method to set MQTT configuration
+bool ConfigManager::setWifiEnabled(bool enabled, bool saveConfig)
+{
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
+    wifiEnabled = enabled;
+    if (saveConfig)
+    {
+        return save();
+    }
+    return true;
+}
+
+bool ConfigManager::setSignedOnly(bool on)
+{
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
+    // The option lives only in Preferences (not in config.json): one key is
+    // written, read back, and RAM changes only when it is on flash - a failed
+    // save never leaves RAM and flash disagreeing
+    if (!preferencesInitialized)
+    {
+        return false;
+    }
+    if (preferences.putBool("signedOnly", on) == 0 || preferences.getBool("signedOnly", !on) != on)
+    {
+        logger.error("Signed images only: the setting could not be saved");
+        return false;
+    }
+    signedOnly = on;
+    return true;
+}
+
+bool ConfigManager::setAutoUpdate(uint32_t packed)
+{
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
+    // One Preferences key, read back (as signedOnly)
+    if (!preferencesInitialized || preferences.putUInt("autoUpd", packed) == 0 ||
+        preferences.getUInt("autoUpd", ~packed) != packed)
+    {
+        logger.error("Automatic updates: the setting could not be saved");
+        return false;
+    }
+    autoUpdate = packed;
+    return true;
+}
+
+bool ConfigManager::setUiAdvanced(bool advanced)
+{
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
+    // Only in config.json: RAM keeps the old mode when the file is not written
+    const bool old = uiAdvanced;
+    uiAdvanced = advanced;
+    if (!saveToFS())
+    {
+        uiAdvanced = old;
+        return false;
+    }
+    return true;
+}
+
 bool ConfigManager::setLteConfig(bool enabled, const String &apn, const String &pin, bool saveConfig)
 {
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
     std::lock_guard<std::recursive_mutex> guard(configMutex);
     // PIN: empty or 4-8 digits
     bool pinOk = pin.length() == 0 || (pin.length() >= 4 && pin.length() <= 8);
@@ -434,6 +536,7 @@ static bool parseIPv4(const String &text, String &normalized)
 String ConfigManager::setEthernetConfig(bool useStatic, const String &ip, const String &mask, const String &gateway,
                                         const String &dns1, const String &dns2, bool saveConfig)
 {
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
     std::lock_guard<std::recursive_mutex> guard(configMutex);
     String nIp, nMask, nGateway, nDns1, nDns2;
     bool ipOk = parseIPv4(ip, nIp);
@@ -502,6 +605,7 @@ String ConfigManager::setEthernetConfig(bool useStatic, const String &ip, const 
 
 void ConfigManager::setLtePinRejected(bool rejected)
 {
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
     std::lock_guard<std::recursive_mutex> guard(configMutex);
     ltePinRejected = rejected;
     if (preferencesInitialized)
@@ -512,6 +616,7 @@ void ConfigManager::setLtePinRejected(bool rejected)
 
 bool ConfigManager::setAdminPasswordHash(const String &hash)
 {
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
     std::lock_guard<std::recursive_mutex> guard(configMutex);
     if (!preferencesInitialized)
     {
@@ -541,6 +646,7 @@ bool ConfigManager::setMqttConfig(const String &host, int port, const String &us
                                   const String &rootPrefix, const String &haPrefix, bool haEnable,
                                   bool saveConfig)
 {
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
     std::lock_guard<std::recursive_mutex> guard(configMutex);
     // Validate MQTT topic format (basic validation)
     // A prefix stored by an older version (e.g. with '/') may be kept as it is
@@ -613,10 +719,13 @@ void ConfigManager::resetToDefaults()
 {
     wifiSSID = "";
     wifiPassword = "";
+    uiAdvanced = false;
     configMode = true;
     lastWifiAttempt = 0;
     logLevel = LogLevel::INFO;
     timezone = DEFAULT_TIMEZONE;
+    timezoneName = TimeZones::DEFAULT_NAME;
+    timezoneNamePosix = DEFAULT_TIMEZONE;
     mqttHost = MQTT_DEFAULT_HOST;
     mqttPort = MQTT_DEFAULT_PORT;
     mqttUser = MQTT_DEFAULT_USER;
@@ -625,6 +734,9 @@ void ConfigManager::resetToDefaults()
     mqttTls = MQTT_DEFAULT_TLS;
     mqttPrefix = MQTT_DEFAULT_PREFIX;
     mqttHAEnabled = HA_DISCOVERY_DEFAULT_ENABLED;
+    wifiEnabled = WIFI_DEFAULT_ENABLED;
+    signedOnly = false;
+    autoUpdate = 0;
     lteEnabled = LTE_DEFAULT_ENABLED;
     lteApn = LTE_DEFAULT_APN;
     ltePin = "";
@@ -679,6 +791,7 @@ String ConfigManager::getDeviceName() const
 // Set WiFi configuration
 bool ConfigManager::setWiFiConfig(const String &ssid, const String &password, bool saveConfig)
 {
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
     std::lock_guard<std::recursive_mutex> guard(configMutex);
     wifiSSID = ssid;
     wifiPassword = password;
@@ -693,9 +806,65 @@ bool ConfigManager::setWiFiConfig(const String &ssid, const String &password, bo
     return true;
 }
 
+// Settings from before the time zone list hold only a POSIX string: it maps
+// to the closest entry or stays custom. A known name takes the table's
+// string, so corrected rules reach stored settings, unless an older firmware
+// changed the string after the name (see TimeZones::resolve). true = the
+// setting changed and should be saved.
+bool ConfigManager::resolveTimezone()
+{
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
+    String oldName = timezoneName, oldPosix = timezone, oldNamePosix = timezoneNamePosix;
+    int index = TimeZones::resolve(timezoneName.c_str(), timezone.c_str(), timezoneNamePosix.c_str());
+    setTimezoneFields(index);
+    return timezoneName != oldName || timezone != oldPosix || timezoneNamePosix != oldNamePosix;
+}
+
+// Name, POSIX string and the string written with the name always together;
+// -1 = keep the POSIX string as a custom zone
+void ConfigManager::setTimezoneFields(int zoneIndex)
+{
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
+    if (zoneIndex >= 0)
+    {
+        timezoneName = TimeZones::ZONES[zoneIndex].name;
+        timezone = TimeZones::ZONES[zoneIndex].posix;
+        timezoneNamePosix = timezone;
+    }
+    else
+    {
+        timezoneName = "";
+        timezoneNamePosix = "";
+    }
+}
+
+bool ConfigManager::setTimezone(int zoneIndex)
+{
+    if (zoneIndex < 0 || zoneIndex >= (int)TimeZones::COUNT)
+    {
+        return false;
+    }
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
+    std::lock_guard<std::recursive_mutex> guard(configMutex);
+    String oldName = timezoneName, oldPosix = timezone, oldNamePosix = timezoneNamePosix;
+    setTimezoneFields(zoneIndex);
+    if (!save())
+    {
+        // One store may hold the new zone: write the old one to both, so
+        // they agree with what the page reports (the previous zone)
+        timezoneName = oldName;
+        timezone = oldPosix;
+        timezoneNamePosix = oldNamePosix;
+        save();
+        return false;
+    }
+    return true;
+}
+
 // Switch to configuration mode (AP)
 void ConfigManager::enableConfigMode(bool enable, bool saveConfig)
 {
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
     std::lock_guard<std::recursive_mutex> guard(configMutex);
     // Called on every boot - only write flash when it changes
     if (configMode == enable)
@@ -713,6 +882,7 @@ void ConfigManager::enableConfigMode(bool enable, bool saveConfig)
 // Set logging level
 void ConfigManager::setLogLevel(LogLevel level, bool saveConfig)
 {
+    FlashWriteGuard flashPermit; // lock order: flash permit before configMutex
     std::lock_guard<std::recursive_mutex> guard(configMutex);
     logLevel = level;
 

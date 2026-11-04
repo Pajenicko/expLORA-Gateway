@@ -23,6 +23,8 @@
 
 #include <Arduino.h>
 #include "../config.h"
+#include "SensorTypeIds.h"
+#include "Quantity.h"
 
 /**
  * Definition of sensor types and their properties
@@ -38,10 +40,7 @@ enum class SensorType : uint8_t
     UNKNOWN = SENSOR_TYPE_UNKNOWN,
     BME280 = SENSOR_TYPE_BME280,       // Temperature, humidity, pressure
     SCD40 = SENSOR_TYPE_SCD40,         // Temperature, humidity, CO2
-    VEML7700 = SENSOR_TYPE_VEML7700,   // Light sensor (LUX)
     METEO = SENSOR_TYPE_METEO,         // Meteorological station
-    SHT40 = SENSOR_TYPE_SHT40,         // Temperature, humidity
-    DIY_TEMP = SENSOR_TYPE_DIY_TEMP,   // Temperature sensor (DS18B20)
     // Add more sensor types here...
 };
 
@@ -52,31 +51,27 @@ struct SensorTypeInfo
     const char *name;           // Sensor type name
     uint8_t expectedDataLength; // Expected data length in packet (excluding header and checksum)
     uint8_t packetDataOffset;   // Offset where sensor data begins in the packet
-    bool hasTemperature;        // Whether sensor provides temperature
-    bool hasHumidity;           // Whether sensor provides humidity
-    bool hasPressure;           // Whether sensor provides pressure
-    bool hasPPM;                // Whether sensor provides PPM (CO2)
-    bool hasLux;                // Whether sensor provides illumination (lux)
-    bool hasWindSpeed;          // Whether sensor provides wind speed
-    bool hasWindDirection;      // Whether sensor provides wind direction
-    bool hasRainAmount;         // Whether sensor provides rain amount
-    bool hasRainRate;           // Whether sensor provides rain intensity
-    // Possibility to add more parameters as needed
+    uint16_t q;                 // Quantities it provides (Qty::mask), battery and signal included
 };
+
+// Quantities of every generation 1 sensor, and of the types
+constexpr uint16_t Q_ANY = Qty::mask(Qty::Battery) | Qty::mask(Qty::Rssi);
+constexpr uint16_t Q_CLIMA = Q_ANY | Qty::mask(Qty::Temperature) | Qty::mask(Qty::Humidity) | Qty::mask(Qty::Pressure);
+constexpr uint16_t Q_CARBON = Q_ANY | Qty::mask(Qty::Temperature) | Qty::mask(Qty::Humidity) | Qty::mask(Qty::Co2);
+constexpr uint16_t Q_METEO = Q_CLIMA | Qty::mask(Qty::WindSpeed) | Qty::mask(Qty::WindDir) | Qty::mask(Qty::Rain) |
+                             Qty::mask(Qty::DailyRain) | Qty::mask(Qty::RainRate);
 
 // Table of sensor type definitions - for easy lookup and adding new types
 const SensorTypeInfo SENSOR_TYPE_DEFINITIONS[] = {
-    // type,                 name,       dataLen, offset, temp,  hum,   press, ppm,   lux,   windS, windD, rain,  rainR
-    {SensorType::UNKNOWN, "Unknown",  0, 7, false, false, false, false, false, false, false, false, false},
-    {SensorType::BME280,    "CLIMA",  6, 7, true,  true,  true,  false, false, false, false, false, false},
-    {SensorType::SCD40,    "CARBON",  6, 7, true,  true,  false,  true, false, false, false, false, false},
-    {SensorType::METEO,     "METEO", 14, 7, true,  true,  true,  false, false,  true,  true,  true,  true},
-    {SensorType::SHT40,     "SHT40",  4, 7, true,  true,  false, false, false, false, false, false, false},
-    //{SensorType::VEML7700,  "VEML7700",     4,     7,    false, false, false, false, true,  false, false, false, false},
-    {SensorType::DIY_TEMP, "DIY_TEMP",     2,     7,    true,  false, false, false, false, false, false, false, false},
-
-    // Add more sensor types here in the future...
+    {SensorType::UNKNOWN, "Unknown", 0, 7, 0},
+    {SensorType::BME280, "CLIMA", 6, 7, Q_CLIMA},
+    {SensorType::SCD40, "CARBON", 6, 7, Q_CARBON},
+    {SensorType::METEO, "METEO", 14, 7, Q_METEO},
 };
+
+static_assert(SENSOR_TYPE_BME280 == SensorTypeIds::CLIMA && SENSOR_TYPE_SCD40 == SensorTypeIds::CARBON &&
+                  SENSOR_TYPE_METEO == SensorTypeIds::METEO,
+              "SensorTypeIds.h: the supported types are the table's");
 
 // Helper function to get information about sensor type by enum value
 inline const SensorTypeInfo &getSensorTypeInfo(SensorType type)

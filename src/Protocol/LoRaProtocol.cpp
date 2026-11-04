@@ -20,12 +20,13 @@
  */
 
 #include "LoRaProtocol.h"
+#include "Gen2Dispatch.h"
 #include "LoRaCrypto.h"
 #include "SensorParsers.h"
 
 // Constructor
-LoRaProtocol::LoRaProtocol(LoRaRadio &module, SensorManager &manager, Logger &log)
-    : loraModule(module), sensorManager(manager), logger(log), lastProcessedSensorIndex(-1)
+LoRaProtocol::LoRaProtocol(SensorManager &manager, Logger &log)
+    : sensorManager(manager), logger(log), lastProcessedSensorIndex(-1)
 {
 }
 
@@ -35,24 +36,42 @@ LoRaProtocol::~LoRaProtocol()
     // Nothing specific to release
 }
 
-// Process received packet
-bool LoRaProtocol::processReceivedPacket()
+// Process a packet received by the radio task
+bool LoRaProtocol::processPacket(const RadioPacket &packet)
 {
-    yield();
-    // Check if data was received
-    if (!loraModule.hasInterrupt())
+    const uint8_t length = packet.length;
+    if (length == 0)
     {
         return false;
     }
+    memcpy(packetBuffer, packet.data, length);
 
-    // Reset interrupt flag
-    loraModule.clearInterrupt();
-
-    // Attempt to receive packet
-    uint8_t length = 0;
-    if (!loraModule.receivePacket(packetBuffer, &length))
+    // Generation 2 first (docs/protocol-v2.md section 6): a frame of a
+    // configured gen2 DevID never reaches the generation 1 decoder
+    ep::FrameInfo info;
+    Gen2Dispatch::Route route = Gen2Dispatch::classify(
+        packetBuffer, length, [this](uint32_t devId) { return sensorManager.isKnownGen2(devId); }, info);
+    if (route == Gen2Dispatch::Route::Gen2Known)
     {
-        logger.warning("Failed to receive packet from LoRa module");
+        // Every response slot is answered: a response, or a cancel that
+        // releases the radio task's flash write permit at once
+        static TxRequest response; // loop() only, 200 bytes off the stack
+        bool answer = sensorManager.handleGen2Frame(packet, info, millis(), response);
+        if (!answer || !RadioTask::respond(response))
+        {
+            RadioTask::cancel(packet.responseSlot);
+        }
+        return false;
+    }
+    // Not a known gen2 frame: no response, release the slot right away
+    RadioTask::cancel(packet.responseSlot);
+    if (route == Gen2Dispatch::Route::JoinUnknown)
+    {
+        ep::JoinRequest req;
+        if (ep::parseJoinRequest(packetBuffer, length, req))
+        {
+            sensorManager.recordWaitingJoin(req, packet.rssi, millis());
+        }
         return false;
     }
 
@@ -71,11 +90,12 @@ bool LoRaProtocol::processReceivedPacket()
         logger.debug(hexData);
     }
 
-    // Get RSSI for diagnostics
-    int rssi = loraModule.getRSSI();
+    // Reception metadata from the radio task
+    int rssi = packet.rssi;
     if (dump)
     {
-        logger.debug("RSSI: " + String(rssi) + " dBm, SNR: " + String(loraModule.getSNR()) + " dB");
+        logger.debug("RSSI: " + String(rssi) + " dBm, SNR: " + String(packet.snr) + " dB, frequency error: " +
+                     String(packet.freqError, 0) + " Hz");
     }
 
     // Attempt to decrypt packet
@@ -157,17 +177,8 @@ bool LoRaProtocol::processPacketByType(SensorType type, uint8_t *data, uint8_t l
     case SensorType::SCD40:
         return processSCD40Packet(data, len, sensorIndex, rssi);
 
-    case SensorType::VEML7700:
-        return processVEML7700Packet(data, len, sensorIndex, rssi);
-
     case SensorType::METEO:
         return processMeteoPacket(data, len, sensorIndex, rssi);
-            
-    case SensorType::DIY_TEMP: 
-        return processDIYTempPacket(data, len, sensorIndex, rssi);
-
-    case SensorType::SHT40:
-        return processSHT40Packet(data, len, sensorIndex, rssi);
 
     default:
         logger.warning("Unknown device type: 0x" + String(static_cast<uint8_t>(type), HEX));
@@ -203,58 +214,6 @@ bool LoRaProtocol::processBME280Packet(uint8_t *data, uint8_t len, int sensorInd
     return result;
 }
 
-// Process packet from SHT40 sensor
-bool LoRaProtocol::processSHT40Packet(uint8_t *data, uint8_t len, int sensorIndex, int rssi)
-{
-    SensorParsers::CommonHeader header;
-    SensorParsers::SHT40Data    payload;
-    if (!SensorParsers::parseCommonHeader(data, len, header) ||
-        !SensorParsers::parseSHT40(data, len, payload))
-    {
-        logger.warning("Packet too short for SHT40");
-        return false;
-    }
-
-    bool result = sensorManager.updateSensorData(sensorIndex,
-                                                 payload.temperature, payload.humidity, 0.0f,
-                                                 0.0f, 0.0f, header.batteryVoltage, rssi);
-
-    // Copy: the web task may edit the sensor concurrently
-    SensorData sensor;
-    if (result && sensorManager.getSensorCopy(sensorIndex, sensor))
-    {
-        logger.info(sensor.name + " data updated - Temp: " + String(sensor.temperature, 2) + "°C, Hum: " +
-                    String(sensor.humidity, 2) + "%, Batt: " + String(header.batteryVoltage, 2) + "V");
-    }
-
-    return result;
-}
-
-// Process packet from DIY temperature sensor
-bool LoRaProtocol::processDIYTempPacket(uint8_t *data, uint8_t len, int sensorIndex, int rssi) {
-    SensorParsers::CommonHeader header;
-    SensorParsers::DIYTempData  payload;
-    if (!SensorParsers::parseCommonHeader(data, len, header) ||
-        !SensorParsers::parseDIYTemp(data, len, payload))
-    {
-        logger.warning("Packet too short for DS18B20");
-        return false;
-    }
-
-    bool result = sensorManager.updateSensorData(sensorIndex,
-                                                 payload.temperature, 0.0f, 0.0f,
-                                                 0.0f, 0.0f, header.batteryVoltage, rssi);
-
-    // Copy: the web task may edit the sensor concurrently
-    SensorData sensor;
-    if (result && sensorManager.getSensorCopy(sensorIndex, sensor)) {
-        logger.info(sensor.name + " data updated - Temp: " + String(payload.temperature, 2) + "°C, Batt: " +
-                  String(header.batteryVoltage, 2) + "V");
-    }
-
-    return result;
-}
-
 // Process packet from SCD40 sensor
 bool LoRaProtocol::processSCD40Packet(uint8_t *data, uint8_t len, int sensorIndex, int rssi)
 {
@@ -277,32 +236,6 @@ bool LoRaProtocol::processSCD40Packet(uint8_t *data, uint8_t len, int sensorInde
     {
         logger.info(sensor.name + " data updated - Temp: " + String(sensor.temperature, 2) + "°C, Hum: " +
                     String(sensor.humidity, 2) + "%, CO2: " + String(sensor.ppm, 0) + " ppm, Batt: " +
-                    String(header.batteryVoltage, 2) + "V");
-    }
-
-    return result;
-}
-
-// Process packet from VEML7700 sensor
-bool LoRaProtocol::processVEML7700Packet(uint8_t *data, uint8_t len, int sensorIndex, int rssi)
-{
-    SensorParsers::CommonHeader header;
-    SensorParsers::VEML7700Data payload;
-    if (!SensorParsers::parseCommonHeader(data, len, header) ||
-        !SensorParsers::parseVEML7700(data, len, payload))
-    {
-        logger.warning("Packet too short for VEML7700");
-        return false;
-    }
-
-    bool result = sensorManager.updateSensorData(sensorIndex, 0.0f, 0.0f, 0.0f, 0.0f,
-                                                 payload.lux, header.batteryVoltage, rssi);
-
-    // Copy: the web task may edit the sensor concurrently
-    SensorData sensor;
-    if (result && sensorManager.getSensorCopy(sensorIndex, sensor))
-    {
-        logger.info(sensor.name + " data updated - Light: " + String(payload.lux, 1) + " lux, Batt: " +
                     String(header.batteryVoltage, 2) + "V");
     }
 

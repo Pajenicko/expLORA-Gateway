@@ -231,6 +231,9 @@ void LteModem::process()
         }
         break;
 
+    case State::Suspended:
+        break;
+
     case State::PowerCycle:
     {
         unsigned long backoff = min(LTE_RETRY_BASE * failures, LTE_RETRY_MAX);
@@ -242,6 +245,33 @@ void LteModem::process()
         break;
     }
     }
+}
+
+bool LteModem::suspend()
+{
+    if (state == State::Disabled || state == State::Suspended)
+    {
+        return false;
+    }
+    // A modem waiting to retry is already off (fail() powered it down)
+    if (state != State::PowerCycle)
+    {
+        logger.info("LTE: powering the modem off for the update");
+        stopPpp();
+        powerOff();
+    }
+    setState(State::Suspended);
+    return true;
+}
+
+void LteModem::resume()
+{
+    if (state != State::Suspended)
+    {
+        return;
+    }
+    logger.info("LTE: powering the modem on again after the update");
+    setState(State::Off);
 }
 
 void LteModem::setState(State next)
@@ -608,6 +638,8 @@ const char *LteModem::getStateName() const
         return "online";
     case State::PowerCycle:
         return "waiting to retry";
+    case State::Suspended:
+        return "off for an update";
     }
     return "unknown";
 }

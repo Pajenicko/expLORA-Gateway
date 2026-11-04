@@ -25,6 +25,7 @@
 #include <ArduinoJson.h>
 #include "SensorTypes.h"
 #include "SensorHealth.h"
+#include "SensorCalibration.h"
 
 /**
  * Structure for storing sensor data
@@ -43,7 +44,6 @@ struct SensorData
 
     // Extended configuration
     String customUrl; // Complete URL with placeholders
-    int altitude;     // Altitude (m) - for BME280
 
     // Sensor status
     unsigned long lastSeen; // Time of last seen packet
@@ -64,15 +64,8 @@ struct SensorData
     float dailyRainTotal;        // Daily precipitation total (mm) - resets at midnight
     unsigned long lastRainReset; // Timestamp of last daily total reset
 
-    float temperatureCorrection; // Correction offset for temperature
-    float humidityCorrection;    // Correction offset for humidity
-    float pressureCorrection;    // Correction offset for pressure
-    float ppmCorrection;         // Correction offset for CO2 concentration
-    float luxCorrection;         // Correction offset for light intensity
-    float windSpeedCorrection;   // Correction factor for wind speed (multiplier)
-    int windDirectionCorrection; // Correction offset for wind direction (degrees)
-    float rainAmountCorrection;  // Correction factor for rain amount (multiplier)
-    float rainRateCorrection;    // Correction factor for rain rate (multiplier)
+    // Corrections and the altitude for the pressure (SensorCalibration.h)
+    SensorCalibration::Set cal;
 
     // General device data
     float batteryVoltage; // Battery voltage (V)
@@ -88,7 +81,6 @@ struct SensorData
                    deviceKey(0),
                    name(""),
                    customUrl(""),
-                   altitude(0),
                    lastSeen(0),
                    configured(false),
                    temperature(0.0f),
@@ -103,64 +95,62 @@ struct SensorData
                    rainAmount(0.0f),
                    rainRate(0.0f),
                    dailyRainTotal(0.0f),
-                   lastRainReset(0),
-                   temperatureCorrection(0.0f),
-                   humidityCorrection(0.0f),
-                   pressureCorrection(0.0f),
-                   ppmCorrection(0.0f),
-                   luxCorrection(0.0f),
-                   windSpeedCorrection(1.0f), // Multiplier of 1.0 = no change
-                   windDirectionCorrection(0),
-                   rainAmountCorrection(1.0f),
-                   rainRateCorrection(1.0f)
+                   lastRainReset(0)
     {
     }
 
-    // Helper methods to verify if the sensor provides a specific type of data
-    bool hasTemperature() const
-    {
-        return getSensorTypeInfo(deviceType).hasTemperature;
-    }
+    // Generation 2 readings (SensorManager::getReadings): serialNumber holds
+    // the DevID, the quantities come from the sensor, not from a type
+    bool gen2 = false;
+    uint16_t gen2Q = 0;    // quantities it has reported (Gen2Sensor::qMask)
+    uint16_t gen2QNow = 0; // ... with a value since this start (Gen2Sensor::qNow)
+    uint16_t gen2QBad = 0; // ... whose last report was invalid (Gen2Sensor::qBad)
+    uint16_t hwType = 0;   // HW type and firmware (Home Assistant model / sw_version)
+    uint32_t fwVersion = 0;
 
-    bool hasHumidity() const
-    {
-        return getSensorTypeInfo(deviceType).hasHumidity;
-    }
+    // Quantities it provides, and those with a current value
+    uint16_t qMask() const { return gen2 ? gen2Q : getSensorTypeInfo(deviceType).q; }
+    uint16_t qValid() const { return gen2 ? gen2QNow : lastSeen > 0 ? qMask() : 0; }
+    bool has(Qty::Id q) const { return (qMask() & Qty::mask(q)) != 0; }
+    bool hasTemperature() const { return has(Qty::Temperature); }
+    bool hasHumidity() const { return has(Qty::Humidity); }
+    bool hasPressure() const { return has(Qty::Pressure); }
+    bool hasPPM() const { return has(Qty::Co2); }
+    bool hasLux() const { return has(Qty::Lux); }
+    bool hasWindSpeed() const { return has(Qty::WindSpeed); }
+    bool hasWindDirection() const { return has(Qty::WindDir); }
+    bool hasRainAmount() const { return has(Qty::Rain); }
+    bool hasRainRate() const { return has(Qty::RainRate); }
 
-    bool hasPressure() const
+    float value(Qty::Id q) const
     {
-        return getSensorTypeInfo(deviceType).hasPressure;
-    }
-
-    bool hasPPM() const
-    {
-        return getSensorTypeInfo(deviceType).hasPPM;
-    }
-
-    bool hasLux() const
-    {
-        return getSensorTypeInfo(deviceType).hasLux;
-    }
-
-    // Helper methods to verify if the sensor provides a specific type of data
-    bool hasWindSpeed() const
-    {
-        return getSensorTypeInfo(deviceType).hasWindSpeed;
-    }
-
-    bool hasWindDirection() const
-    {
-        return getSensorTypeInfo(deviceType).hasWindDirection;
-    }
-
-    bool hasRainAmount() const
-    {
-        return getSensorTypeInfo(deviceType).hasRainAmount;
-    }
-
-    bool hasRainRate() const
-    {
-        return getSensorTypeInfo(deviceType).hasRainRate;
+        switch (q)
+        {
+        case Qty::Temperature:
+            return temperature;
+        case Qty::Humidity:
+            return humidity;
+        case Qty::Pressure:
+            return pressure;
+        case Qty::Co2:
+            return ppm;
+        case Qty::Lux:
+            return lux;
+        case Qty::WindSpeed:
+            return windSpeed;
+        case Qty::WindDir:
+            return windDirection;
+        case Qty::Rain:
+            return rainAmount;
+        case Qty::DailyRain:
+            return dailyRainTotal;
+        case Qty::RainRate:
+            return rainRate;
+        case Qty::Battery:
+            return batteryVoltage;
+        default:
+            return rssi;
+        }
     }
 
     // Get information about sensor type
@@ -169,189 +159,12 @@ struct SensorData
         return getSensorTypeInfo(deviceType);
     }
 
-    // Convert to JSON for web API and storage
-    void toJson(JsonObject &json) const
-    {
-        json["deviceType"] = static_cast<uint8_t>(deviceType);
-        json["typeName"] = getTypeInfo().name;
-        json["serialNumber"] = formatSN(serialNumber);
-        json["name"] = name;
+    // Type name for the pages, the API and Home Assistant
+    const char *typeName() const { return gen2 ? "GEN2" : getTypeInfo().name; }
 
-        // Add data specific to sensor type with validity check
-        // if (lastSeen > 0) {
-        if (hasTemperature())
-        {
-            json["temperature"] = round(temperature * 100) / 100.0;
-        }
-
-        if (hasHumidity())
-        {
-            json["humidity"] = round(humidity * 100) / 100.0;
-        }
-
-        if (hasPressure())
-        {
-            json["pressure"] = round(pressure * 100) / 100.0;
-        }
-
-        if (hasPPM())
-        {
-            json["ppm"] = round(ppm);
-        }
-
-        if (hasLux())
-        {
-            json["lux"] = round(lux * 10) / 10.0;
-        }
-
-        if (hasWindSpeed())
-        {
-            json["windSpeed"] = round(windSpeed * 10) / 10.0;
-        }
-
-        if (hasWindDirection())
-        {
-            json["windDirection"] = windDirection;
-        }
-
-        if (hasRainAmount())
-        {
-            json["rainAmount"] = round(rainAmount * 100) / 100.0;
-            json["dailyRainTotal"] = round(dailyRainTotal * 100) / 100.0;
-        }
-
-        if (hasRainRate())
-        {
-            json["rainRate"] = round(rainRate * 100) / 100.0;
-        }
-
-        json["batteryVoltage"] = round(batteryVoltage * 100) / 100.0;
-        json["rssi"] = rssi;
-
-        if (lastSeen > 0)
-        {
-            json["lastSeen"] = (millis() - lastSeen) / 1000; // seconds since last seen
-        }
-        else
-        {
-            json["lastSeen"] = -1;
-        }
-    }
-
-    // Format data for web display
-    String getDataString() const
-    {
-        String dataStr = "";
-        bool first = true;
-
-        if (lastSeen == 0)
-        {
-            return "-";
-        }
-
-        if (hasTemperature())
-        {
-            if (!first)
-                dataStr += ", ";
-            dataStr += String(temperature, 2) + " °C";
-            first = false;
-        }
-
-        if (hasHumidity())
-        {
-            if (!first)
-                dataStr += ", ";
-            dataStr += String(humidity, 2) + " %";
-            first = false;
-        }
-
-        if (hasPressure())
-        {
-            if (!first)
-                dataStr += ", ";
-            dataStr += String(pressure, 2) + " hPa";
-            first = false;
-        }
-
-        if (hasPPM())
-        {
-            if (!first)
-                dataStr += ", ";
-            dataStr += String(int(ppm)) + " ppm CO2";
-            first = false;
-        }
-
-        if (hasLux())
-        {
-            if (!first)
-                dataStr += ", ";
-            dataStr += String(lux, 1) + " lux";
-            first = false;
-        }
-
-        if (hasWindSpeed())
-        {
-            if (!first)
-                dataStr += ", ";
-            dataStr += String(windSpeed, 1) + " m/s";
-            first = false;
-        }
-
-        if (hasWindDirection())
-        {
-            if (!first)
-                dataStr += ", ";
-            dataStr += String(windDirection) + "°";
-            first = false;
-        }
-
-        if (hasRainAmount())
-        {
-            if (!first)
-                dataStr += ", ";
-            dataStr += String(rainAmount, 1) + " mm";
-            dataStr += " (daily precipitation total: " + String(dailyRainTotal, 1) + " mm)";
-            first = false;
-        }
-
-        if (hasRainRate())
-        {
-            if (!first)
-                dataStr += ", ";
-            dataStr += String(rainRate, 1) + " mm/h";
-            first = false;
-        }
-
-        // Add battery voltage
-        if (!first)
-            dataStr += ", ";
-        dataStr += String(batteryVoltage, 2) + " V";
-
-        return dataStr;
-    }
-
-    // Format time of last seen packet
-    String getLastSeenString() const
-    {
-        if (lastSeen == 0)
-        {
-            return "Never";
-        }
-
-        unsigned long seconds = (millis() - lastSeen) / 1000;
-        if (seconds < 60)
-        {
-            return String(seconds) + " seconds ago";
-        }
-        else if (seconds < 3600)
-        {
-            return String(seconds / 60) + " minutes ago";
-        }
-        else
-        {
-            return String(seconds / 3600) + " hours ago";
-        }
-    }
+    // The ID in the API and the MQTT topics: 6 hex digits of the serial
+    // number, 8 of a generation 2 DevID
+    String idString() const { return gen2 ? formatHex(serialNumber, 8) : formatSN(serialNumber); }
 };
 
 struct ActiveSensorEntry {

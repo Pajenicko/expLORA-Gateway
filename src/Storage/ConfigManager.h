@@ -57,6 +57,10 @@ private:
     bool loadFromPreferences();
     bool saveToPreferences();
 
+    // Stored name / POSIX string -> a zone of the list, or a custom string;
+    // true = changed (to be saved)
+    bool resolveTimezone();
+
 public:
     // Device configuration
     String wifiSSID;               // WiFi network SSID
@@ -65,6 +69,8 @@ public:
     unsigned long lastWifiAttempt; // Time of last WiFi connection attempt
     LogLevel logLevel;             // Logging level
     String timezone;               // Timezone in Posix format
+    String timezoneName;           // Its name in Data/TimeZones.h, empty = custom POSIX string
+    String timezoneNamePosix;      // POSIX string written together with the name (an older firmware rewrites only timezone)
 
     // MQTT Configuration
     String mqttHost;     // MQTT broker hostname
@@ -76,6 +82,10 @@ public:
     String mqttPrefix;   // MQTT Topic prefix
     String mqttHAPrefix; // MQTT Homeassistant topic prefix
     bool mqttHAEnabled;  // MQTT Homeassistant discovery enable
+
+    // WiFi radio switch (boards with HAS_WIFI_SWITCH, always true elsewhere;
+    // stored in Preferences only). Off: no station, AP only for recovery
+    bool wifiEnabled = WIFI_DEFAULT_ENABLED;
 
     // LTE configuration (boards with HAS_LTE; stored in Preferences only)
     bool lteEnabled; // Modem enabled
@@ -93,6 +103,21 @@ public:
 
     // Web admin password, "pbkdf2$..." (see WebAuth); empty = not set yet
     String adminPasswordHash;
+
+    // "Signed images only" (Preferences only, default off): unsigned images
+    // (and images signed with a key the firmware does not know) are refused
+    // at the end of a manual upload; shared by sensor images (store) and,
+    // from stage S3, the gateway's own firmware. Automatic updates always
+    // take signed images only, whatever this says
+    bool signedOnly = false;
+
+    // Automatic updates (S6, Preferences only): AutoUpdatePolicy::pack() of
+    // the two switches and the window; 0 = never set (both off, 02-05)
+    uint32_t autoUpdate = 0;
+
+    // Web interface: Advanced (true) or Simple (default) - one setting for
+    // everyone (config.json only)
+    bool uiAdvanced = false;
 
     // Held by save()/load() and the setters (web and loop task both write);
     // readers in another task take it while copying values (MQTTManager)
@@ -128,6 +153,14 @@ public:
     // Set WiFi configuration
     bool setWiFiConfig(const String &ssid, const String &password, bool saveConfig = true);
 
+    // Set the time zone by its index in Data/TimeZones.h; false = not saved
+    // (the previous zone is kept)
+    bool setTimezone(int zoneIndex);
+
+    // Sets timezoneName, timezone and timezoneNamePosix in memory for the
+    // index in Data/TimeZones.h, -1 = custom (keeps timezone); no saving
+    void setTimezoneFields(int zoneIndex);
+
     // Switch to configuration mode (AP)
     void enableConfigMode(bool enable = true, bool saveConfig = true);
 
@@ -136,6 +169,19 @@ public:
                        const String &password, bool enabled, bool tls,
                        const String &rootPrefix, const String &haPrefix, bool haEnable,
                        bool saveConfig = true);
+
+    // Set the WiFi radio switch (applies after a restart)
+    bool setWifiEnabled(bool enabled, bool saveConfig = true);
+
+    // Set "signed images only"; false = not saved (the previous value is kept)
+    bool setSignedOnly(bool on);
+
+    // Set the automatic updates (packed); false = not saved (the previous
+    // value is kept)
+    bool setAutoUpdate(uint32_t packed);
+
+    // Set the web interface mode; false = not saved (the previous mode is kept)
+    bool setUiAdvanced(bool advanced);
 
     // Set LTE configuration
     bool setLteConfig(bool enabled, const String &apn, const String &pin, bool saveConfig = true);

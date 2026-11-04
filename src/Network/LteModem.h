@@ -56,12 +56,21 @@ public:
         Connecting,
         Online,
         PowerCycle,
+        Suspended, // update mode: modem off, back to Off (a full attach) on resume()
     };
 
     LteModem(ConfigManager &config, Logger &log);
 
     void begin();
     void process();
+
+    // Update mode (loop task): power the modem down and keep it off (frees
+    // the PPP / esp_modem memory) until resume(), which attaches again from
+    // scratch (~20-60 s). suspend() blocks for the modem's power-down
+    // (~3-6 s). false: nothing to suspend (disabled or already suspended)
+    bool suspend();
+    void resume();
+    bool suspended() const { return state == State::Suspended; }
 
     State getState() const { return state; }
     const char *getStateName() const;

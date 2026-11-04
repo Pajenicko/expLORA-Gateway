@@ -25,7 +25,7 @@
 
 // Constructor
 RadioSX1262::RadioSX1262(Logger &log, SPIManager *spiMgr)
-    : logger(log), spiManager(spiMgr), module(nullptr), radio(nullptr), initialized(false)
+    : logger(log), spiManager(spiMgr), module(nullptr), radio(nullptr), initialized(false), lastRssi(0), lastSnr(0), lastFreqError(0)
 {
     if (spiManager == nullptr)
     {
@@ -40,21 +40,23 @@ RadioSX1262::~RadioSX1262()
     delete module;
 }
 
-// Log a RadioLib error code
-void RadioSX1262::logError(const char *what, int16_t state)
+// Remember a RadioLib error code (no logging: also called from the radio task)
+void RadioSX1262::recordError(const char *what, int16_t state)
 {
-    logger.error(String("SX1262 ") + what + " failed, RadioLib error " + String(state));
+    lastErr.what = what;
+    lastErr.code = state;
 }
 
 // Configure the chip and start continuous receive
 bool RadioSX1262::configure()
 {
-    // TX power is irrelevant (receive only), RadioLib needs a value
+    rxRunning = false;
+    // Downlink power is set per response in prepareTx(); RadioLib needs a value here
     int16_t state = radio->begin(LORA_FREQUENCY_MHZ, LORA_BANDWIDTH_KHZ, LORA_SPREADING_FACTOR, LORA_CODING_RATE,
                                  LORA_SYNC_WORD, 10, LORA_PREAMBLE_LENGTH, LORA_TCXO_VOLTAGE);
     if (state != RADIOLIB_ERR_NONE)
     {
-        logError("begin", state);
+        recordError("begin", state);
         return false;
     }
 
@@ -63,14 +65,14 @@ bool RadioSX1262::configure()
     state = radio->setDio2AsRfSwitch(true);
     if (state != RADIOLIB_ERR_NONE)
     {
-        logError("setDio2AsRfSwitch", state);
+        recordError("setDio2AsRfSwitch", state);
         return false;
     }
 
     state = radio->setCRC(2);
     if (state != RADIOLIB_ERR_NONE)
     {
-        logError("setCRC", state);
+        recordError("setCRC", state);
         return false;
     }
 
@@ -79,55 +81,66 @@ bool RadioSX1262::configure()
     state = radio->startReceive();
     if (state != RADIOLIB_ERR_NONE)
     {
-        logError("startReceive", state);
+        recordError("startReceive", state);
         return false;
     }
 
+    rxRunning = true;
     return true;
 }
 
-// Initialize LoRa module
+// Create the RadioLib objects (no logging)
+bool RadioSX1262::create()
+{
+    if (radio != nullptr)
+    {
+        return true;
+    }
+    if (!spiManager->isInitialized() && !spiManager->init(true))
+    {
+        recordError("SPI init", 0);
+        return false;
+    }
+    module = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY, *spiManager->getSPI(),
+                SPISettings(2000000, MSBFIRST, SPI_MODE0));
+    radio = new SX1262(module);
+    return true;
+}
+
+// Initialize LoRa module (setup(), logs the result)
 bool RadioSX1262::init()
 {
     logger.info("Initializing LoRa module (SX1262)...");
-
-    if (!spiManager->isInitialized() && !spiManager->init())
-    {
-        logger.error("Failed to initialize SPI manager");
-        return false;
-    }
-
-    if (radio == nullptr)
-    {
-        module = new Module(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY, *spiManager->getSPI(),
-                            SPISettings(2000000, MSBFIRST, SPI_MODE0));
-        radio = new SX1262(module);
-    }
-
-    initialized = configure();
+    initialized = create() && configure();
     if (initialized)
     {
         logger.info("LoRa module initialized and in receive mode");
     }
+    else
+    {
+        logger.error(String("SX1262 ") + lastErr.what + " failed, RadioLib error " + String(lastErr.code));
+    }
     return initialized;
 }
 
-// Reset module
+// Reset module (radio task: no logging, the result is reported by the task)
 bool RadioSX1262::reset()
 {
-    if (radio == nullptr)
+    if (!create())
     {
-        return init();
+        initialized = false;
+        return false;
     }
-
     radio->clearPacketReceivedAction();
     radio->reset();
     initialized = configure();
-    if (initialized)
-    {
-        logger.info("LoRa module reset successfully");
-    }
     return initialized;
+}
+
+// DIO line still high: an RxDone that was not picked up
+bool RadioSX1262::irqPinActive()
+{
+    return digitalRead(LORA_DIO1) == HIGH;
 }
 
 // Receive packet
@@ -135,28 +148,39 @@ bool RadioSX1262::receivePacket(uint8_t *buffer, uint8_t *length)
 {
     if (!initialized)
     {
+        recordError("not initialized", 0);
         return false;
     }
 
     size_t packetLength = radio->getPacketLength();
     int16_t state = radio->readData(buffer, packetLength);
+    lastRssi = (int)radio->getRSSI();
+    lastSnr = radio->getSNR();
+    lastFreqError = radio->getFrequencyError();
 
-    // Make sure the chip is back in continuous receive
-    radio->startReceive();
-
-    if (state == RADIOLIB_ERR_CRC_MISMATCH)
+    // Back to continuous receive; if that fails the chip is deaf until reset
+    int16_t rxState = radio->startReceive();
+    rxRunning = rxState == RADIOLIB_ERR_NONE;
+    if (!rxRunning)
     {
-        logger.warning("LoRa packet CRC error, dropped");
-        return false;
+        recordError("startReceive", rxState);
     }
+
+    // No logging here (radio task): the task counts the error and loop() logs it
     if (state != RADIOLIB_ERR_NONE)
     {
-        logger.warning("LoRa packet read failed, RadioLib error " + String(state));
+        if (rxRunning) // keep "startReceive" as the more important error
+        {
+            recordError(state == RADIOLIB_ERR_CRC_MISMATCH ? "CRC" : "readData", state);
+        }
         return false;
     }
     if (packetLength == 0 || packetLength > 255)
     {
-        logger.warning("Invalid packet length: " + String(packetLength));
+        if (rxRunning)
+        {
+            recordError("length", (int16_t)packetLength);
+        }
         return false;
     }
 
@@ -167,13 +191,106 @@ bool RadioSX1262::receivePacket(uint8_t *buffer, uint8_t *length)
 // Get RSSI of last packet
 int RadioSX1262::getRSSI()
 {
-    return initialized ? (int)radio->getRSSI() : 0;
+    return lastRssi;
 }
 
 // Get SNR of last packet
 float RadioSX1262::getSNR()
 {
-    return initialized ? radio->getSNR() : 0.0f;
+    return lastSnr;
+}
+
+// Frequency error of the last packet in Hz
+float RadioSX1262::getFrequencyError()
+{
+    return lastFreqError;
+}
+
+// Header received, RxDone not yet (HEADER_VALID is enabled in the RX IRQ flags)
+bool RadioSX1262::receivingNow()
+{
+    if (!initialized)
+    {
+        return false;
+    }
+    // From the valid header on (about 70-100 ms into an UP at SF9). The
+    // PREAMBLE_DETECTED IRQ would see the preamble too, but it is latched and
+    // not enabled in the receive IRQ mask: a false preamble would block every
+    // OTA launch until the next packet. Accepted: a packet starting in the
+    // last ~100 ms before an OTA launch can be lost (spec 14.10 Q3)
+    uint32_t flags = radio->getIrqFlags();
+    return (flags & RADIOLIB_SX126X_IRQ_HEADER_VALID) && !(flags & RADIOLIB_SX126X_IRQ_RX_DONE);
+}
+
+int16_t RadioSX1262::prepareTx(const uint8_t *frame, size_t len)
+{
+    if (!initialized)
+    {
+        return RADIOLIB_ERR_CHIP_NOT_FOUND;
+    }
+    rxRunning = false;
+    // XOSC standby: the TCXO keeps running, no 5 ms restart at the launch
+    int16_t state = radio->standby(RADIOLIB_SX126X_STANDBY_XOSC);
+    if (state == RADIOLIB_ERR_NONE)
+        state = radio->setFrequency(LORA_DOWNLINK_MHZ); // 1.5 MHz: no image recalibration
+    if (state == RADIOLIB_ERR_NONE)
+        state = radio->setOutputPower(LORA_DOWNLINK_POWER_DBM);
+    if (state == RADIOLIB_ERR_NONE)
+    {
+        RadioModeConfig_t cfg;
+        cfg.transmit.data = frame;
+        cfg.transmit.len = len;
+        cfg.transmit.addr = 0;
+        state = radio->stageMode(RADIOLIB_RADIO_MODE_TX, &cfg);
+    }
+    if (state != RADIOLIB_ERR_NONE)
+    {
+        recordError("prepareTx", state);
+    }
+    return state;
+}
+
+int16_t RadioSX1262::launchTx()
+{
+    int16_t state = radio->launchMode();
+    if (state != RADIOLIB_ERR_NONE)
+    {
+        recordError("launchTx", state);
+    }
+    return state;
+}
+
+void RadioSX1262::finishTx()
+{
+    radio->finishTransmit();
+    radio->setFrequency(LORA_FREQUENCY_MHZ);
+    int16_t state = radio->startReceive();
+    rxRunning = state == RADIOLIB_ERR_NONE;
+    if (!rxRunning)
+    {
+        recordError("startReceive", state);
+    }
+}
+
+bool RadioSX1262::standby()
+{
+    rxRunning = false;
+    if (!initialized)
+    {
+        return false;
+    }
+    int16_t state = radio->standby();
+    if (state != RADIOLIB_ERR_NONE)
+    {
+        recordError("standby", state);
+        return false;
+    }
+    return true;
+}
+
+uint32_t RadioSX1262::timeOnAirUs(size_t len)
+{
+    return (uint32_t)radio->getTimeOnAir(len);
 }
 
 // Check if module is connected (LoRa sync word register reads back 0x1424)

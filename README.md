@@ -30,9 +30,10 @@ The gateway receives data from various wireless sensors via LoRa, processes the 
   - and more to come (you can also add new sensor, pull request are welcomed)
 
 - **Web Interface**:
-  - Responsive design
-  - Real-time sensor monitoring
-  - Sensor management (add, edit, delete)
+  - Small, responsive pages (light and dark scheme)
+  - Simple mode (default) and Advanced mode, see [Interface](#interface-simple-and-advanced)
+  - Real-time sensor monitoring, generation 1 and 2 sensors together
+  - Sensor management (add, edit, calibrate, delete)
   - Configuration settings
 
 - **Network Connectivity**:
@@ -48,9 +49,8 @@ The gateway receives data from various wireless sensors via LoRa, processes the 
   - Gateway diagnostics (uplink, IP address; Pro: power source, LTE signal and state)
 
 - **Data Correction**:
-  - Calibration options for sensor readings
+  - Calibration options for sensor readings (generation 1 and 2)
   - Independent corrections for each measurement type
-  - Original values logged for reference
 
 - **Logging System**:
   - Multiple log levels (ERROR, WARNING, INFO, DEBUG, VERBOSE)
@@ -59,6 +59,109 @@ The gateway receives data from various wireless sensors via LoRa, processes the 
 - **API Access**:
   - JSON and CSV formats
   - Query parameters for filtering
+
+## Release notes 2.0.2
+
+- **Report slots spread by DevID.** A generation 2 sensor whose slot offset
+  was never set by hand gets an automatic slot derived from its DevID (it
+  follows the interval) instead of 0 for everyone - two sensors with the
+  same interval no longer transmit in the same second (a lost report was
+  the result). Existing sensors with slot 0 move to their automatic slot
+  under a new configuration version, sent with the sensor's next join or
+  report after the update; a slot set by hand stays. On the sensor's page
+  (Advanced): slot offset empty = automatic (the effective slot is shown),
+  a number = set by hand. After a downgrade to 2.0.1 and back, non-zero
+  automatic slots read as set by hand (`docs/release.md` section 6).
+- **"Reverted on this sensor before" ends** once that version runs
+  confirmed on the sensor (a successful update, or a report that it runs
+  the version confirmed); before, the mark stayed for good and the
+  automatic update skipped that version on the sensor forever.
+- **Production images and development identities** (`docs/protocol-v2.md`
+  §14.12): a sensor with firmware 1.0.1 or newer reports when it runs the
+  development identity of a test build (no identity record). The gateway
+  then skips it in automatic updates for images that need a provisioned
+  identity (log line with the reason) and asks for a confirmation on a
+  manual start; the sensor page shows "development identity". Sensor 1.0.1
+  itself refuses to install such an image after the transfer ("failed:
+  the image needs a provisioned identity") instead of resetting three
+  times and reverting. Sensors with a provisioned identity (every sensor
+  that leaves production) are not affected; older sensor firmware does not
+  report it and behaves as before - a bench sensor with an old test build
+  must be provisioned or updated before it is offered a production image:
+  before a manifest with a new production sensor image is published, and
+  before such a sensor is added to a gateway with automatic sensor updates
+  on while the manifest names a production image. In both cases the other
+  way is to switch that gateway's automatic sensor updates off first
+  (`docs/release.md` section 4).
+
+## Release notes 2.0.1
+
+- **Lite: larger firmware slots.** The Lite's flash is re-partitioned in
+  place from two 1984K firmware slots to two 2752K slots (layout v2,
+  `partitions/lite_8MB_v2.csv`; `docs/protocol-v2.md` §15.8). It happens
+  by itself shortly after 2.0.1 has been installed and validated (about
+  2 minutes after the install the gateway restarts a few times within
+  ~20 s). Settings, sensors, the admin password and all files stay. **The
+  previous firmware is removed by it** (no rollback to the version that was
+  installed before 2.0.1). Do not cut the power while it runs; if a unit
+  does not start any more after a power cut at that moment, install the
+  full image over USB (webflash). The Firmware page shows the layout
+  ("partition layout v2 (2752K slots)").
+- 2.0.0 and 1.2.0 still run on a migrated Lite (a downgrade keeps the new
+  layout); a full webflash image of an older version writes the old
+  layout back, and 2.0.1 migrates again.
+- A Lite flashed before 2025-08-17 (one firmware slot, no over-the-air
+  updates) is not re-partitioned by 2.0.1 (Firmware page: "partition
+  layout unknown - no migration"); it gets the new layout from the full
+  webflash image.
+- The Pro is unchanged apart from the version number.
+
+## Release notes 2.0.0
+
+2.0.0 is the protocol generation 2 release. Coming from 1.x, everything
+configured stays (network, password, time zone, MQTT, generation 1 sensors
+with their keys, forward URLs and corrections); a 1.x Lite is offered 2.0.0
+by its "Check for updates".
+
+**New**
+- Generation 2 sensors (`docs/protocol-v2.md`): encrypted join and
+  sessions, acknowledged reports, remote configuration (report interval,
+  TX power), link diagnostics, and firmware updates of the sensors over
+  LoRa from the gateway (resumable, verified, the sensor keeps its old
+  firmware if the new one does not confirm). They appear on the home page,
+  in `/api`, MQTT / Home Assistant, get corrections and "Forward to URL"
+  like generation 1.
+- Signed firmware: release images carry an ECDSA signature checked by the
+  gateway (gateway firmware and sensor images); unsigned files still
+  install after a confirmation, or never with **Signed images only**.
+- Update check from a signed package manifest (`explora/v2/packages.json`),
+  install of the gateway firmware and download of sensor images from it or
+  from any `https://` URL; automatic rollback of a gateway firmware that
+  does not run for 2 minutes.
+- **Automatic updates** (off by default): gateway firmware and/or sensor
+  firmware, once a night inside an update window (default 02:00-05:00);
+  signed releases only.
+- Update mode: during an update download MQTT and sensor reception pause
+  and interfaces may be switched off briefly (see Installation, Firmware
+  updates).
+- New interface: Simple (default) and Advanced mode, smaller pages, the
+  navigation wraps on narrow screens; time zone chosen from a list.
+
+**Changed / removed**
+- `/api`: missing values are `null` instead of `0`, generation 2 sensors
+  are listed too (`"deviceType": 0`, `"gen": 2`) - see
+  [Changes for /api consumers](#changes-for-api-consumers-200). `/api`
+  answers 503 during an update session.
+- MQTT / Home Assistant: generation 2 sensors appear as devices "Gen 2
+  HW<n>" under `<root>/<DevID>/<quantity>`; a failed generation 2 reading
+  is published as `None` (unknown); topics and discovery of generation 1
+  sensors are unchanged. MQTT disconnects during an update session.
+- The sensor types SHT40 (0x05) and DIY_TEMP (0x51) were removed (an entry
+  of such a type is dropped at start).
+- A firmware download from a URL must end exactly at its Content-Length
+  and the URL must be a plain `https://` address.
+- Settings defaults: automatic updates off, **Signed images only** off,
+  Simple mode.
 
 ## Hardware
 
@@ -89,6 +192,172 @@ Pin assignments live in `variants/<board>/board_config.h`.
    checked against the built-in CA bundle). Images for the other board are
    refused.
 
+   **Check now** (Firmware page): the gateway downloads the signed package
+   manifest `https://pajenicko.cz/webflash/explora/v2/packages.json` and
+   decides itself what to offer - the browser no longer compares versions,
+   and the 1.x `explora-gw-<board>-autoupdate.json` is not read by 2.x. The
+   manifest is one file, at most 4 kB: a line `EXSM1 <key id> <signature>`
+   (ECDSA P-256 with a release key over the exact bytes after it), then
+   JSON with a sequence number `seq` and per board / per sensor HW type the
+   version, URL, size and SHA-256 of a signed file. A manifest that is not
+   signed with a key the firmware carries, has a bad signature or a broken
+   structure (no valid `seq`, `gateway` / `sensor` not objects, too large or
+   too complex) is refused (logged; an error for a bad signature). Single
+   entries are checked one by one so that a later release cannot stop the
+   check of gateways already installed: an entry this firmware cannot use
+   (a bigger image than it allows, a 9th sensor HW type, a bad URL or
+   version) is skipped with a log line and never offered; an invalid entry
+   for this board only means no gateway offer ("gateway entry invalid"),
+   the sensor packages are still used. Fields it does not know are
+   ignored. Replay
+   protection: the gateway keeps the highest `seq` it accepted in
+   `/update/state.json` and refuses a lower one (the same one is fine); there
+   is no expiry date. A damaged state file keeps its `seq` when it can still
+   be read from the text; a formatted filesystem (or a rollback to a firmware
+   without this check, which drops the field) starts again at 0, which is
+   harmless because nothing older than the running firmware is installed
+   from the manifest. The page shows the
+   last check (time and result) and "vX is available - Install" or "Up to
+   date" (offers come only from the last check: a refused manifest or a
+   failed check offers nothing until the next successful one); skipped
+   entries are logged one line each, at most 8 per check plus one "N more"
+   line; Advanced mode also shows the seq, the key ("verified, key
+   ab12cd34") and the sensor images per HW type (stored vs offered, with
+   Fetch). **Install** downloads the offered file like a URL install, but it
+   must have the manifest's size and SHA-256 and be signed with a release key
+   for this board with the manifest's version, newer than the running one -
+   otherwise it is refused and erased (no confirmation, no downgrade from the
+   manifest). **Fetch** stores a sensor image the same way (size, SHA-256, HW
+   type, version, signature; the sensor image download rules apply).
+   `GET /firmware/check` has the check's state and last result; `/diag/heap`
+   has `manifestSeq`, `check`, `checkAt` and `releaseKeys` (the key ids this
+   firmware verifies with) under `update`. A development
+   build whose version is not maj.min.pat offers no install.
+
+   **Automatic updates** (Firmware page, off by default): two switches,
+   *Gateway firmware* and *Sensor firmware*, and the update window (whole
+   local hours, default 02-05; it may run across midnight, start and end
+   must differ). Automatic updates take signed releases only, whatever
+   **Signed images only** says. With a switch on and the clock set by NTP
+   (synced since the start, the last sync within 24 h), the gateway checks
+   the manifest once a night inside the window, at a minute derived from
+   its MAC address (gateways spread over the window; the days when the
+   clocks change neither skip nor repeat the run). The check, a gateway
+   install and the sensor image downloads run in one update-mode session.
+   *Gateway firmware*: a newer firmware the manifest offers is installed
+   (verified, as **Install**) and the gateway restarts. A version gets a
+   strike when its install reached the activation (counted before the
+   restart and cleared only once the new firmware is validated, so a
+   firmware that crashes or rolls back keeps it) or when its image is
+   refused (larger than the slot, size / SHA-256 / version not as in the
+   manifest, not verified, for another board, or the server answers its
+   URL with HTTP 404 or 410 - the file is not there), or when the gateway
+   restarted during its download (crashed or lost power - counted at the
+   next start); at most one strike per night, and a version is not tried
+   again in the night it got one. After three strikes it is no longer
+   installed automatically until another version is offered. Any other
+   failed download (network, server, any other HTTP status such as 403 or
+   5xx) is no strike: it is tried again later in the window. *Sensor firmware*: every newer sensor image offered
+   is downloaded (verified) unless an unfinished sensor job uses the stored
+   image of that HW type or that version was refused on three nights (not
+   stored - size, SHA-256, signature, HW type, version - or HTTP 404 / 410;
+   network failures and other HTTP statuses do not count); then the
+   sensors are updated one at a time in
+   DevID order: a sensor gets the stored image of its HW type when the
+   image is signed and newer than its firmware, did not revert on it
+   before, did not fail twice automatically (a failed job or one the
+   gateway aborted; an abort by the admin does not count but leaves that
+   sensor alone for 24 h), and the start needs no confirmation. These jobs
+   may run at any time of day, but none starts while a gateway update
+   waits, while a newly installed gateway firmware is being validated,
+   inside a window before its run, or when the job would run into the next
+   window. A gateway update "waits" while the last successful check offers
+   it; after a restart or a failed check only a version that was installed
+   and rolled back (not yet given up) still holds the sensors back, for at
+   most 3 nights after that attempt. The nightly session waits (tried again every 5 minutes
+   inside the window) while a sensor job needs the radio (a paused job
+   does not count), a start is queued, an upload or a manual download
+   runs, a gateway image waits for the admin's confirmation, a new
+   firmware is being validated or a restart is pending; when a sensor job
+   overran into the window, the run may still start up to 1 h after the
+   window's end. A failed run is tried again after 15 min, 30 min, 1 h,
+   2 h (+-10 %) while the window lasts; the wait is saved before each run,
+   so a restart does not run it early. Manual actions always come first: an
+   automatic job never stops or replaces one started by the admin. The card
+   shows the next and the last run (also "gateway vX installed" once it is
+   validated, or "rolled back") and a gateway update that waits;
+   Advanced mode also the strikes and the sensors waiting. The log has one line per run and a warning for every refusal;
+   `/diag/heap` has the state under `update.auto`. The state lives in
+   `/update/state.json` (`auto`), the per-sensor failures in `sensors.json`
+   (`autoFail`, only written after a failure).
+
+   **Signed firmware and confirmation:** a file signed with a release key
+   (a 128-byte signature block appended by `tools/release/explora_sign.py`)
+   is verified while it is received and installed at once. An unsigned file
+   (or one signed with a key this firmware does not carry) is written but not
+   installed until you confirm it: the upload answer asks, and the Firmware
+   page shows a "waiting for confirmation" card (for a URL download too). The
+   confirmation is valid for 10 minutes and only from the login session that
+   installed that exact image. With **Signed images only** on, unsigned files
+   are refused. A file whose signature is present but wrong (changed content,
+   another board, a malformed block) or a download shorter or longer than
+   announced is always refused, and a refused image can never start. Older
+   gateways (1.x) install a signed file like an unsigned one (the block after
+   the image is ignored). A manually uploaded signed file with bytes appended
+   or with its block cut off no longer carries a valid block at its end: it
+   counts as unsigned (it needs the confirmation, and is refused with
+   **Signed images only** on) - by design, an upload has no announced length
+   to compare. A download from a URL with a wrong length is refused.
+   Changed in 2.0.0: a download from a URL must end exactly at its announced
+   Content-Length - a server that sends any bytes after it (even a stray line
+   break) is refused, where 1.x installed the image and ignored them; the
+   URL must also be a plain `https://` address of at most 256 characters
+   with a valid host and no spaces.
+
+   **Older version:** a verified file whose version is lower than the running
+   firmware is not installed at once either: the Firmware page asks you to
+   confirm the downgrade (same rules as above, also with **Signed images
+   only** on). The same version is a reinstall and is installed without a
+   question. An image that waits for its confirmation and is not confirmed
+   (10 minutes over, **Signed images only** switched on, or a restart
+   meanwhile) is erased so it can never start. A development build whose
+   version is not a plain maj.min.pat (e.g. "2.1.0-dev") cannot compare
+   versions and asks for the confirmation for every verified file.
+
+   **Rollback:** a newly installed firmware must run for 2 minutes with the
+   web server up; a crash or reset before that makes the gateway go back to
+   the previous firmware, which then logs "rolled back from vX". A restart
+   you start in the web interface during these 2 minutes keeps the new
+   firmware. No other firmware can be installed and no update check runs
+   during them. The criterion is the gateway itself (web server up, its
+   internal checks healthy), not its connection to the internet: a site or
+   provider outage must not roll back a good firmware. The Firmware page
+   shows how the running firmware was installed (verified / unsigned) and the
+   last install result; `/diag/heap` has them under `update`. Flashing only
+   the application over USB with esptool into the running slot keeps the
+   install record (the gateway cannot tell without hashing the image), so the
+   Firmware page may then still say "verified" for the replaced firmware; a
+   full USB flash (PlatformIO upload) resets it.
+
+   The check, an install from the manifest and a download from a URL run in **update mode**: MQTT is
+   disconnected, sensor reception pauses (the radio is in standby) and the
+   web interface answers most pages with "update in progress" (HTTP 503)
+   until it ends (the login, a short status page under Firmware and the
+   diagnostics stay; Restart is not available either - the session ends by
+   itself within 15 minutes). Only when
+   there is not enough free memory for the HTTPS session, the network
+   interfaces that do not carry the uplink are switched off for it
+   (Ethernet uplink: WiFi and LTE; WiFi uplink: the access point and LTE;
+   LTE uplink: WiFi) and switched on again afterwards. If the page was
+   loaded over such an interface, the connection drops - reload it after a
+   few minutes. Update mode is refused during an upload and while a sensor
+   OTA job is running (pause it first; for a sensor image download from a
+   URL see the generation 2 OTA section). If the interfaces it switched off
+   (and that worked before) are not back 5 minutes after the session, the
+   gateway restarts - not while an upload or a sensor OTA transfer, swap
+   or confirmation runs (it waits for them), and not for an interface you
+   disabled or changed in the settings meanwhile.
+
 4. **Unit tests** run on the host: `pio test -e native`. An end-to-end test against
    a real device is in `tests/integration`.
 
@@ -104,7 +373,7 @@ Pin assignments live in `variants/<board>/board_config.h`.
      password (at least 8 characters) before anything else
 
 3. **Configure WiFi**:
-   - Enter your home WiFi credentials
+   - Enter your home WiFi credentials and select your time zone
    - Save and reboot
 
 4. **Access the Web Interface**:
@@ -127,7 +396,28 @@ version without login asks for a new password at the first login, the same way
 as a freshly flashed one. Sessions last until logout, 24 hours of inactivity or
 a restart; five wrong passwords lock the login for a minute.
 
-The sensor data API (`/api`) and `/firmware/version` stay public (read-only).
+The sensor data API (`/api`), `/firmware/version` and the shared stylesheet
+and script (`/a.css`, `/a.js`) stay public (read-only).
+
+## Interface: Simple and Advanced
+
+The System page (`/password`) switches the web interface between **Simple**
+(the default) and **Advanced**; the mode is a gateway setting, the same for
+everyone who logs in. Simple shows the sensors (add, rename, calibrate,
+delete - generation 1 and 2), the readings and the basic settings. Advanced
+adds what is needed for diagnostics: the generation 2 radio and security
+details (keys, devNonce, counters, link margins, configuration, OTA), the
+sensor serial numbers and 24 h statistics, the Logs page, MQTT TLS and the
+topics, the firmware URL update and the "Signed images only" option. Routes
+work in both modes; Simple only leaves them out of the pages and the
+navigation. The System page also holds the time zone, the admin password and
+the restart button.
+
+Settings of a switched-off feature are hidden (WiFi credentials while "Use
+WiFi" is off, LTE APN and PIN while LTE is off, MQTT settings while MQTT is
+off, static Ethernet addresses with DHCP). Hidden fields are not sent, and the
+gateway keeps their stored values - switching a feature off and on again does
+not lose its settings.
 
 **Forgotten password:** connect the gateway over USB and send `reset-password`
 on the serial console (115200 Bd). The password is cleared and has to be set
@@ -153,6 +443,26 @@ when the gateway loses its local network (Ethernet and WiFi), so it can always
 be reached for configuration; the Network page is available on the access point
 too (http://192.168.4.1/network).
 
+**Use WiFi** (WiFi card of the Network page, Pro only - the Lite has WiFi as
+its only uplink): with WiFi disabled the gateway runs on Ethernet (and LTE) - it never
+connects to a WiFi network, and once the access point is no longer needed the
+WiFi driver is stopped, which frees about 20 kB of memory. It applies after a
+restart, with or without WiFi credentials (an Ethernet-only gateway that was
+never given any can switch WiFi off too).
+So that the gateway can never be locked out, the access point still runs:
+- for 5 minutes after every boot, even when Ethernet has an address - an
+  address does not prove the gateway is reachable (a wrong static address,
+  DHCP on an isolated VLAN), so a power cycle is always a way back in;
+- whenever Ethernet has no address for 10 s (cable unplugged, no DHCP), until
+  Ethernet has had an address for 5 minutes again.
+The Network page is reachable on the access point (http://192.168.4.1/network),
+with the captive portal when there is no other way in. LTE does not count - it
+is not reachable from the local network. The SSID and password stay stored
+while WiFi is off. Disabling WiFi on a page opened over WiFi asks for
+confirmation, because that connection ends with the restart. There is no
+reset button: the only way to clear all settings is erasing the flash (NVS)
+over USB.
+
 If a wrong static Ethernet address makes the gateway unreachable, restart it:
 the access point runs for 5 minutes after boot, so the address can be fixed on
 its Network page.
@@ -160,24 +470,167 @@ its Network page.
 The Network page and `/diag/network` (JSON) show the state of each interface,
 the LTE operator and signal, and the power source (PoE or USB).
 
+## Time and Time Zone
+
+The clock is set over NTP once the gateway is online. The time zone is selected
+on the System page (card "Time zone") from a list of named zones (`Europe/Prague`,
+`Europe/London`, `America/New_York`, ...): the zones of all European
+countries, mostly named after the capital (Vatican City has no entry of its own
+and uses `Europe/Rome`, Kosovo `Europe/Belgrade`, as in the tz database), plus
+e.g. the Azores, the Canaries and a few Russian zones, and common zones
+worldwide. Summer time follows the rules of the selected zone
+automatically. The default is `Europe/Prague`. A change takes effect
+immediately, without a restart; the card shows the current local time, its UTC
+offset and whether summer time applies.
+
+The rules are frozen at build time: the list was taken from the IANA tz database
+version 2026c (e.g. British Columbia on UTC-7 all year from November 2026,
+Morocco on UTC+0 from September 2026). When a country changes its rules later,
+the gateway follows only after a firmware update.
+
+The zone is stored by name together with its POSIX TZ string. A setting from a
+version before 2.0.0 is mapped to the matching entry of the list; a string that
+matches no entry is kept and shown as "Custom". After a downgrade to 1.2.0 the
+zone keeps working, but 1.2.0 offers only five zones (GMT, WET, CET, EET, MSK)
+in its WiFi form: saving the WiFi settings there switches any other zone to
+GMT. A zone changed by 1.2.0 is taken over when 2.0.0 or newer is installed
+again.
+
 ## Adding Sensors
 
 1. Navigate to the "Sensors" page in the web interface
-2. Click "Add New Sensor"
+2. Click "Add sensor" (generation 1) or "Add gen 2 sensor"
 3. Enter the required details:
    - Name: A friendly name for the sensor
-   - Device Type: Select the appropriate sensor type
+   - Type: CLIMA, CARBON or METEO (generation 1)
    - Serial Number: The unique identifier of the sensor (in hexadecimal)
    - Device Key: The encryption key used by the sensor (in hexadecimal)
+   - Generation 2: the DevID and the key from the sensor's label; a sensor
+     that is heard but not added yet is listed under "Heard, not added yet"
 4. Optionally configure:
-   - Custom URL: For forwarding data to external services (http:// or https://;
+   - Forward to URL: For forwarding data to external services (http:// or https://;
      for https the connection is encrypted but the certificate is not checked,
-     so self-signed endpoints work)
-   - Altitude: For pressure sensors, to adjust for elevation
-   - Correction values: To calibrate sensor readings
+     so self-signed endpoints work), both generations, at most 200 characters.
+     After every received report with readings the gateway sends one GET to
+     the URL with the placeholders replaced by the corrected values:
+     `*TEMP*` `*HUM*` `*PRESS*` (2 decimals), `*PPM*` (0), `*LUX*` (1),
+     `*WIND_SPEED*` `*WIND_DIR*` `*RAIN*` `*DAILY_RAIN*` `*RAIN_RATE*`
+     (meteo station), `*BAT*` (2), `*RSSI*`, `*SN*` (the ID as in `/api`: 6
+     hex digits, the DevID of a generation 2 sensor) and `*TYPE*` (the
+     `deviceType` number of `/api`, 0 for generation 2). A quantity without
+     a current value is **not replaced** – the placeholder stays in the URL
+     as written (as in 1.x for quantities the type does not have): for a
+     generation 2 sensor only the quantities the forwarded report carried
+     with a valid value are replaced - one it left out (e.g. a failed
+     measuring chip) or sent as invalid is never sent as an old number.
+     Generation 2 sends only after a report that carried at least one valid
+     reading (not after a status or OTA report alone, not for the battery
+     voltage alone), not during an update-mode session and not while a
+     sensor OTA job is starting or running (a queued start, Transfer,
+     Swapping, Confirming - the request would delay the timed OTA frames;
+     Waiting, Paused and Verified do not hold it). For both generations a
+     request without an answer (DNS, connection, TLS or timeout) pauses
+     that sensor's forwards for 5 minutes (RAM only). Each request blocks
+     the gateway's main loop: the DNS lookup (no time limit of its own), up
+     to 3 s to connect, up to 5 s for the TLS handshake (https) and up to
+     3 s for the answer - about 11 s plus DNS at worst. Meanwhile other
+     sensors' reports wait and generation 2 sensors miss their timed
+     answers, so keep the number of forwarding sensors and their report
+     rate moderate; https only with enough free memory.
+5. "Edit" on the Sensors page: name, forward URL, corrections and the altitude
+   (pressure sensors); a generation 2 sensor also its report interval
+
+The types SHT40 (0x05) and DIY_TEMP (0x51) were removed in 2.0.0: an entry of
+such a type in `sensors.json` is dropped at start (one log line).
 
 The daily rain total of a meteo station restarts at local midnight. That needs
 the clock (NTP): without a synchronized time the total keeps adding up.
+
+### Firmware updates of generation 2 sensors (OTA)
+
+A generation 2 sensor whose firmware contains the OTA receiver can be updated
+over LoRa from its detail page (`/sensors/gen2?devId=…`, docs/protocol-v2.md
+§14):
+
+1. **Upload the image** in the "Images" part of the page: the sensor's
+   `firmware.bin` with the image trailer (built with
+   `custom_ota_transfer = 1`). The gateway streams it to its flash, checks
+   length, trailer, load address, CRC and the OTA flags (an image without the
+   OTA receiver is refused – a sensor running it could never be updated over
+   the air again) and keeps one image per HW type (at most 4). An image that a
+   running job uses cannot be replaced or deleted.
+   **Signed images**: a file signed with `tools/release/explora_sign.py`
+   (`--kind sensor`, the 128-byte signature block appended) is checked
+   against the release keys built into the gateway firmware. The block is
+   not stored – the stored image is the unsigned file byte for byte, the
+   sensor sees no difference. The image list and the upload result show
+   "verified (key xxxxxxxx)", "unsigned" or "unsigned (unknown key
+   xxxxxxxx)" (signed, but with a key this firmware does not know – treated
+   as unsigned). A file whose signature block is there but wrong (another
+   HW type or version, changed content, a bad signature, anything other
+   than exactly one block after the image) is always refused. A signed file
+   cut exactly at the end of the image is simply an unsigned file and is
+   stored as unsigned. **Signed images only** on the Firmware page (default
+   off) refuses unsigned uploads, blocks starts with unsigned images already
+   stored and holds an unfinished job with an unsigned image Paused (also
+   after a restart; Resume refused until the option is off, Abort works); a
+   job whose image is already complete on the sensor is not stopped, but it
+   is held as well if the sensor would need the image again.
+   **From a URL** (Advanced mode): instead of uploading, enter an `https://`
+   address next to the upload and press Download. The gateway downloads the
+   file itself in update mode (MQTT and sensor reception pause for the few
+   seconds it takes, at most about 2 minutes; see Firmware updates) and stores it exactly like an
+   upload, with the same checks, signature classification and "Signed images
+   only" rule (an unsigned file from a URL is stored with the same warning and
+   needs the same confirmation at the start). The server must answer 200 with
+   a Content-Length of at most 114,816 bytes (image plus signature block);
+   anything else, a body shorter or longer than announced, a cut or silent
+   connection (15 s), a server slower than 30 s plus 2 kB/s for the file
+   (at most 86 s from the request, connection, redirects and headers
+   included - they are cut off at that point too, at most 10 s later, plus
+   a few seconds if a redirect's new host is slow to look up; WiFi
+   and Ethernet take about 2 s, LTE about 12 s for the largest file), more
+   than 3 redirects or a certificate the built-in CA bundle
+   does not accept ends the download, and the store stays as it was. The page shows the
+   progress and then the result ("Last download: ..."); `GET
+   /ota/fetch/status` and `/diag/heap` (`sensorFetch`) have the state, bytes
+   and result. One download at a time; it is refused while an upload, a
+   firmware download or another update-mode session runs and while a job
+   needs the radio (Transfer, Verified, Swapping, Confirming - pause it
+   first). A job that waits for its sensor (Waiting) may stay as it is
+   while no start has gone out to the sensor yet and its deadline leaves
+   2 minutes plus two report intervals; otherwise the download is refused
+   until the job ends (or you abort it). The job's own image cannot be
+   replaced meanwhile. A queued start is fine (the job begins after the
+   download). Like an update check it is also refused while a newly
+   installed gateway firmware is being validated (its first 2 minutes).
+   Uploads (sensor image or firmware) are refused while a download is
+   queued or runs; start them after it ends.
+2. **Start** with "Update to vX". The page lists what blocks a start (no
+   image, no OTA receiver, no status report yet, RTC not usable, an
+   unconfirmed image running, another job – one at a time, an unsigned image
+   with "Signed images only" on) and warnings (weak link, long report
+   interval); a downgrade, a reinstall, an unsigned image, an image that
+   reverted on this sensor before (the mark ends once that version runs
+   confirmed on the sensor) or a production image for a sensor that runs
+   the development identity of a test build (sensor firmware 1.0.1+; it
+   would refuse to install it) needs a confirmation. The stored image is
+   re-checked first, then the start goes with the sensor's next report.
+3. **Transfer**: one 232-byte block every 26 s in scheduled windows, a
+   progress status every 32 blocks (about 14 min; the sensor's reports ride in
+   it), so an 88 kB image takes about 3–3.5 h. The page shows the state,
+   blocks confirmed / missing / sent, repeats, missed statuses, airtime and an
+   ETA; Pause / Resume keep the progress, Abort discards it, Clear job removes
+   a finished-looking job from the gateway only.
+4. The sensor verifies the image, swaps it in (bootloader) and confirms it
+   after a proven sleep; the job ends Done, or Reverted when the new image did
+   not confirm (that image is never retried automatically).
+
+OTA frames use at most 60 % of the gateway's downlink data share (172.8 s per
+hour on 869.525 MHz) and never pre-empt a reception or a response; while a
+block is on air (1.26 s) the gateway does not receive. `/diag/heap` shows the
+job under `ota` (state, blocks, skipped slots by reason) and the radio side
+under `otaRadio`.
 
 ## Sensor Calibration
 
@@ -192,7 +645,14 @@ The gateway supports calibration of sensor readings through correction values:
 - **Wind Direction**: Degree offset (±)
   - Example: A correction of +10 rotates the direction 10 degrees clockwise
 
-Original (uncorrected) values are logged for reference while corrected values are stored and used for all operations.
+- **Altitude** (pressure sensors): the corrected station pressure is converted
+  to sea level
+
+Corrections are applied once, when a reading arrives: the pages, `/api`,
+MQTT and the forward URL all see the corrected values. A generation 2 sensor
+has the same corrections for the quantities it has reported (they appear
+after its first report); Advanced mode shows its raw values next to the
+corrected ones.
 
 ## MQTT Integration
 
@@ -203,24 +663,64 @@ To connect to a Home Assistant MQTT broker:
 3. Enter your MQTT broker details:
    - Host: The IP or hostname of your MQTT broker
    - Port: Usually 1883 (default) or 8883 (TLS; encrypted, but the broker
-     certificate is not verified, so self-signed brokers work)
+     certificate is not verified, so self-signed brokers work). A TLS session
+     needs about 80 kB of free memory to connect: both boards have it (the
+     Pro ~99 kB with WiFi, Ethernet and LTE on); if not, the MQTT page says
+     why it does not connect
    - Username and Password: If your broker requires authentication
+   - TLS, the root topic and the discovery topic: Advanced mode
 4. Save the configuration
 
-The gateway will automatically generate discovery information for Home Assistant and publish sensor data to appropriate topics.
+The gateway will automatically generate discovery information for Home
+Assistant and publish sensor data to `<root topic>/<ID>/<quantity>`, where ID
+is the serial number of a generation 1 sensor (6 hex digits) or the DevID of
+a generation 2 sensor (8 hex digits). A generation 2 sensor appears as device
+model "Gen 2 HW<n>" with its firmware version; its entities follow the
+quantities it reports (temperature, humidity, pressure, CO2, light, battery,
+signal) and are announced again when it reports a new one.
+
+When a generation 2 sensor reports a failed reading (the sensor's invalid-value
+marker, e.g. a broken humidity sensor), that quantity is shown as missing on
+the pages and is `null` in `/api` until the next good reading, and its state
+topic gets `None`, which Home Assistant shows as "unknown" (never the last
+good number). A quantity the sensor does not send at all keeps its last value.
 
 ## API Usage
 
 The gateway provides a read-only REST API for sensor data (no login needed):
 
 - **List all sensors**: `/api?format=json`
-- **Get specific sensor**: `/api?sensor=XXXXXX&format=json` (where XXXXXX is the sensor's serial number in hex)
+- **Get specific sensor**: `/api?sensor=XXXXXX&format=json` (the serial number
+  in hex, or the DevID of a generation 2 sensor). It returns at most one
+  sensor: when a generation 1 serial number and a generation 2 DevID are the
+  same number, the generation 1 sensor is returned; add `&gen=2` (or
+  `&gen=1`) to choose
 - **CSV format**: Replace `json` with `csv` in the URL
+
+Generation 1 and 2 sensors have the same keys; a generation 2 sensor has
+`"typeName": "GEN2"`, `"gen": 2`, `"deviceType": 0` and its DevID as
+`serialNumber`. A value the sensor has not reported since the gateway started
+is `null` (empty in CSV); `lastSeen` is in seconds, -1 for never.
+
+### Changes for /api consumers (2.0.0)
+
+- A value without a reading is `null` in JSON (empty in CSV) instead of `0`:
+  before the sensor's first report since the gateway started (this includes
+  `batteryVoltage` and `rssi`), and while a generation 2 sensor reports a
+  failed reading. Parse the values as nullable numbers.
+- Generation 2 sensors are in the same list with `"deviceType": 0`,
+  `"typeName": "GEN2"`, `"gen": 2` and an 8-digit DevID as `serialNumber`;
+  code that expects `deviceType` 1-3 should skip or handle them. CSV gives
+  them type `0`.
+- Key names, their order and the rounding are unchanged.
+
+While the gateway checks for or downloads an update (update mode, at most
+15 minutes), `/api` answers `503` with `Retry-After: 60`; retry later.
 
 Example API response:
 ```json
 {
-  "version": "1.2.0",
+  "version": "2.0.0",
   "time": "2026-10-17 15:30:45",
   "status": "connected",
   "sensors": [
@@ -263,13 +763,27 @@ Example API response:
 
 The logging system is a valuable troubleshooting tool:
 
-1. Navigate to the "Logs" page in the web interface
+1. Navigate to the "Logs" page in the web interface (Advanced mode; the
+   route `/logs` works in Simple mode too)
 2. Set the appropriate log level:
    - **ERROR**: Only critical issues
    - **WARNING**: Errors and warnings
    - **INFO**: General operational information
    - **DEBUG**: Detailed information for debugging
    - **VERBOSE**: All available information
+
+### Radio diagnostics
+
+The LoRa radio is served by its own task: every packet is read right after
+the radio reports it and queued for processing, so a busy gateway (LTE modem,
+TLS connection, firmware upload) does not lose packets in the radio. Flash
+writes (settings, sensor list, firmware upload) wait briefly while a timed
+radio response is pending (needed by the second-generation sensors).
+`/diag/heap` (after login) shows the radio counters under `radio`: packets
+received, CRC and read errors, packets dropped because the queue was full,
+the longest delay before a packet was processed, radio re-initializations,
+missed interrupts picked up by polling, task stack left and flash-permit
+waits. Errors are also written to the log.
 
 ## Contributing
 

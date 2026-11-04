@@ -313,6 +313,21 @@ bool WebAuth::isAuthorized(AsyncWebServerRequest *request)
     return valid;
 }
 
+uint64_t WebAuth::sessionTag(AsyncWebServerRequest *request)
+{
+    if (!isAuthorized(request))
+    {
+        return 0;
+    }
+    String token = sessionToken(request);
+    uint64_t h = 1469598103934665603ULL; // FNV-1a 64
+    for (size_t i = 0; i < token.length(); i++)
+    {
+        h = (h ^ (uint8_t)token[i]) * 1099511628211ULL;
+    }
+    return h ? h : 1;
+}
+
 void WebAuth::logout(AsyncWebServerRequest *request)
 {
     String token = sessionToken(request);

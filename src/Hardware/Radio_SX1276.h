@@ -46,12 +46,21 @@ private:
     Module *module;
     SX1276 *radio;
     bool initialized;
+    int lastRssi;         // metadata of the last packet, read before
+    float lastSnr;        // receive is restarted
+    float lastFreqError;
 
     // Configure the chip and start continuous receive
     bool configure();
 
-    // Log a RadioLib error code
-    void logError(const char *what, int16_t state);
+    RadioError lastErr = {"none", 0};
+    bool rxRunning = false;
+
+    // Create the RadioLib objects (no logging)
+    bool create();
+
+    // Remember a RadioLib error code
+    void recordError(const char *what, int16_t state);
 
 public:
     RadioSX1276(Logger &log, SPIManager *spiMgr);
@@ -62,7 +71,18 @@ public:
     bool receivePacket(uint8_t *buffer, uint8_t *length) override;
     int getRSSI() override;
     float getSNR() override;
+    float getFrequencyError() override;
     bool isConnected() override;
+    bool irqPinActive() override;
+    RadioError lastError() const override { return lastErr; }
+    int64_t chipOffsetUs() const override { return LORA_CHIP_OFFSET_US; }
+    bool receivingNow() override;
+    int16_t prepareTx(const uint8_t *frame, size_t len) override;
+    int16_t launchTx() override;
+    void finishTx() override;
+    bool standby() override;
+    uint32_t timeOnAirUs(size_t len) override;
+    bool receiving() const override { return rxRunning; }
     const char *getChipName() const override { return "SX1276"; }
 };
 

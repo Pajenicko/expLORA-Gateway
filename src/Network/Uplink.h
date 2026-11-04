@@ -23,6 +23,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <atomic>
 #include <functional>
 #include "../config.h"
 #include "../Data/Logging.h"
@@ -49,9 +50,39 @@
  *   comes up, and whenever local access is lost (immediately when there are no
  *   WiFi credentials, otherwise after AP_RESTORE_DELAY)
  * - captive portal (DNS + config UI) whenever the AP is up without local access
+ * - "Enable WiFi" switch (wifiEnabled, boards with HAS_WIFI_SWITCH = ethernet;
+ *   the Lite has no such setting, WiFi is its only uplink), applied by a
+ *   restart like the LTE switch, with or without WiFi credentials. Off:
+ *   the station is never started. The AP runs for AP_TIMEOUT from its first
+ *   start after every boot (however long that start takes) - an Ethernet address does not prove the gateway is reachable
+ *   (wrong static address, DHCP on an isolated VLAN) and there is no reset
+ *   button, so a power cycle is always a way back in. After that, while
+ *   ethernet has an address, the AP is stopped and the WiFi driver
+ *   deinitialised (frees ~30 kB of internal RAM on the Pro, room for TLS).
+ *   When ethernet has no address for AP_RESTORE_DELAY the AP (network page
+ *   included, captive portal without other access) comes up again and stays
+ *   until ethernet has had an address for AP_TIMEOUT. LTE does not count as
+ *   local access (it is not reachable from the LAN). Saving WiFi
+ *   credentials (/config) switches WiFi back on. If the AP cannot start
+ *   for lack of memory (e.g. LTE + an MQTT TLS session), apStarved() makes
+ *   MQTT drop its TLS session for a few retries.
+ *   Pure rules: WifiPolicy.h (native tests in test/test_wifi_policy)
  * - DNS: lwIP keeps one global server list that every interface overwrites
  *   when it gets an address, so the servers of the active interface are
- *   remembered per interface and re-applied
+ *   remembered per interface and re-applied (also when something else
+ *   cleared the list: refilled when found empty, checked every 2 s); the default route is set to the
+ *   active interface the same way (an Ethernet netif without a cable keeps
+ *   its route priority). esp_netif_set_default_netif is a sticky override:
+ *   ESP-IDF's route_prio choice no longer applies (until that netif is
+ *   destroyed), so the uplink owns the default route; after an interface
+ *   loses its address the route and DNS follow when loop() sees the uplink
+ *   change, at most 2 s later (re-applying them from the address-loss
+ *   events made the Pro reset under a connection flood - not done)
+ * - WiFi switched off and the AP failing to start (memory): the boot grace
+ *   lasts until the AP has run for AP_TIMEOUT, so with an AP that never
+ *   starts it never ends - the driver stays loaded and the start is retried
+ *   every 5 s (log rate-limited); the trade-off keeps a power cycle a way
+ *   back in
  * - time: SNTP is (re)started when the device goes online, without blocking
  */
 class Uplink
@@ -92,11 +123,30 @@ public:
     String getTimeStatus() const;
     IPAddress getLocalIP() const;
 
-    // Access point
-    bool isApActive() const { return apActive; }
+    // "Enable WiFi" is off (never true on boards without HAS_WIFI_SWITCH)
+    bool wifiSwitchedOff() const;
+    // The WiFi driver is initialised (holds its RAM), started or not
+    bool wifiDriverRunning() const;
+
+    // Station state, safe from any task (false / 0.0.0.0 while WiFi is
+    // switched off, without touching the driver)
+    bool stationHasIP() const;
+    bool stationConnected() const;
+    IPAddress getStationIP() const;
+
+    // Access point (any task; the address is cached, no driver call)
+    bool isApActive() const { return apActive.load(); }
     bool isCaptive() const { return captive; }
     const String &getApName() const { return apName; }
     IPAddress getApIP() const;
+    // The AP is the way in but failed to start for lack of memory: MQTT
+    // drops / holds back its TLS session (for a few failed starts, see
+    // WifiPolicy::apStarved), so the admin is not locked out
+    bool apStarved() const { return starved.load(); }
+    // Failed AP starts in a row and the free 8-bit heap at the last one
+    uint32_t apFailedStarts() const { return apStartFailures.load(); }
+    uint32_t apFailedStartFree() const { return apFailFree.load(); }
+    static constexpr uint32_t apStarvedMaxTries() { return 3; }
 
     // Ethernet state (false on boards without ethernet)
     bool ethernetLinkUp() const;
@@ -105,6 +155,33 @@ public:
 #if defined(HAS_LTE)
     const LteModem &getLte() const { return *lte; }
 #endif
+
+    // Update mode (Update/UpdateMode.cpp, loop task). Interfaces as
+    // UpdateModePolicy::IF_* bits: WIFI_STA = the WiFi driver for anything
+    // but the access point alone (station, or a driver left loaded),
+    // WIFI_AP = the access point, LTE = the modem (not disabled)
+    uint8_t updateModeRunning() const;
+    // Switch these off and keep them off (the station does not reconnect,
+    // the AP does not restart, LTE stays powered down); returns the bits
+    // that went off. WIFI_STA deinitialises the whole driver (AP included)
+    uint8_t updateModeSuspend(uint8_t mask);
+    // Everything back: the station reconnects at once, the AP comes back
+    // per the WiFi policy, LTE attaches again
+    void updateModeResume();
+    uint8_t updateModeSuspended() const { return suspendedMask.load(); }
+    // The WiFi policy wants the access point (as of the last process())
+    bool apWantedNow() const { return apWantedLast; }
+    bool lteOnline() const;
+    // Connectivity watch after an update session: the interface (one IF_*
+    // bit) is still enabled, and a fingerprint of its settings (a change
+    // after the session means it is not expected back as it was)
+    bool updateModeWanted(uint8_t bit) const;
+    uint32_t updateModeConfigKey(uint8_t bit) const;
+    // DNS servers and default route of the active uplink again, at once
+    // (process() does this every few seconds, but not while an update
+    // session blocks the loop; switching interfaces off can clear lwIP's
+    // DNS list or move the default route)
+    void refreshRoutes();
 
     // Called when the captive portal turns on or off
     void setCaptiveCallback(std::function<void(bool)> callback) { captiveCallback = callback; }
@@ -118,10 +195,23 @@ private:
     Logger &logger;
 
     String apName;
-    bool apActive = false;
+    std::atomic<bool> apActive{false};
+    std::atomic<uint32_t> apIp{0};          // AP address while it runs
+    std::atomic<uint32_t> apStartFailures{0}; // failed starts in a row
+    std::atomic<uint32_t> apFailFree{0};      // free 8-bit heap at the last one
+    bool apFailLowMemory = false;             // ... below AP_START_LOW_MEMORY
+    std::atomic<bool> starved{false};       // see apStarved()
     unsigned long lastApAttempt = 0;
+    bool apUpSinceBoot = false;             // the AP has run since boot
+    unsigned long apFirstUpAt = 0;          // when it first came up
+    bool bootGraceOver = false;             // the AP ran for AP_TIMEOUT since then (latched)
+    unsigned long lastDriverStop = 0;
+    bool driverStopFailedLogged = false;
     bool captive = false;
     Type active = Type::None;
+    bool switchedOffAtBoot = false; // "Enable WiFi" off, read in begin()
+    std::atomic<uint8_t> suspendedMask{0}; // update mode, UpdateModePolicy::IF_* bits
+    bool apWantedLast = false;              // WifiPolicy::apWanted at the last processAp()
 
     bool localWasUp = false;
     unsigned long localAccessSince = 0; // when local access came up
@@ -151,9 +241,11 @@ private:
     IPAddress dnsServers[TYPE_COUNT][2];
     portMUX_TYPE dnsMux = portMUX_INITIALIZER_UNLOCKED;
     volatile bool dnsDirty = false;
+    unsigned long lastDnsCheck = 0;   // see DNS_CHECK_INTERVAL
 
     void onGotIp(Type type, NetworkInterface &ifc);
-    void applyDns();
+    void applyDefaultRoute();
+    void applyDns(bool onlyIfCleared);
     NetworkInterface *interfaceFor(Type type) const;
 
     bool stationEnabled() const;
@@ -165,6 +257,7 @@ private:
     void processAp(unsigned long now);
     void startAp();
     void stopAp();
+    bool stopDriver();
     void selectActive();
     void startTimeSync();
     static void onTimeSync(struct timeval *tv);
